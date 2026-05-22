@@ -1,6 +1,6 @@
 # System Design Practice Problems
 
-> Interview-style system design questions with the ambiguity, follow-ups, and judgement calls of a real onsite. Not just "Design X — here's the answer" essays.
+> Interview-style system design questions with the ambiguity, follow-ups, and judgement calls of a real onsite.
 
 Most system design content reads like a textbook. Real interviews don't. The interviewer drops a vague prompt, you ask clarifying questions, you sketch, they push back, you redesign. This repo is built around that loop.
 

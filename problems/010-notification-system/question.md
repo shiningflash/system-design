@@ -59,28 +59,30 @@ Compute (do this on paper before revealing):
 <details>
 <summary><b>Reveal: the math</b></summary>
 
-Notifications per second. 10B / 86400 is roughly 116K/sec sustained. Peak (3x): about 350K/sec. Total across channels.
+**Notifications per second.** 10B / 86400 ≈ 116K/sec sustained. Peak roughly 3× that, so about 350K/sec across all channels combined.
 
-Per-channel sustained:
+**Per-channel sustained rate:**
 
-- Push: 60% x 116K = ~70K/sec
-- In-app: 30% x 116K = ~35K/sec
-- Email: 7% x 116K = ~8K/sec
-- SMS: 3% x 116K = ~3.5K/sec
+| Channel | Share | Sustained QPS |
+|---------|-------|---------------|
+| Push    | 60%   | ~70K/sec  |
+| In-app  | 30%   | ~35K/sec  |
+| Email   | 7%    | ~8K/sec   |
+| SMS     | 3%    | ~3.5K/sec |
 
-These all sit comfortably under what APNs, FCM, SendGrid, and Twilio quote as their commercial throughput ceilings, but only if you stay within their per-account rate limits. SMS in particular has carrier-level caps (typically 100 messages/sec per long code, hundreds per short code). You will hold many sender identities, not one.
+These sit under what APNs, FCM, SendGrid, and Twilio quote as commercial ceilings, but only if you stay within per-account rate limits. SMS in particular has carrier-level caps (typically 100 msgs/sec per long code, hundreds per short code), so you hold many sender identities, not one.
 
-Storage for delivery records. One row per delivery: `{notification_id (16B), user_id (8B), channel (1B), event_id (16B), template_id (8B), status (1B), sent_at (8B), provider_msg_id (32B), retries (1B), ~30B overhead}` is about 120 bytes. 10B x 120B = 1.2TB/day. 30 days is ~36TB. Sharded by notification_id hash, that fits across 32 to 64 shards.
+**Storage for delivery records.** One row per delivery, ~120 bytes (16B notification_id + 8B user_id + 1B channel + 16B event_id + 8B template_id + 1B status + 8B sent_at + 32B provider_msg_id + 1B retries + ~30B overhead). At 10B notifications/day: 10B × 120B = 1.2TB/day. Over 30 days, ~36TB. Sharded by `notification_id` hash, that fits across 32 to 64 shards.
 
-Marketing campaign burst. 10M notifications in 5 minutes is 33K/sec sustained for those 5 minutes. On top of the steady-state 116K/sec, that is a 30% spike. The queue must absorb at least 10M messages within 5 minutes without backpressuring the producer. Kafka handles this trivially as long as partitions are sized right.
+**Marketing campaign burst.** 10M notifications in 5 minutes is ~33K/sec sustained for those 5 minutes. On top of the steady 116K/sec, that is a ~30% spike. The queue must absorb 10M messages within 5 minutes without backpressuring the producer. Kafka handles this trivially with correctly-sized partitions.
 
-Fan-out worker pool. At 500 calls/sec per worker, 116K/sec sustained needs about 230 workers. Peak around 700. Auto-scale on consumer lag.
+**Fan-out worker pool.** At 500 calls/sec per worker, the 116K/sec sustained rate needs about 230 workers. Peak around 700. Auto-scale on consumer lag.
 
-The total throughput is not the hard part. The hard parts are:
+The total throughput is not the hard part. The hard parts are these three:
 
-- Fan-out per event ranges from 0 to 1M, and the system has to scale across that range without operators tuning anything.
-- External providers (APNs, FCM, SendGrid, Twilio) are slow and lossy compared to in-house services. You retry without duplicating.
-- Preferences and quiet hours have to be evaluated cheaply and consistently for every single notification.
+1. Fan-out per event ranges from 0 to 1 million, and the system has to scale across that range without operators tuning anything.
+2. External providers (APNs, FCM, SendGrid, Twilio) are slow and lossy compared to in-house services. You retry without duplicating.
+3. Preferences and quiet hours have to be evaluated cheaply and consistently for every single notification.
 
 </details>
 

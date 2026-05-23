@@ -69,7 +69,7 @@ Every request increments a counter. 300K QPS peak = **300K counter writes/sec**.
 300K / 200 gateway nodes = **1500 QPS per gateway node**. Each node performs 1500 limit checks per second. Trivial in-process. Each one talking to Redis is 1500 network round trips per node per second.
 
 **Redis read+write rate.**
-If every check is a Redis call: 300K req/sec x ~2 ops (read counter + conditional increment) = **600K ops/sec**. A single Redis instance handles ~100K ops/sec comfortably, so we shard, batch, or cache locally.
+If every check is a Redis call: 300K req/sec × ~2 ops (read counter + conditional increment) = **600K ops/sec**. A single Redis instance handles ~100K ops/sec comfortably, so we shard, batch, or cache locally.
 
 **Wire cost per check.**
 Redis INCR + EXPIRE pipelined: ~80 bytes request, ~40 bytes response. At 300K QPS that's **~36MB/sec of internal traffic**. Not a problem, but worth noting the limiter generates real load on its own dependencies.

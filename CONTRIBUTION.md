@@ -22,7 +22,7 @@ Use the next sequential 3-digit ID. Slug should be the title lowercased, words j
 
 ## question.md
 
-Front matter (exact field names — the build script depends on them):
+Front matter (exact field names, the build script depends on them):
 
 ```yaml
 ---
@@ -37,15 +37,15 @@ solution: solution.md
 
 Body sections (in this order):
 
-1. **Scene** — one paragraph. Where you are, who the interviewer is, what they just said. Sets tone.
-2. **The prompt** — verbatim what the interviewer would say. 2 to 5 sentences. Deliberately under-specified.
-3. **Step 1: Clarifying questions** — invite the reader to spend 5 minutes listing questions, then reveal a suggested set in a `<details>` block.
-4. **Step 2: Capacity estimates** — give the inputs (DAU, qps, payload size), ask the reader to compute 4 to 6 outputs, reveal the math.
-5. **Step 3: Sketch the high-level architecture** — provide an intentionally incomplete ASCII diagram with `[ ? ]` placeholders. Reveal the complete diagram in a `<details>` block.
-6. **Step 4: API design** — list the endpoints to design. Reveal the reference API.
-7. **Step 5 onwards** — problem-specific design steps. Sharding strategy, caching, real-time path, etc.
-8. **Follow-up questions** — 5 to 10 numbered questions. Do NOT answer them here; answers belong in solution.md.
-9. **Related problems** — link to 2 to 4 other problems in this repo that share patterns.
+1. **Scene**. One paragraph. Where you are, who the interviewer is, what they just said. Sets tone.
+2. **The prompt**. Verbatim what the interviewer would say. 2 to 5 sentences. Deliberately under-specified.
+3. **Step 1: Clarifying questions**. Invite the reader to spend 5 minutes listing questions, then reveal a suggested set in a `<details>` block.
+4. **Step 2: Capacity estimates**. Give the inputs (DAU, qps, payload size), ask the reader to compute 4 to 6 outputs, reveal the math.
+5. **Step 3: Sketch the high-level architecture**. Provide an intentionally incomplete ASCII diagram with `[ ? ]` placeholders. Reveal the complete diagram in a `<details>` block.
+6. **Step 4: API design**. List the endpoints to design. Reveal the reference API.
+7. **Step 5 onwards**. Problem-specific design steps. Sharding strategy, caching, real-time path, etc.
+8. **Follow-up questions**. 5 to 10 numbered questions. Do NOT answer them here; answers belong in solution.md.
+9. **Related problems**. Link to 2 to 4 other problems in this repo that share patterns.
 
 Use plain HTML `<details><summary>` blocks for reveal sections. Do not use any framework-specific syntax.
 
@@ -53,20 +53,20 @@ Use plain HTML `<details><summary>` blocks for reveal sections. Do not use any f
 
 The deep walkthrough. Roughly 800 to 2000 lines. Required sections:
 
-1. **TL;DR** — three paragraphs.
-2. **Clarifying questions** — list the ones you would ask and why each matters.
-3. **Capacity estimates** — full math, not just answers.
-4. **API design** — full spec including status codes and error cases.
-5. **Data model** — schema with reasoning for every column and index choice.
-6. **Core algorithm** — the central design decision (encoding, fan-out, indexing, etc.) with at least two alternatives compared.
-7. **High-level architecture** — diagram + component walkthrough.
-8. **Read and write paths** — what happens on a single request.
-9. **Scaling** — caching, sharding, replication, CDN, geographic distribution. Sub-sections for each.
-10. **Reliability** — failure modes, retries, what stays consistent under partition.
-11. **Observability** — metrics, logs, alerts that should be in place from day one.
-12. **Follow-up answers** — one section per follow-up question from question.md, with the answer a senior candidate would give.
-13. **Trade-offs and what a senior would mention** — architectural calls, business considerations, what you'd revisit at 10x scale.
-14. **Common interview mistakes** — what weaker answers do wrong.
+1. **TL;DR**. Three paragraphs.
+2. **Clarifying questions**. List the ones you would ask and why each matters.
+3. **Capacity estimates**. Full math, not just answers.
+4. **API design**. Full spec including status codes and error cases.
+5. **Data model**. Schema with reasoning for every column and index choice.
+6. **Core algorithm**. The central design decision (encoding, fan-out, indexing, etc.) with at least two alternatives compared.
+7. **High-level architecture**. Diagram + component walkthrough.
+8. **Read and write paths**. What happens on a single request.
+9. **Scaling**. Caching, sharding, replication, CDN, geographic distribution. Sub-sections for each.
+10. **Reliability**. Failure modes, retries, what stays consistent under partition.
+11. **Observability**. Metrics, logs, alerts that should be in place from day one.
+12. **Follow-up answers**. One section per follow-up question from question.md, with the answer a senior candidate would give.
+13. **Trade-offs and what a senior would mention**. Architectural calls, business considerations, what you'd revisit at 10x scale.
+14. **Common interview mistakes**. What weaker answers do wrong.
 
 ## Style guide
 
@@ -74,7 +74,7 @@ The deep walkthrough. Roughly 800 to 2000 lines. Required sections:
 - Bullet points for genuinely parallel options or trade-off lists.
 - ASCII diagrams over Mermaid where the diagram is a flow.
 - Mermaid for state machines and sequence diagrams.
-- No marketing words: "robust", "comprehensive", "seamless", "leverage". Just say what it does.
+- No marketing words: "robust", "comprehensive", "seamless", "use". Just say what it does.
 - Show your numbers. Order-of-magnitude is fine, but show the working.
 - Acknowledge what you do not know. "I would benchmark this before committing" is a senior-candidate sentence.
 
@@ -89,8 +89,8 @@ The deep walkthrough. Roughly 800 to 2000 lines. Required sections:
 
 PRs are reviewed on three criteria:
 
-1. **Substance** — do the follow-up answers go past surface level?
-2. **Honesty** — does it admit trade-offs, or pretend the answer is obvious?
-3. **Interview realism** — would a real interviewer recognize this as something they would ask?
+1. **Substance**. Do the follow-up answers go past surface level?
+2. **Honesty**. Does it admit trade-offs, or pretend the answer is obvious?
+3. **Interview realism**. Would a real interviewer recognize this as something they would ask?
 
 If the PR clears all three, it ships.

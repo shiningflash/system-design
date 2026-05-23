@@ -8,8 +8,8 @@ Most system design content reads like a textbook. Real interviews don't. The int
 
 Each problem has two files:
 
-- **`question.md`** — the interview scene. A short prompt from the "interviewer", clarifying questions you should ask, capacity-estimate math you must do, a **partial architecture diagram you complete yourself**, then five to ten follow-up scenarios. Most steps have a `<details>` block you reveal only after attempting the step yourself.
-- **`solution.md`** — the full deep dive. API design, data model, sharding strategy, read/write paths, cache invalidation, geo distribution, observability, trade-offs, the most common follow-up answers, and the mistakes weak candidates make.
+- **`question.md`**. The interview scene. A short prompt from the "interviewer", clarifying questions you should ask, capacity-estimate math you must do, a **partial architecture diagram you complete yourself**, then five to ten follow-up scenarios. Most steps have a `<details>` block you reveal only after attempting the step yourself.
+- **`solution.md`**. The full deep dive. API design, data model, sharding strategy, read/write paths, cache invalidation, geo distribution, observability, trade-offs, the most common follow-up answers, and the mistakes weak candidates make.
 
 You won't get the most out of this by reading the solution first. The point is to sit with the question, sketch the diagram, do the math, *then* compare.
 

@@ -354,7 +354,6 @@ def resolve_approver(spec, requester, when):
     # Step 3: follow OOO/delegation chain with cycle and depth guard
     return follow_delegation(candidate, when, depth=0, visited=set())
 
-
 def follow_delegation(user, when, depth, visited):
     if depth > 5:                       # never follow more than 5 hops
         raise DelegationTooDeep(user)

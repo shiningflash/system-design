@@ -16,6 +16,16 @@ A quick overview of every system design problem in this repo. Use the **Category
 | 8 | Design a Web Crawler (Googlebot) | Distributed Systems | bfs, frontier, deduplication, politeness, distributed coordination | Hard | [Question](problems/008-web-crawler/question.md) | [Solution](problems/008-web-crawler/solution.md) |
 | 9 | Design a Distributed Cache (Redis / Memcached) | Distributed Systems | consistent hashing, replication, eviction, ttl, hot keys | Medium | [Question](problems/009-distributed-cache/question.md) | [Solution](problems/009-distributed-cache/solution.md) |
 | 10 | Design a Notification System | Messaging | fan-out, retry, deduplication, multi-channel, queue | Medium | [Question](problems/010-notification-system/question.md) | [Solution](problems/010-notification-system/solution.md) |
+| 11 | Design an Approval Management Service | Workflow | state machine, role routing, delegation, escalation, audit trail | Easy | [Question](problems/011-approval-management/question.md) | [Solution](problems/011-approval-management/solution.md) |
+| 12 | Design a Shopping Cart Service | Session State | session, persistence, idempotency, inventory check, abandoned cart | Easy | [Question](problems/012-shopping-cart/question.md) | [Solution](problems/012-shopping-cart/solution.md) |
+| 13 | Design a Todo List with Sharing and Collaboration | Collaboration | real-time, websockets, sharing, permissions, eventual consistency | Easy | [Question](problems/013-todo-list-sharing/question.md) | [Solution](problems/013-todo-list-sharing/solution.md) |
+| 14 | Design a Coupon Code Redemption System | Concurrency | uniqueness, single-use, abuse prevention, expiration, atomic operations | Easy | [Question](problems/014-coupon-redemption/question.md) | [Solution](problems/014-coupon-redemption/solution.md) |
+| 15 | Design a Comment System (Threaded + Voted + Moderated) | User Content | nested data, voting, moderation, soft delete, ranking | Easy | [Question](problems/015-comment-system/question.md) | [Solution](problems/015-comment-system/solution.md) |
+| 16 | Design a Load Balancer | Networking | l4, l7, health checks, sticky sessions, algorithms, failover | Easy | [Question](problems/016-load-balancer/question.md) | [Solution](problems/016-load-balancer/solution.md) |
+| 17 | Design a Read-Heavy System (Patterns Walkthrough) | Patterns | caching, read replicas, cdn, materialized views, denormalization | Easy | [Question](problems/017-read-heavy-patterns/question.md) | [Solution](problems/017-read-heavy-patterns/solution.md) |
+| 18 | Design a Write-Heavy System (Patterns Walkthrough) | Patterns | batching, async, partitioning, append-only, queues | Easy | [Question](problems/018-write-heavy-patterns/question.md) | [Solution](problems/018-write-heavy-patterns/solution.md) |
+| 19 | Design a Help Desk Ticketing System (Zendesk basic) | Workflow | state machine, sla, assignment, multi-channel intake, escalation | Easy | [Question](problems/019-helpdesk-ticketing/question.md) | [Solution](problems/019-helpdesk-ticketing/solution.md) |
+| 20 | Design a File Upload & Share Service (Dropbox-lite) | Storage | chunked upload, share links, permissions, storage tiers, virus scan | Easy | [Question](problems/020-file-upload-share/question.md) | [Solution](problems/020-file-upload-share/solution.md) |
 
 ---
 

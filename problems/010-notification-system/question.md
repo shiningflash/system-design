@@ -7,391 +7,554 @@ difficulty: Medium
 solution: solution.md
 ---
 
-## Scene
+## The scene
 
-The interviewer has spent the last fifteen minutes grilling you on a feed design. They drop that thread and write a new prompt on the whiteboard:
+You are in the interview room. The whiteboard already has scribbles from the last problem. The interviewer wipes it clean and writes one line:
 
-> *Design the notification system for our product. Push, email, SMS. One event in, the right notifications out.*
+> *"Design the notification system for our product. Push, email, SMS. One event comes in. The right notifications go out."*
 
-They lean back. The question looks easy. Read from a queue, call APNs, done. It is not. Notifications are where two ugly problems meet: fan-out (one event becomes many notifications) and external delivery (each channel has its own SLA, failure modes, and rate limits). Get the fan-out wrong and you spam users at 3am. Get the retries wrong and you either drop notifications silently or send the same SMS seven times. Both are user-visible.
+It sounds easy. Read from a queue. Call Apple's push service. Done. Go home.
 
-The interviewer is watching whether you ask about channels, user preferences, and dedup before you start drawing.
+It is not easy. The trap is the word "one." One event is not one notification. One event might become zero notifications (the user turned them all off). Or one notification (a single SMS). Or a million notifications (a marketing blast). The system has to handle all three without breaking a sweat.
 
-## Step 1: clarify before you design
+Two ugly problems meet here:
 
-Take 5 minutes. Write down at least six questions. Do not draw anything yet.
+1. **Fan-out.** One input event triggers many output messages. Like one tweet posting to a thousand followers' timelines. Or one "Black Friday sale" event going out to ten million users.
+2. **External delivery.** Your code does not deliver the push. Apple does. Or Google. Or SendGrid. Or Twilio. Each one has its own rules, its own failures, its own rate limits. You are not in charge. You just ask nicely.
 
-<details>
-<summary><b>Reveal: questions a strong candidate asks</b></summary>
+Get fan-out wrong and you wake users up at 3am. Get retries wrong and you either drop notifications silently or send the same SMS seven times. Both make users hate you.
 
-1. Which channels. "Push (iOS and Android), email, SMS, in-app? Web push?" Each channel is a different external provider with its own SLA, rate limits, and failure modes. The architecture has to accommodate channel adapters as plug-ins, not bake one in.
-2. What triggers a notification. "Are these user-generated events (someone liked your post), system events (your invoice is ready), or marketing campaigns? All three?" Marketing campaigns have a completely different shape (one operator action triggers 10M notifications in a few minutes) versus transactional (one event triggers one or a few notifications).
-3. User preferences. "Can users opt out per channel and per event type? Quiet hours? Locale?" Preferences are the single biggest source of "why did I get this" complaints. They must be honored before fan-out, not after.
-4. Latency targets. "What is the SLA per channel? Push delivered in under a minute? Email under five? SMS under one?" Each channel has different user expectations. SMS for 2FA is on a strict deadline; a weekly digest email can wait an hour.
-5. Aggregation rules. "If a user gets 100 likes on a post in an hour, is that 100 notifications or one?" Almost certainly one ("John and 99 others liked your post"). Aggregation lives in the design as a first-class step, not a hack.
-6. Volume and fan-out shape. "How many notifications per day? Largest single event in terms of fan-out?" The shape matters more than the total. 10B/day with even distribution is very different from 10B/day with 90% of it triggered by ten viral events per week.
-7. Idempotency. "If the same event arrives twice (because the upstream producer retried), do we send the notification twice or once?" Once. The system needs a dedup key.
-8. Compliance. "GDPR, TCPA for SMS, CAN-SPAM for email? Unsubscribe links mandatory?" Each channel has regulatory requirements that change the API and the data model.
+The interviewer is watching to see if you ask about channels, preferences, and dedup *before* you start drawing boxes. We will walk this from a small startup to a billion-user product. At each step, we name what just broke and add the smallest fix.
 
-If you only asked "how many notifications per day" you missed the question that decides the entire architecture: user preferences. Preferences turn this from a simple queue into a real fan-out system.
+---
+
+## Step 1: Ask the right questions
+
+Before you draw anything, sit for five minutes. Write down the questions you would ask the interviewer.
+
+A good list is not "every edge case I can think of." It is the small set of questions whose answers change the whole design.
+
+<details markdown="1">
+<summary><b>Show: 8 questions that matter</b></summary>
+
+1. **Which channels?** Push (iPhone and Android)? Email? SMS? In-app messages? Web push? *Each channel is a different external service with its own rules. The design has to treat channels as plug-ins, not bake one in.*
+
+2. **What kinds of events trigger notifications?** User events (someone liked your post)? System events (your invoice is ready)? Marketing campaigns? *Marketing is a totally different shape. One operator click can send to 10 million users in a few minutes. Transactional is one event to one or a few users.*
+
+3. **Can users turn things off?** Per channel? Per event type? Quiet hours? Different languages? *Preferences are the number one source of "why did I get this?" complaints. They have to be checked before fan-out, not after.*
+
+4. **What is the deadline per channel?** Push in under a minute? Email in under five? SMS in under one? *A 2-hour-old "your driver arrived" push is useless. A weekly digest email can wait an hour. Different channels have different deadlines.*
+
+5. **What about aggregation?** If a user gets 100 likes on a post in an hour, is that 100 notifications or one? *Almost always one. ("John and 99 others liked your post.") This needs to be a first-class step in the design, not a hack.*
+
+6. **How big is it?** How many notifications per day? What is the biggest single event? *Shape matters more than total. 10 billion per day spread evenly is easy. 10 billion per day with 90% of it coming from ten viral events per week is hard.*
+
+7. **What if the same event arrives twice?** A producer service retried because of a network blip. Do we send the notification twice? *No. We need a dedup key.*
+
+8. **What rules apply?** GDPR in Europe. TCPA for SMS in the US. CAN-SPAM for email. Unsubscribe links required? *Each channel has legal rules that change the API and the data model.*
+
+The question that decides the whole design is **user preferences**. Without preferences, fan-out is just "for each recipient, send." With preferences, it becomes "for each recipient, check what they allow, check the time of day, check the hourly cap, check if we already sent this." That is a totally different system.
 
 </details>
 
-## Step 2: capacity estimates
+---
 
-Inputs from the interviewer:
+## Step 2: How big is this thing?
 
-- 1B users
-- 10B notifications delivered per day across all channels
+The interviewer gives you these numbers.
+
+- 1 billion users
+- 10 billion notifications delivered per day, across all channels
 - Channel mix: 60% push, 30% in-app, 7% email, 3% SMS
-- Single event fan-out: ranges from 0 (preferences blocked all channels) to 1M (a marketer's broadcast)
-- Per-channel SLAs: push <1min P99, in-app <5s P99, email <5min P99, SMS <1min P99
-- Worst-case event burst: a marketing campaign fires 10M notifications in 5 minutes
+- Single event fan-out ranges from 0 (user blocked all channels) to 1 million (a marketer's blast)
+- Per-channel deadlines: push under 1 minute, in-app under 5 seconds, email under 5 minutes, SMS under 1 minute
+- Worst burst: a marketing campaign fires 10 million notifications in 5 minutes
 
-Compute (do this on paper before revealing):
+Compute five numbers before peeking:
 
-1. Notifications per second sustained and peak
-2. Per-channel send rate sustained
-3. Storage for delivery records with 30-day retention
-4. Burst rate for the marketing campaign and what that means for queue sizing
-5. Fan-out worker pool size assuming each worker handles 500 channel-API-calls/sec
+1. Notifications per second, sustained and at peak
+2. Per-channel sustained rate
+3. Storage for delivery records over 30 days
+4. The burst rate during a marketing campaign
+5. How many worker machines you need (assume each worker can do 500 calls per second)
 
-<details>
-<summary><b>Reveal: the math</b></summary>
+<details markdown="1">
+<summary><b>Show: the math</b></summary>
 
-**Notifications per second.** 10B / 86400 ≈ 116K/sec sustained. Peak roughly 3× that, so about 350K/sec across all channels combined.
+**Notifications per second.**
+
+10 billion / 86,400 seconds = ~116,000 per second sustained. Peak is roughly 3× that, so around **350,000 per second** across all channels combined.
 
 **Per-channel sustained rate:**
 
 | Channel | Share | Sustained QPS |
 |---------|-------|---------------|
-| Push    | 60%   | ~70K/sec  |
-| In-app  | 30%   | ~35K/sec  |
-| Email   | 7%    | ~8K/sec   |
-| SMS     | 3%    | ~3.5K/sec |
+| Push    | 60%   | ~70,000/sec  |
+| In-app  | 30%   | ~35,000/sec  |
+| Email   | 7%    | ~8,000/sec   |
+| SMS     | 3%    | ~3,500/sec   |
 
-These sit under what APNs, FCM, SendGrid, and Twilio quote as commercial ceilings, but only if you stay within per-account rate limits. SMS in particular has carrier-level caps (typically 100 msgs/sec per long code, hundreds per short code), so you hold many sender identities, not one.
+These are under what Apple's push service (APNs), Google's push service (FCM), SendGrid, and Twilio can take. But only if you stay under their per-account limits. SMS in particular has carrier limits (around 100 messages per second per long phone number). So you hold many sender phone numbers, not one.
 
-**Storage for delivery records.** One row per delivery, ~120 bytes (16B notification_id + 8B user_id + 1B channel + 16B event_id + 8B template_id + 1B status + 8B sent_at + 32B provider_msg_id + 1B retries + ~30B overhead). At 10B notifications/day: 10B × 120B = 1.2TB/day. Over 30 days, ~36TB. Sharded by `notification_id` hash, that fits across 32 to 64 shards.
+**Storage for delivery records.**
 
-**Marketing campaign burst.** 10M notifications in 5 minutes is ~33K/sec sustained for those 5 minutes. On top of the steady 116K/sec, that is a ~30% spike. The queue must absorb 10M messages within 5 minutes without backpressuring the producer. Kafka handles this trivially with correctly-sized partitions.
+One row per delivery is about 120 bytes. At 10 billion notifications per day:
 
-**Fan-out worker pool.** At 500 calls/sec per worker, the 116K/sec sustained rate needs about 230 workers. Peak around 700. Auto-scale on consumer lag.
+10 billion × 120 bytes = **1.2 TB per day**.
 
-The total throughput is not the hard part. The hard parts are these three:
+Over 30 days, that is **36 TB**. Spread across 32 to 64 database shards, manageable.
 
-1. Fan-out per event ranges from 0 to 1 million, and the system has to scale across that range without operators tuning anything.
-2. External providers (APNs, FCM, SendGrid, Twilio) are slow and lossy compared to in-house services. You retry without duplicating.
-3. Preferences and quiet hours have to be evaluated cheaply and consistently for every single notification.
+**Marketing campaign burst.**
+
+10 million notifications in 5 minutes = 33,000 per second for those 5 minutes. On top of the steady 116,000 per second, that is a 30% spike. Kafka handles this without sweating, as long as the partitions are sized right.
+
+**Worker pool size.**
+
+At 500 calls per second per worker, the 116,000 per second sustained rate needs about **230 workers**. Peak around **700**. Auto-scale based on how far behind the queues fall.
+
+**What the math is telling you.**
+
+Total throughput is not the hard part. The hard parts are these three:
+
+1. Fan-out per event ranges from 0 to 1 million. The system must handle that range without operators changing settings every day.
+2. External providers (Apple, Google, SendGrid, Twilio) are slow and lossy compared to your own services. You have to retry without sending duplicates.
+3. Preferences and quiet hours must be checked cheaply and correctly for every single notification.
+
+> **Why does fan-out shape matter so much?** Imagine two products. Product A sends 1 million notifications a day, evenly. That is ~12 per second. Easy. Product B sends 1 million a day, but 900,000 of them go out in a single 5-minute marketing blast. Same total, but Product B's queue must absorb a 3,000-per-second burst. Same number on paper. Totally different system.
 
 </details>
 
-## Step 3: pipeline architecture
+---
 
-Notifications follow a producer-to-consumer pipeline with several stages between the triggering event and the delivered message. Sketch the pipeline. Four stages: ingest the event, expand to per-recipient notifications, route per channel, deliver via external provider.
+## Step 3: The pipeline
 
-<details>
-<summary><b>Reveal: full pipeline</b></summary>
+Notifications flow through a pipeline. Four stages, each doing one job.
+
+```
+1. Ingest    -> 2. Fan-out    -> 3. Route per channel    -> 4. Deliver
+   (front       (one event       (separate queue for         (call APNs,
+    door)        becomes many     each channel)               FCM, SendGrid,
+                 notifications)                               Twilio)
+```
+
+Try to fill in why each stage exists, then check.
+
+<details markdown="1">
+<summary><b>Show: full pipeline with reasons</b></summary>
 
 ```
    Producer Service (the thing that fires the event)
-   e.g. PostService, BillingService, MarketingTool
-                 │
-                 │   1. POST /events  { event_id, type, payload, recipients[] }
-                 ▼
-   ┌─────────────────────────────────────┐
-   │  Notification Ingest API            │  Auth, validation, idempotency
-   │  (stateless)                        │  on event_id
-   └────────────┬────────────────────────┘
-                │
-                │   2. Append to events.created Kafka topic
-                ▼
-   ┌─────────────────────────────────────┐
-   │  Fan-out Service                    │  For each recipient:
-   │  (Kafka consumer)                   │   - load user preferences
-   │                                     │   - load template
-   │                                     │   - decide channels (per opt-in)
-   │                                     │   - check quiet hours
-   │                                     │   - check aggregation window
-   │                                     │  Emit per-channel tasks.
-   └────────────┬────────────────────────┘
-                │
-                │   3. Append to per-channel topics:
-                │      notifications.push, .email, .sms, .in_app
-                ▼
-   ┌─────────────────────────────────────┐
-   │  Channel Workers                    │  One pool per channel.
-   │  (push / email / sms / in-app)      │  Render template, call provider.
-   └────────────┬────────────────────────┘
-                │
-                │   4. Provider call (APNs, FCM, SendGrid, Twilio, ...)
-                ▼
-              User device / inbox / phone
+   like PostService, BillingService, MarketingTool
+                 |
+                 |  1. POST /events  { event_id, type, payload, recipients[] }
+                 v
+   +-------------------------------------+
+   |  Notification Ingest API            |  Check who you are, check the
+   |  (stateless, just a front door)     |  payload, dedup on event_id
+   +------------+------------------------+
+                |
+                |  2. Append to "events.created" Kafka topic
+                v
+   +-------------------------------------+
+   |  Fan-out Service                    |  For each recipient:
+   |  (reads from Kafka)                 |   - load user preferences
+   |                                     |   - load the template
+   |                                     |   - decide which channels
+   |                                     |   - check quiet hours
+   |                                     |   - check aggregation window
+   |                                     |  Then emit per-channel tasks.
+   +------------+------------------------+
+                |
+                |  3. Append to per-channel topics:
+                |     notifications.push, .email, .sms, .in_app
+                v
+   +-------------------------------------+
+   |  Channel Workers                    |  One worker pool per channel.
+   |  (push / email / sms / in-app)      |  Render the template, call
+   |                                     |  the external provider.
+   +------------+------------------------+
+                |
+                |  4. Call the external provider
+                v
+              User's phone / inbox / app
 ```
 
-Why each stage:
+**Why each stage exists:**
 
-- Ingest API is the front door. It validates and dedups on `event_id`. Same `event_id` twice and the second one is dropped before it costs anything downstream.
-- Kafka in the middle decouples producers from consumers. Producers post and get a fast 202. Consumers run at their own pace. If a downstream provider goes down, messages queue up and drain when it returns.
-- Fan-out Service is where the event-to-notifications expansion happens. One event may produce 0 (user opted out), 1 (single channel), or many (multi-channel per recipient x many recipients). All preference and aggregation logic lives here.
-- Per-channel topics. Each channel has different throughput, different rate limits, different retry semantics. Separating them means a SendGrid outage does not back up push delivery.
-- Channel workers are stateless. Render the localized template, call the provider, record the outcome.
+- **Ingest API** is the front door. It checks the request, then dedups on `event_id`. If the same `event_id` shows up twice, the second one gets dropped before it costs anything downstream.
+
+> **Why dedup at the front door?** Because producers retry on timeouts. They sent the event, then their network blipped, so they sent it again. Without dedup, your user gets two notifications. The fix is one line: check if you have seen this event_id in the last 24 hours.
+
+- **Kafka in the middle** separates producers from consumers. Producers post and get a fast OK. Consumers process at their own pace. If a downstream provider goes down, messages queue up and drain when it comes back.
+
+- **Fan-out Service** is where the magic happens. One event might become 0, 1, or 1,000 notifications. All preference and aggregation logic lives here.
+
+- **Per-channel queues.** Each channel has different speeds, different limits, different retry rules. Keep them in separate queues so a SendGrid outage does not back up push delivery.
+
+> **Why separate queues?** Imagine you have one big "notifications" queue. SendGrid goes down. Email retries pile up. The single queue gets backed up. Now push notifications also slow down, because they share the queue. One bad channel takes everyone down. Separating queues stops this.
+
+- **Channel workers** are simple and stateless. Render the message, call the provider, record what happened.
 
 </details>
 
-## Step 4: incomplete diagram
+---
 
-Fill in the six `[ ? ]` boxes. Hint: think about who owns user preferences, who renders the message body, where the dedup state lives, and what the external providers look like.
+## Step 4: Sequence diagram, event to delivered push
+
+Before drawing the full architecture, walk through a single event from start to finish. One like on a post. One push notification to one phone.
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant I as Ingest API
+    participant R as Event Router (Kafka)
+    participant F as Fan-out
+    participant U as User Prefs
+    participant C as Push Channel
+    participant A as APNs
+    participant D as Device
+
+    P->>I: POST /events (event_id, recipient)
+    I->>I: Dedup on event_id
+    I->>R: Append to events topic
+    I-->>P: 202 Accepted
+
+    R->>F: Read event
+    F->>U: Load user preferences
+    U-->>F: push=on, in quiet hours? no
+    F->>F: Pick channels (push)
+    F->>C: Emit to push topic
+
+    C->>C: Render template
+    C->>A: HTTP/2 POST /3/device/{token}
+    A-->>C: 200 OK
+    C->>D: Delivered
+```
+
+The trick is what the boxes do not say. The Fan-out check is doing five things in parallel: preferences, template, quiet hours, hourly cap, dedup. If any one says "no," the notification stops there. We will see that in detail later.
+
+---
+
+## Step 5: The big architecture
+
+Now draw all the supporting pieces. Eight boxes are missing in the diagram below. Think about: who owns user preferences, who renders the message, where dedup state lives, where device tokens are stored.
 
 ```
-   Producer Services ──► ┌────────────────┐
-                         │   Ingest API   │
-                         └───────┬────────┘
-                                 │
-                                 ▼
-                         ┌────────────────┐
-                         │  events Kafka  │
-                         └───────┬────────┘
-                                 │
-                                 ▼
-                         ┌────────────────┐         ┌──────────────────┐
-                         │   Fan-out      │◄────────│   [ ? ]          │  (per-user opt-in,
-                         │   Service      │         │                  │   quiet hours, locale)
-                         └──┬─────────────┘         └──────────────────┘
-                            │
-                            │             ┌──────────────────┐
-                            │◄────────────│   [ ? ]          │  (subject, body,
-                            │             │                  │   localized, versioned)
-                            │             └──────────────────┘
-                            │
-                            │             ┌──────────────────┐
-                            │◄────────────│   [ ? ]          │  (event_id+recipient+
-                            │             │                  │   channel → already sent?)
-                            │             └──────────────────┘
-                            │
-                            ▼
-                ┌────────────────────────────┐
-                │  per-channel Kafka topics  │
-                │ push / email / sms / inapp │
-                └─────┬────┬────┬────┬───────┘
-                      │    │    │    │
-                      ▼    ▼    ▼    ▼
-                ┌───┐ ┌───┐ ┌───┐ ┌───┐
-                │[?]│ │[?]│ │[?]│ │[?]│  (each calls its external provider)
-                └─┬─┘ └─┬─┘ └─┬─┘ └─┬─┘
-                  │     │     │     │
-                  ▼     ▼     ▼     ▼
+   Producer Services --> +----------------+
+                         |   Ingest API   |
+                         +-------+--------+
+                                 |
+                                 v
+                         +----------------+
+                         |  events Kafka  |
+                         +-------+--------+
+                                 |
+                                 v
+                         +----------------+        +------------------+
+                         |   Fan-out      |<-------|    [ ? ]         |  (per-user opt-in,
+                         |   Service      |        |                  |   quiet hours, locale)
+                         +--+-------------+        +------------------+
+                            |
+                            |             +------------------+
+                            |<------------|    [ ? ]         |  (subject, body,
+                            |             |                  |   localized, versioned)
+                            |             +------------------+
+                            |
+                            |             +------------------+
+                            |<------------|    [ ? ]         |  (event_id + recipient +
+                            |             |                  |   channel -> already sent?)
+                            |             +------------------+
+                            |
+                            v
+                +----------------------------+
+                |  per-channel Kafka topics  |
+                | push / email / sms / inapp |
+                +-----+----+----+----+-------+
+                      |    |    |    |
+                      v    v    v    v
+                +---+ +---+ +---+ +---+
+                |[?]| |[?]| |[?]| |[?]|  (each calls its external provider)
+                +-+-+ +-+-+ +-+-+ +-+-+
+                  |     |     |     |
+                  v     v     v     v
                 APNs/  Send  Twilio/ WebSocket
                 FCM    Grid   SNS    push to
                               SMS    open app
 ```
 
-<details>
-<summary><b>Reveal: complete diagram</b></summary>
+<details markdown="1">
+<summary><b>Show: full architecture</b></summary>
 
 ```
-   Producer Services ──► ┌────────────────┐
-                         │   Ingest API   │  Auth, idempotency on event_id
-                         └───────┬────────┘
-                                 │
-                                 ▼
-                         ┌────────────────┐
-                         │  events Kafka  │  topic: events.created
-                         └───────┬────────┘  partitioned by recipient_id hash
-                                 │
-                                 ▼
-                         ┌────────────────┐         ┌─────────────────────┐
-                         │   Fan-out      │◄────────│  Preferences Service │
-                         │   Service      │         │  (per-channel opt-in,│
-                         └──┬─────────────┘         │   per-event opt-out, │
-                            │                       │   quiet hours, tz,   │
-                            │                       │   locale)            │
-                            │                       └─────────────────────┘
-                            │
-                            │             ┌─────────────────────┐
-                            │◄────────────│  Template Service   │
-                            │             │  (localized subject │
-                            │             │   + body, versioned │
-                            │             │   per channel,      │
-                            │             │   A/B variants)     │
-                            │             └─────────────────────┘
-                            │
-                            │             ┌─────────────────────┐
-                            │◄────────────│  Dedup Store        │
-                            │             │  (Redis with TTL,   │
-                            │             │   key = event_id +  │
-                            │             │   recipient +       │
-                            │             │   channel)          │
-                            │             └─────────────────────┘
-                            │
-                            ▼
-                ┌────────────────────────────┐
-                │  per-channel Kafka topics  │
-                │ push / email / sms / inapp │
-                └─────┬────┬────┬────┬───────┘
-                      │    │    │    │
-                      ▼    ▼    ▼    ▼
-                ┌────┐┌────┐┌────┐┌────┐
-                │Push││Mail││ SMS││InApp│
-                │ Wkr││ Wkr││ Wkr││ Wkr │
-                └─┬──┘└─┬──┘└─┬──┘└─┬──┘
-                  │     │     │     │
-                  ▼     ▼     ▼     ▼
+   Producer Services --> +----------------+
+                         |   Ingest API   |  Auth, dedup on event_id
+                         +-------+--------+
+                                 |
+                                 v
+                         +----------------+
+                         |  events Kafka  |  topic: events.created
+                         +-------+--------+  partitioned by recipient_id hash
+                                 |
+                                 v
+                         +----------------+      +-----------------------+
+                         |   Fan-out      |<-----|  Preferences Service  |
+                         |   Service      |      |  (per-channel opt-in, |
+                         +--+-------------+      |   per-event opt-out,  |
+                            |                    |   quiet hours, tz,    |
+                            |                    |   locale)             |
+                            |                    +-----------------------+
+                            |
+                            |             +-----------------------+
+                            |<------------|  Template Service     |
+                            |             |  (subject + body,     |
+                            |             |   localized, versioned|
+                            |             |   per channel,        |
+                            |             |   A/B variants)       |
+                            |             +-----------------------+
+                            |
+                            |             +-----------------------+
+                            |<------------|  Dedup Store          |
+                            |             |  (Redis with TTL,     |
+                            |             |   key = event_id +    |
+                            |             |   recipient +         |
+                            |             |   channel)            |
+                            |             +-----------------------+
+                            |
+                            v
+                +----------------------------+
+                |  per-channel Kafka topics  |
+                | push / email / sms / inapp |
+                +-----+----+----+----+-------+
+                      |    |    |    |
+                      v    v    v    v
+                +----+ +----+ +----+ +-----+
+                |Push| |Mail| |SMS | |InApp|
+                |Wkr | |Wkr | |Wkr | |Wkr  |
+                +-+--+ +-+--+ +-+--+ +-+---+
+                  |     |     |     |
+                  v     v     v     v
                 APNs/  Send  Twilio/ WebSocket
                 FCM    Grid   SNS    push to
                               SMS    open app
-                  │     │     │     │
-                  ▼     ▼     ▼     ▼
-              Device Inbox  Phone  In-app
-                                   feed
+                  |     |     |     |
+                  v     v     v     v
+              Device Inbox  Phone  In-app feed
 ```
 
 What each new piece does:
 
-- Preferences Service. Cheap, hot, read-mostly. Fan-out hits it once per recipient. Cached aggressively because preferences change rarely.
-- Template Service. Stores message templates with variables (`Hi {{name}}, you have {{count}} new likes`), versioning, and localization. The renderer is a small library called inside the channel workers; the Template Service just serves template metadata and bodies.
-- Dedup Store. Redis with TTL. Key is `event_id + recipient + channel`. If present, the notification was already sent (or is in flight) and we skip. TTL is long enough to cover all retry windows (24 hours works).
-- Per-channel workers. Each pool sized independently. Push workers call APNs and FCM in batches; email workers call SendGrid; SMS workers call Twilio with per-number rate limiting; in-app workers write to a WebSocket gateway or store-and-poll.
+- **Preferences Service.** Cheap, hot, mostly read. Fan-out hits it once per recipient. Heavily cached because preferences rarely change.
+
+- **Template Service.** Stores message templates with variables (like `Hi {{name}}, you have {{count}} new likes`). Versioned. Localized. The renderer is a small library called inside the channel workers. The Template Service just hands out template content.
+
+- **Dedup Store.** Redis with TTL. Key is `event_id + recipient + channel`. If the key is there, the notification was already sent (or is on its way). Skip. TTL is 24 hours, long enough to cover all retry windows.
+
+- **Per-channel workers.** Each pool is sized on its own. Push workers call APNs and FCM in batches. Email workers call SendGrid. SMS workers call Twilio with per-number rate limiting. In-app workers write to a WebSocket gateway or to a store-and-poll table.
+
+> **Why is dedup keyed on three things, not just `event_id`?** Because one event can go to many recipients (fan-out). And one recipient can get notifications on multiple channels (push, email, in-app for the same event). The unique unit is `event + person + channel`. Anything less and you either miss real notifications or send duplicates.
 
 </details>
 
-## Step 5: retry, dedup, and deadletter
+---
 
-External providers fail. APNs returns 429 when you push too fast. SendGrid returns 5xx during their incidents. Twilio rejects messages to invalid numbers permanently. The design has to distinguish "transient failure, try again" from "permanent failure, give up and clean up" without sending the same notification twice.
+## Step 6: Retry, dedup, and deadletter
 
-Take 10 minutes to design:
+External providers fail. APNs returns 429 when you push too fast. SendGrid returns 5xx during their incidents. Twilio rejects messages to invalid numbers. The design has to tell "try again later" apart from "give up forever" without sending the same notification twice.
 
-1. The retry policy per channel (how many retries, with what backoff)
+Take 10 minutes. Design:
+
+1. The retry policy per channel (how many tries, with what wait between)
 2. The idempotency key (so retries do not duplicate)
 3. What goes to the deadletter queue and who looks at it
 4. How invalid push tokens get cleaned up
 
-<details>
-<summary><b>Reveal: retry strategy</b></summary>
+```mermaid
+flowchart TD
+    A[Send notification] --> B{Provider response}
+    B -->|200 OK| C[Mark delivered<br/>store dedup key]
+    B -->|429 or 5xx| D{Retries left?}
+    B -->|4xx invalid token| E[Mark token dead<br/>tell device registry]
+    B -->|4xx other| F[Send to deadletter<br/>human reviews]
+    D -->|Yes| G[Wait with backoff<br/>2s, 4s, 8s, 16s, 32s]
+    G --> A
+    D -->|No| H[Send to deadletter]
+```
 
-Retry classification. Every provider response falls into one of three buckets:
+<details markdown="1">
+<summary><b>Show: full retry strategy</b></summary>
 
-| Bucket | What it means | Action |
-|--------|---------------|--------|
-| Transient | 429, 5xx, timeout, network reset | Retry with exponential backoff |
-| Permanent invalid recipient | APNs `Unregistered`, FCM `NotRegistered`, Twilio invalid number, email hard bounce | Do not retry. Mark recipient address as invalid. Trigger cleanup. |
-| Permanent rejection | Template rejected, content flagged, blacklisted sender | Do not retry. Send to deadletter for human review. |
+**Sorting responses into three buckets.** Every provider response falls into one of three:
 
-Per-channel retry policy:
+| Bucket | What it means | What to do |
+|--------|---------------|------------|
+| Transient | 429, 5xx, timeout, network reset | Wait, then try again |
+| Permanent invalid recipient | APNs `Unregistered`, FCM `NotRegistered`, Twilio invalid number, email hard bounce | Do not retry. Mark the address as dead. Clean it up. |
+| Permanent rejection | Template rejected, content flagged, sender blacklisted | Do not retry. Send to deadletter for a human to look at. |
+
+> **Why retry only on 5xx but not 4xx?** Because 5xx means the server temporarily failed (it might work next time). 4xx means we sent something wrong (invalid token, bad payload). Retrying a 4xx will fail forever. Knowing the difference stops a million pointless API calls.
+
+**Per-channel retry policy:**
 
 | Channel | Max retries | Backoff | Max retry window |
 |---------|-------------|---------|------------------|
-| Push (APNs/FCM) | 5 | exp(2,4,8,16,32 sec) + jitter | 60 sec (push must be fresh) |
-| In-app | 3 | exp(1,2,4 sec) | 7 sec |
-| Email | 8 | exp(30s,1m,5m,15m,1h,4h,12h,24h) | 24 hours |
-| SMS | 3 | exp(5s,30s,2m) + jitter | 5 min |
+| Push (APNs/FCM) | 5 | 2s, 4s, 8s, 16s, 32s + jitter | 60 seconds (push must be fresh) |
+| In-app | 3 | 1s, 2s, 4s | 7 seconds |
+| Email | 8 | 30s, 1m, 5m, 15m, 1h, 4h, 12h, 24h | 24 hours |
+| SMS | 3 | 5s, 30s, 2m + jitter | 5 minutes |
 
-Push retries have a tight window because a 2-hour-old "your driver has arrived" push is useless. Email retries are generous because email is store-and-forward by nature and provider outages can last hours.
+Push retries have a tight window because a 2-hour-old "your driver arrived" push is junk. Email retries are generous because email is store-and-forward by nature. SendGrid outages can last hours.
 
-Idempotency key:
+> **What is jitter?** Random wiggle added to the backoff. If 1,000 workers all wait exactly 8 seconds, they all hit the provider at the same instant. The provider falls over again. Jitter spreads them out so they retry at different times. Tiny detail, huge impact.
+
+**The idempotency key:**
 
 ```
 dedup_key = sha256(event_id + recipient_user_id + channel)
 ```
 
-Stored in Redis with a 24-hour TTL. Two checks:
+Stored in Redis with a 24-hour TTL.
 
-1. Before send. Channel worker checks `EXISTS dedup_key`. If present, skip (retry of an already-delivered message).
-2. After send. Channel worker `SET dedup_key 1 EX 86400`.
+```mermaid
+flowchart TD
+    A[Channel worker picks up task] --> B[Check dedup key in Redis]
+    B -->|Key exists| C[Skip - already sent or in flight]
+    B -->|Key missing| D[SETNX dedup_key]
+    D -->|Won the race| E[Call provider]
+    D -->|Lost the race| C
+    E --> F[Set dedup_key with TTL 24h]
+```
 
-Race condition: two workers process the same message simultaneously because Kafka rebalanced and replayed. Both see the key missing, both send. Fix: `SET dedup_key 1 NX EX 86400` (set only if not exists) returns whether the worker is the winner. The loser skips the provider call. That narrows the race to the inflight provider call itself; the tiny duplicate risk during rebalances is acceptable for most categories.
+> **Why SETNX and not just SET?** SETNX means "set only if not exists." It is atomic. If two workers both try at the same instant, only one wins. The loser sees "already set" and skips the provider call. Without SETNX, both could check, both see empty, both send. Duplicate notification.
 
-For mission-critical channels (SMS for 2FA), use a stronger check: write to a Postgres row with `INSERT... ON CONFLICT DO NOTHING RETURNING` and only proceed if you got the insert. Adds latency. Guarantees no duplicates.
+For mission-critical channels (SMS for 2FA codes), use a stronger check. Write to a Postgres row with `INSERT ON CONFLICT DO NOTHING RETURNING`. Slower (one DB write per send) but bulletproof.
 
-Deadletter queue. Messages that exhaust retries go to `notifications.deadletter.{channel}`. A small dashboard surfaces them grouped by error reason. Permanent invalid recipients are auto-cleaned (push token deregistered, email marked bounced). The rest land in front of a human, usually within an hour.
+**Deadletter queue.** Messages that fail all retries go to `notifications.deadletter.{channel}`. A small dashboard groups them by error reason. Permanent invalid recipients get auto-cleaned. The rest land in front of a human, usually within an hour.
 
-Push token cleanup. APNs and FCM both return "this token is dead" responses. The channel worker reads this and:
+**Push token cleanup.** APNs and FCM both tell you when a token is dead. The channel worker:
 
-- Writes a row to a `push_token_invalidations` topic.
-- A small consumer marks the token as `revoked` in the user-devices table.
-- Future notifications skip that token. If the user has no other devices, the push channel returns "no recipient" for that user, which Fan-out treats like an opt-out.
+1. Sees the dead-token response.
+2. Writes to a `push_token_invalidations` topic.
+3. A small consumer marks the token as `revoked` in the device table.
+4. Future notifications skip that token. If the user has no other devices, push acts like an opt-out for that user.
 
 </details>
 
-## Step 6: rate limiting, aggregation, and quiet hours
+---
 
-Notifications are the easiest way to make users uninstall your app. Three guardrails, each operating at a different scope.
+## Step 7: Dedup, drawn out
+
+The dedup check is the single most important thing in this design. If it works, retries are safe. If it does not, users hate you.
+
+```mermaid
+flowchart TD
+    A[Event arrives at Fan-out] --> B[Build dedup key:<br/>event_id + recipient + channel]
+    B --> C{Key in Redis?}
+    C -->|Yes, seen before| D[Skip<br/>do nothing]
+    C -->|No, first time| E[SETNX key with 24h TTL]
+    E -->|SETNX succeeded| F[Proceed: render + send]
+    E -->|SETNX failed<br/>someone beat us| D
+    F --> G{Provider response}
+    G -->|Success| H[Key stays set for 24h<br/>no duplicates possible]
+    G -->|Transient fail| I[Backoff and retry<br/>key already set<br/>so retry is safe]
+```
+
+> **Why does the TTL exist?** Two reasons. One, Redis would fill up forever otherwise. Two, after 24 hours, a "retry" of the same event_id is more likely an operator manually resending or a real bug. You want it to go through, not silently skip.
+
+> **What if a worker dies right after SETNX but before calling the provider?** The key is set, but the notification was never sent. The user never gets it. To handle this, you can store the worker_id and a timestamp in the dedup value. On replay, check if that worker is still alive (heartbeat). If dead, the replay proceeds. For social and marketing notifications, the simpler SETNX is fine. For 2FA codes, use the bulletproof Postgres version.
+
+---
+
+## Step 8: Rate limiting, aggregation, and quiet hours
+
+Notifications are the fastest way to make users uninstall your app. Three guardrails, each at a different layer.
 
 Take 10 minutes:
 
-1. Per-user cap. A user should not receive more than N notifications per hour across all channels (let alone per channel).
-2. Aggregation. 100 likes on one post should be one notification ("John and 99 others"), not 100.
-3. Quiet hours. A user in Tokyo at 2am should not receive a marketing push, even if the system is in California at 10am.
+1. **Per-user cap.** A user should not get more than N notifications per hour, across all channels.
+2. **Aggregation.** 100 likes on one post should be one notification ("John and 99 others"), not 100.
+3. **Quiet hours.** A user in Tokyo at 2am should not get a marketing push, even if it is 10am in California where your servers run.
 
-How do you implement each? Where in the pipeline do these live?
+How do you build each? Where in the pipeline do they live?
 
-<details>
-<summary><b>Reveal: guardrails</b></summary>
+<details markdown="1">
+<summary><b>Show: all three guardrails</b></summary>
 
-Per-user cap. Lives in the Fan-out Service, after channel selection, before emitting per-channel tasks.
+**Per-user cap.** Lives in the Fan-out Service. After choosing channels, before emitting per-channel tasks.
 
-Mechanism: a Redis sliding-window counter per `(user_id, channel)`. `INCR notifications:hourly:{user_id}:{channel}` with a 1-hour TTL. If the counter exceeds the cap (say 20/hour for push, 5/hour for SMS), drop the notification or defer it to a daily digest.
+How: a Redis sliding-window counter per `(user_id, channel)`.
 
-The cap is per-channel because the costs differ. SMS at $0.01 each is much costlier than push at near zero, so the SMS cap is much tighter.
+```
+INCR notifications:hourly:user_456:push
+EXPIRE notifications:hourly:user_456:push 3600
+```
 
-Transactional notifications (your code, your invoice, your driver arrived) bypass the cap. They are tagged with `category=transactional` and the cap check skips them. Only `marketing` and `social` categories count toward the cap.
+If the counter exceeds the cap (say 20/hour for push, 5/hour for SMS), drop the notification or hold it for a daily digest.
 
-Aggregation. Also Fan-out, on a separate path for aggregatable events.
+> **Why per-channel and not just per-user?** Because the costs differ. SMS costs about $0.01 each. Push costs near zero. You can send a user 50 pushes a day without thinking. 50 SMS a day costs you $0.50 and probably gets you sued.
 
-Events that can be batched (likes, follows, comments on the same post) carry an `aggregation_key` like `post:{post_id}:likes`. The Fan-out Service does:
+Transactional notifications (your code, your invoice, your driver arrived) bypass the cap. They are tagged `category=transactional` and the check skips them. Only `marketing` and `social` count.
 
-1. On event arrival, check Redis for an existing aggregation window: `EXISTS agg:{aggregation_key}`.
-2. If no window: start a window with `SETEX agg:{aggregation_key} 3600 1` (1-hour window) and emit a "delayed" notification scheduled for window end.
-3. If window exists: `INCR agg:{aggregation_key}`. Do not emit a new notification.
-4. When the window expires, a scheduled job (or a delayed Kafka message) reads the count and dispatches one notification with the aggregated content.
+**Aggregation.** Same place. Separate path for events that can be batched.
 
-The notification body is templated: `"{{first_actor.name}} and {{count - 1}} others liked your post"`. Fan-out materializes the actor list at window-close time.
+Events that can be aggregated (likes, follows, comments on the same post) carry an `aggregation_key` like `post:789:likes`. The Fan-out Service does:
 
-There is a subtle ordering problem. The window starts on the first event, so a user who gets 1 like at T=0 and 99 likes at T=3599 gets one notification at T=3600 (good). A user who gets 99 likes at T=0 and 1 like at T=3601 gets two notifications (the first 99, then the lonely 1). Tunable; some products use rolling windows, some use fixed.
+1. On arrival, check Redis for an open window: `EXISTS agg:post:789:likes`.
+2. If no window: start one with `SETEX agg:post:789:likes 3600 1` (1-hour window). Schedule a "close" message for window end.
+3. If window exists: `INCR agg:post:789:likes`. Do not emit anything new.
+4. When the window expires, a scheduled job reads the count and sends one notification with the aggregated content.
 
-Quiet hours. Fan-out again, before emitting any task to a channel topic.
+The template looks like: `"{{first_actor.name}} and {{count - 1}} others liked your post"`. Fan-out materializes the actor list at window close.
 
-Each user's preferences include their timezone and a do-not-disturb window (e.g., 22:00 to 07:00 local). Fan-out converts "now" to the user's local time and checks the window.
+> **Subtle ordering bug.** Window starts on the first event. User gets 1 like at T=0 and 99 likes at T=3,599. They get one notification at T=3,600. Good. But if they get 99 likes at T=0 and 1 like at T=3,601, they get two notifications: the big one, then a lonely "1 person liked your post." Adjustable; some products use rolling windows.
+
+**Quiet hours.** Fan-out again, before emitting to any channel.
+
+Each user's preferences include their timezone and a do-not-disturb window (like 22:00 to 07:00 local time). Fan-out converts "now" to the user's local time and checks the window.
 
 If now is inside the quiet window:
 
-- Transactional. Still send. Quiet hours do not apply.
-- Marketing. Drop. Marketing during quiet hours is dropped, not delayed. Users hate getting a morning rush of overnight notifications.
-- Social (likes, follows, comments). Defer. Hold in a "deferred" topic with a delayed delivery time set to the end of quiet hours. When the user wakes up, they get a digest.
+- **Transactional.** Send anyway. Quiet hours do not apply.
+- **Marketing.** Drop. Do not delay. Users hate a morning rush of overnight notifications.
+- **Social** (likes, follows, comments). Hold. Move to a "deferred" topic with a delayed delivery time set to the end of quiet hours. When the user wakes up, they get a digest.
 
-The deferred topic is a Kafka topic with delayed delivery support (or a separate scheduling service that releases messages at the right time). At end of quiet hours, messages flow into the per-channel topics as normal.
+> **Why drop marketing instead of holding it?** Because the marketing message is timed. "Lunch deal, $5 off until 3pm" is useless at 8am the next day. Holding it would deliver a stale message. Dropping is better than misleading.
 
-Timezone is critical. A marketing campaign that fires at "Tuesday 10am" must fire at 10am in every recipient's local time, not at 10am UTC. Fan-out shards work by recipient timezone for campaigns.
+**Timezone matters.** A marketing campaign that fires "Tuesday 10am" should fire at 10am in each user's local time. Not 10am UTC. Fan-out groups campaign work by user timezone.
 
 </details>
+
+---
 
 ## Follow-up questions
 
 Try answering each in 3 to 4 sentences before reading the solution.
 
-1. A producer service retries an event due to a network blip and sends `event_id=42` twice within 100ms. Walk through how the system avoids sending duplicate notifications. What if the second retry comes 25 hours later, after the dedup TTL expires?
+1. A producer service retries an event because of a network blip and sends `event_id=42` twice within 100ms. Walk through how the system avoids sending duplicate notifications. What if the second retry comes 25 hours later, after the dedup TTL expires?
 
-2. A marketing campaign is meant to send to 10M users but the operator accidentally targets 100M. How do you stop it mid-flight? What state has to be torn down?
+2. A marketing campaign is meant to send to 10 million users but the operator accidentally targets 100 million. How do you stop it mid-flight? What state has to be torn down?
 
 3. APNs is down for 30 minutes. What happens to push notifications during the outage? What happens when it comes back? Do users see a flood at recovery?
 
-4. A user updates their notification preferences to opt out of marketing, but a marketing campaign was already queued. Are messages already in the queue still sent, or honored against the latest preferences?
+4. A user updates their notification preferences to opt out of marketing, but a marketing campaign was already queued. Are messages already in the queue still sent, or do they honor the latest preferences?
 
-5. A user has 5 devices. They post something that triggers a notification to themselves (e.g., "your scheduled post just went live"). How many push notifications? On which devices? What if one device is signed out?
+5. A user has 5 devices. They post something that triggers a notification to themselves (like "your scheduled post just went live"). How many push notifications? On which devices? What if one device is signed out?
 
-6. You discover that one notification template has a bug: it sends "{{name}}" literally instead of the user's name. How do you roll back? What about the messages already sent?
+6. You discover that one notification template has a bug: it sends literal `{{name}}` instead of the user's name. How do you roll back? What about messages already sent?
 
 7. The notifications database is showing one shard much hotter than others. Diagnose.
 
 8. A user complains they got an SMS at 4am. Trace the path: who is responsible? How do you reproduce?
 
-9. Web push (browser-based push notifications) needs to be added as a new channel. What changes in the architecture? What stays the same?
+9. Web push (browser-based push) needs to be added as a new channel. What changes in the architecture? What stays the same?
 
 10. Compliance asks: prove that user 12345 received exactly the notifications we claim, and not others. What is your audit trail? How long do you keep it?
 
+---
+
 ## Related problems
 
-- [News Feed (002)](../002-news-feed/question.md). The fan-out worker pattern is the same. The celebrity problem (one author with millions of followers) maps onto the marketing campaign problem here (one event targeting millions of recipients).
-- [Rate Limiter (004)](../004-rate-limiter/question.md). The per-user notification cap is exactly a rate limiter scoped to a user. The sliding-window counter and token-bucket variants apply directly.
-- [Chat System (003)](../003-chat-system/question.md). Push notification delivery to mobile devices is the same problem as chat message delivery. APNs and FCM are the same tools, and the device-token lifecycle is shared.
-- [Distributed Cache (009)](../009-distributed-cache/question.md). Preferences and dedup state both live in Redis with TTL. Hot-key and eviction behavior matters here too.
+- **[News Feed (002)](../002-news-feed/question.md).** The fan-out worker pattern is the same. The celebrity problem (one author with millions of followers) maps onto the marketing campaign problem here (one event targeting millions of recipients).
+- **[Rate Limiter (004)](../004-rate-limiter/question.md).** The per-user notification cap is exactly a rate limiter scoped to a user. The sliding-window counter and token-bucket variants apply directly.
+- **[Chat System (003)](../003-chat-system/question.md).** Push notification delivery to mobile devices is the same problem as chat message delivery. APNs and FCM are the same tools, and the device-token lifecycle is shared.
+- **[Distributed Cache (009)](../009-distributed-cache/question.md).** Preferences and dedup state both live in Redis with TTL. Hot-key and eviction behavior matters here too.
+- **[Approval Management (011)](../011-approval-management/question.md).** Every approval event fires off notifications. The fan-out, retry, and quiet-hours machinery here consumes the approval engine's events.

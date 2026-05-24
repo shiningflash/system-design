@@ -7,258 +7,477 @@ difficulty: Hard
 solution: solution.md
 ---
 
-## Scene
+## The scene
 
-The interviewer used to work on Twitter's home timeline team. They open with:
+You sit down. The interviewer slides a sheet of paper across the table.
 
-> *Design Twitter. Specifically the home timeline: the chronological-ish list of posts from people you follow, plus some "you might like" injection. Walk me through it.*
+> *"Design Twitter. Not the whole thing. Just the home feed. You know, the list of posts from people you follow. Walk me through it."*
 
-Then they sit back. The prompt looks like "design a feed," but what they actually want to hear about is fan-out. Miss that and the rest of your 40 minutes drawing boxes doesn't add up to much.
+Then they lean back and add: *"Start simple. A small app with 1,000 users. Then we'll grow it. By the end I want to see how it works at 300 million users."*
 
-## Step 1: clarify before you design
+It looks like a simple list problem. It is not. The trap is the word "feed." It sounds like a query. The real question is hidden: what happens when one person has 100 million followers? How do you show a fresh feed in less than 200ms? How do you stop one celebrity's post from melting the whole system?
 
-Take 5 minutes. What do you ask? Don't read further until you have at least six questions written down.
+We will walk this from a 1,000-user app to a Twitter-sized service. At each step we will name what breaks first. Then we will add the smallest fix that solves it.
 
-<details>
-<summary><b>Reveal: questions a strong candidate asks</b></summary>
+---
 
-1. Scale. "Daily active users? Average follower count? Heaviest user's follower count? Posts per day?" Twitter-like answers: 300M DAU, median 100 followers, max user 100M followers, 500M posts/day. That one number (the heaviest user) tilts the whole design.
-2. Timeline semantics. "Strict chronological, or ranked? If ranked, by what signals?" Modern Twitter, Instagram, and Facebook are all ranked. The architecture for a ranked timeline is meaningfully different because there is an ML scoring layer on the read path.
-3. Latency target. "What is the P99 for loading the home timeline?" Sub-200ms is the bar for a feed app to feel responsive.
-4. Read/write ratio. "Roughly how many timeline loads per post?" Heavily read-skewed. 100:1 read-to-write is typical. This is what justifies precomputed timelines.
-5. Freshness. "How fresh must the timeline be? Can a post take 5 seconds to appear in followers' timelines?" The usual answer is "a few seconds is fine, but a user's own post must appear instantly in their own feed."
-6. Media in posts. "Are we showing images and video inline, or just text?" If media, there is a separate CDN and thumbnail pipeline. In this round we focus on the feed itself, but I'd mention it.
-7. Notifications. "Is the notification system part of this design, or separate?" Separate is the right answer. The feed is the home timeline; notifications are a different stream.
-8. Personalization scope. "Just people I follow, or also recommended posts from accounts I don't follow?" Adds an injection step in the read path.
+## Step 1: Ask the right questions
 
-If you only asked "how many users," you missed the most important question: the heaviest user's follower count. That number alone decides whether you can push or have to pull for some users.
+Before you draw anything, sit for five minutes. Write down the questions you would ask.
 
-</details>
+A good answer is not "20 questions about every detail." It is the small handful of questions that change the design if the answer is different.
 
-## Step 2: capacity estimates
+<details markdown="1">
+<summary><b>Show: 8 questions that matter</b></summary>
 
-Inputs from the interviewer:
+1. **How big is the biggest user?** Median user has maybe 100 followers. But what about the top user? 1 million? 100 million? *(This single number decides the whole design. If the biggest user has 1,000 followers, you can push to everyone. If they have 100 million, you can't.)*
+2. **Is the feed in time order, or ranked by an algorithm?** Old Twitter was time order. New Twitter, Instagram, Facebook are all ranked by a machine learning model. Ranking adds a step on the read path.
+3. **How fast must the feed load?** Sub-200ms is the bar. Anything slower feels broken.
+4. **How many reads per write?** Posts are rare. Feed reads are constant. About 100 reads per post is normal. That changes the design a lot.
+5. **How fresh must it be?** Does my own post need to show up instantly in my feed? (Yes.) Can my friend's post take 5 seconds to reach me? (Usually yes.)
+6. **Are posts text only, or with images and video?** Media needs a CDN, thumbnails, and an upload pipeline. We will note it but focus on the feed.
+7. **Are notifications part of this design?** Say no. The feed is one product. Notifications are a different product that listens to the same events.
+8. **Do we show only posts from people I follow, or also "you might like"?** Recommendations add an injection step in the read path.
 
-- 300M DAU
-- Median user: 100 followers
-- P99 user: 1M followers
-- Top user: 100M followers
-- 500M posts per day
-- Each user loads timeline ~10x/day
-- Timeline shows the latest 50 posts
-
-Compute:
-
-1. Posts per second (sustained, peak)
-2. Timeline loads per second (sustained, peak)
-3. Fan-out volume per second under naive push (every post writes to every follower's timeline)
-4. Storage for precomputed timelines, assuming 1000 posts kept per user
-5. Why naive push breaks for a celebrity user
-
-<details>
-<summary><b>Reveal: the math</b></summary>
-
-Posts per second.
-500M / 86400 ≈ 5800 posts/sec sustained. Peak 3x → **17K posts/sec**.
-
-Timeline loads per second.
-300M × 10 / 86400 ≈ 35K loads/sec sustained, peak ~100K loads/sec.
-
-Naive fan-out volume.
-On average each post fans out to 100 followers. 5800 posts/sec × 100 = **580K timeline writes/sec sustained**, ~2M peak. Doable, but distribution matters.
-
-Storage for precomputed timelines.
-300M users × 1000 posts each × 50 bytes per timeline entry (just post_id + author_id + ts) = **15TB**. Sharded, fits.
-
-Where naive push breaks.
-One tweet from Elon (100M followers) is 100M writes for a single post. At peak we'd see ~17K of these per second in the worst case, generating 1.7 trillion writes/sec. Even one celebrity post per second is 100M writes for that single event. The fan-out worker queue gets buried, replication lag explodes, the rest of the system suffers.
-
-The insight: the heaviest user breaks naive push. The design has to treat them differently.
+A strong candidate also asks the meta question: *"Is the biggest user 1 million followers or 100 million?"* The answer changes everything.
 
 </details>
 
-## Step 3: the central design choice. Push, pull, or hybrid
+---
 
-This is the heart of the question. Before drawing anything, decide your approach. Take 10 minutes to think through:
+## Step 2: How big is this thing?
 
-- Push (fan-out on write). When user A posts, copy the post_id into every follower's timeline cache.
-- Pull (fan-out on read). When user B opens their timeline, query every account they follow and merge.
-- Hybrid. Push for users with < N followers, pull for celebrities.
+Same problem, three sizes. Do the math at each.
 
-For each, ask: what is the latency to read? To write? What breaks at scale? And what about a user who follows 5000 accounts?
+**Inputs from the interviewer:**
 
-<details>
-<summary><b>Reveal: comparison</b></summary>
+- 300 million daily active users
+- Median user has 100 followers
+- Heavy users have 1 million followers
+- Top users (celebrities) have 100 million followers
+- 500 million posts per day
+- Each user opens the app 10 times per day
+- Feed shows the latest 50 posts
 
-| Approach | Read latency | Write cost | Falls apart when |
-|----------|--------------|------------|------------------|
-| Push | ~10ms (precomputed) | O(followers) per post | A celebrity posts. 100M writes per post crushes the system. |
-| Pull | O(following) per read. ~500ms for active users. | O(1) per post (one write). | A heavy follower (someone following 5000 accounts) opens their app. 5000 fan-in queries. |
-| Hybrid | ~10ms for normal users; slightly higher for users who follow celebrities. | Bounded fan-out (push only for authors below a threshold). | Boundary effects: how do you decide who is a celebrity? Edge cases around the threshold. |
+Try to compute:
 
-I'd go hybrid:
+1. Posts per second
+2. Feed loads per second
+3. How many "timeline writes" happen if we push every post to every follower
+4. What happens when one celebrity posts
 
-- Push for normal users posting (median 100 followers). Cheap.
-- Pull for celebrities posting (anyone with > 1M followers). Their posts are not pushed; instead, when a follower opens their timeline, we merge in any recent celebrity posts from accounts they follow.
-- The detection threshold is dynamic, not just 1M. You may set it lower for users who tweet frequently (high fan-out × high volume = same load) or higher for users who rarely post.
+<details markdown="1">
+<summary><b>Show: the math</b></summary>
 
-The exact threshold is tunable. Measure system load and adjust.
+**Posts per second.**
+500M / 86,400 seconds ≈ **5,800 posts/sec on average**. Peak is 3x → about **17,000 posts/sec**.
+
+**Feed loads per second.**
+300M users × 10 loads = 3 billion loads/day → about **35,000 loads/sec** on average. Peak about **100,000/sec**.
+
+**Naive push: write every post to every follower's feed.**
+On average, each post goes to 100 followers. 5,800 × 100 = **580,000 timeline writes per second**. That is a lot, but it fits.
+
+**One celebrity post.**
+One post by a user with 100 million followers = 100 million timeline writes. For one post. If that user posts once per second, that is 100 million writes per second from one person.
+
+This is what breaks the system. The fan-out worker queue grows forever. Replication falls behind. Other users see slow feeds.
+
+**Storage for ready-made feeds.**
+300M users × 1,000 posts per feed × 50 bytes per entry = **15 TB**. Spread across many shards, this fits.
+
+**What the math tells you:**
+
+The big number is not posts per second. It is not feed loads per second. It is the gap between an average user (100 followers) and the top user (100 million). That gap is 1 million times. No single design works for both. The whole architecture exists to handle that gap.
 
 </details>
 
-## Step 4: sketch the high-level architecture
+---
 
-Fill in the four `[ ? ]` placeholders. Hint: the timeline service is what serves reads; you need somewhere to store the precomputed timelines; you need a worker pool to do the push fan-out; you need a way to merge in celebrity posts.
+## Step 3: The big decision: push, pull, or both?
 
-```
-       Client (mobile, web)
-              │
-              ▼
-       ┌─────────────┐
-       │   API GW    │
-       └──┬───────┬──┘
-          │       │
-   read   │       │  write (post)
-          │       │
-          ▼       ▼
-   ┌──────────┐ ┌──────────┐
-   │   [ ? ]  │ │   Post   │  (stores posts in canonical store)
-   │ (read)   │ │  Service │
-   └────┬─────┘ └────┬─────┘
-        │            │
-        │            ▼
-        │       ┌────────────────┐
-        │       │   [ ? ]        │  (gets the post and dispatches fan-out)
-        │       └────────┬───────┘
-        │                │
-        ▼                ▼
-   ┌──────────┐   ┌──────────┐
-   │   [ ? ]  │◄──┤   [ ? ]   │  (workers that write into per-follower timeline lists)
-   └──────────┘   └──────────┘
+This is the heart of the problem. Before drawing any boxes, decide your approach.
+
+You have three options:
+
+- **Push (write everywhere).** When I post, copy the post into every follower's ready-made feed list. Reads are fast. Writes can be huge.
+- **Pull (read everywhere).** When you open your feed, ask every person you follow for their recent posts. Merge them. Writes are tiny. Reads can be slow.
+- **Hybrid (mix).** Push for normal users. Pull for celebrities.
+
+Think about it with this flowchart:
+
+```mermaid
+flowchart TD
+    A[New post arrives] --> B{How many followers<br/>does the author have?}
+    B -->|Under 1 million| C[Push: write post_id<br/>to every follower's feed]
+    B -->|Over 1 million<br/>celebrity| D[Skip push.<br/>Save post in author's<br/>recent-posts list]
+
+    E[User opens their feed] --> F[Read pre-built feed<br/>from cache]
+    F --> G{Does this user follow<br/>any celebrities?}
+    G -->|No| H[Rank and return 50 posts]
+    G -->|Yes| I[Also pull recent posts<br/>from each celebrity]
+    I --> J[Merge push + pull,<br/>rank, return 50 posts]
+    H --> K[Done]
+    J --> K
 ```
 
-<details>
-<summary><b>Reveal: complete architecture</b></summary>
+<details markdown="1">
+<summary><b>Show: side-by-side comparison</b></summary>
+
+| Approach | Read speed | Write cost | Breaks when |
+|----------|------------|------------|-------------|
+| Push only | ~10ms (cached) | One write per follower | A celebrity posts. 100M writes for one post crushes the system. |
+| Pull only | Slow. Maybe 500ms for active users | One write per post | A user follows 5,000 people. Their feed needs 5,000 reads. |
+| Hybrid | ~10ms for most. A bit more for people who follow celebrities. | Bounded. Push only for non-celebrities. | Edge cases at the boundary: who counts as a celebrity? |
+
+**Why hybrid wins.**
+
+The math forces it. Push fails for celebrities (100M writes per post). Pull fails for users who follow many people (5,000 reads per feed load). Hybrid takes the cheap path for each case.
+
+- Normal user posts (median 100 followers) → push. Cheap.
+- Celebrity posts (over 1M followers) → no push. Save in their own "recent posts" list.
+- User opens feed → read their pre-built feed AND pull from any celebrities they follow. Merge.
+
+The threshold (1M followers) is not fixed. Set it lower for users who post often (high posts × high followers = same load). Set it higher for users who rarely post. A background job tunes it.
+
+> **Why this matters.** This decision shapes every other choice. Database, cache, worker pool, all of it. If you say "push for everyone," the next 30 minutes go nowhere.
+
+</details>
+
+---
+
+## Step 4: Draw the system
+
+Now draw the boxes. Try to fill in the missing pieces below. Five boxes are missing. Think about: where posts get stored, what runs the push fan-out, where the ready-made feeds live, who reads them, and who does the merge.
 
 ```
-       Client (mobile, web)
-              │
-              ▼
-       ┌─────────────┐
-       │   API GW    │
-       └──┬───────┬──┘
-          │       │
-   read   │       │  write (post)
-          │       │
-          ▼       ▼
-   ┌──────────┐ ┌──────────┐
-   │ Timeline │ │   Post   │  Canonical post store.
-   │ Service  │ │  Service │  Cassandra or Postgres sharded by post_id.
-   │ (reads)  │ └────┬─────┘  Source of truth for post content.
-   └────┬─────┘      │
-        │            ▼
-        │      ┌───────────────┐
-        │      │  Fan-out      │  Reads new post from Post Service,
-        │      │  Dispatcher   │  decides push vs pull per follower group,
-        │      │  (Kafka cons.)│  emits per-follower tasks.
-        │      └─────┬─────────┘
-        │            │
-        │            ▼
-        │      ┌──────────────────┐
-        │      │  Fan-out         │  Pool of stateless workers.
-        │      │  Workers (N pods)│  Each task writes one timeline entry.
-        │      └─────┬────────────┘
-        │            │
-        ▼            ▼
-   ┌────────────────────────────┐
-   │   Timeline Store (Redis    │  Precomputed per-user list of recent
-   │   + spillover to KV / Cass)│  post_ids. Capped at ~1000 per user.
-   │   Sharded by user_id.      │  Hot data in Redis, cold in KV.
-   └────────────────────────────┘
+            Client (mobile, web)
+                   |
+                   v
+            +---------------+
+            |  API Gateway  |  auth, rate limit
+            +-+----------+--+
+   read       |          |       write (post)
+              |          |
+              v          v
+        +-----------+  +-----------+
+        |   [ ? ]   |  |   Post    |  stores posts in main DB
+        |  (reads)  |  |  Service  |
+        +-----+-----+  +-----+-----+
+              |              |
+              |              v
+              |        +------------+
+              |        |   [ ? ]    |  reads new post,
+              |        | (dispatch) |  decides push vs pull
+              |        +-----+------+
+              |              |
+              |              v
+              |        +------------+
+              |        |   [ ? ]    |  workers that write into
+              |        | (workers)  |  each follower's feed list
+              |        +-----+------+
+              |              |
+              v              v
+        +-------------------------+
+        |   [ ? ]                  |  pre-built feeds.
+        |   per-user list of       |  Hot users in Redis,
+        |   recent post_ids        |  cold in Cassandra.
+        +-------------------------+
 
-   On read, Timeline Service does:
-     1. Fetch precomputed list of post_ids from Timeline Store.
-     2. For each celebrity that this user follows, pull recent posts (separate path).
-     3. Merge + rerank.
-     4. Hydrate post_ids → full post content via Post Service.
-     5. Return.
+        Separately, for celebrities:
+        +-------------------------+
+        |   [ ? ]                  |  per-author recent posts.
+        |                          |  Read at feed time.
+        +-------------------------+
 ```
 
-Component responsibilities:
+<details markdown="1">
+<summary><b>Show: the full architecture</b></summary>
 
-- Post Service. Owns the canonical post record. Returns full content given a post_id. Sharded by post_id hash. Read-replicated.
-- Fan-out Dispatcher. Consumes the `posts.created` Kafka topic. Looks up the author's follower count. Under threshold, emit N "push to timeline" tasks. Over threshold, do nothing (the pull path handles celebrities).
-- Fan-out Workers. Stateless pool. Each consumes one timeline-write task and writes a post_id into the target follower's timeline list. Auto-scales with queue depth.
-- Timeline Store. Per-user sorted list of post_ids. Hot users (active in the last week) in Redis; cold users in Cassandra. Tiered.
-- Timeline Service. The read path. Fetches the user's precomputed list, merges in celebrity content from the pull path, hydrates and reranks, returns.
+```
+            Client (mobile, web)
+                   |
+                   v
+            +---------------+
+            |  API Gateway  |  auth, rate limit
+            +-+----------+--+
+   read       |          |       write (post)
+              |          |
+              v          v
+        +-----------+  +-----------+
+        | Timeline  |  |   Post    |  Main store for posts.
+        | Service   |  |  Service  |  Sharded by post_id.
+        | (reads)   |  +-----+-----+
+        +-----+-----+        |
+              |              v
+              |        +----------------+
+              |        |   Posts DB     |  Cassandra or sharded
+              |        |                |  Postgres.
+              |        +-------+--------+
+              |                |
+              |                | CDC / outbox
+              |                v
+              |        +----------------+
+              |        | Kafka topic:   |
+              |        | posts.created  |
+              |        +-------+--------+
+              |                |
+              |                v
+              |        +----------------+
+              |        |  Fan-out       |  Reads new post.
+              |        |  Dispatcher    |  Author < 1M followers?
+              |        +-------+--------+  Push. Else skip.
+              |                |
+              |                v
+              |        +----------------+
+              |        | Kafka topic:   |  One message per follower.
+              |        | timeline.write |
+              |        +-------+--------+
+              |                |
+              |                v
+              |        +----------------+
+              |        |  Fan-out       |  Stateless pool.
+              |        |  Workers       |  Each task: write
+              |        +-------+--------+  one post_id into
+              |                |           one feed.
+              v                v
+        +-------------------------+
+        |  Timeline Store          |  Redis sorted sets,
+        |  (hot users in Redis,    |  sharded by user_id.
+        |   cold in Cassandra)     |  Top 1000 entries per user.
+        +-------------------------+
+
+        Pull path for celebrities:
+        +-------------------------+
+        |  Per-author              |  "Recent 50 posts" list
+        |  Recent Posts Cache      |  per author. Cached in Redis.
+        |  (Redis)                 |  Read at feed time.
+        +-------------------------+
+
+        Ranking:
+        +-------------------------+
+        |  Ranking Service         |  ML model. Scores candidates.
+        |                          |  Called by Timeline Service.
+        +-------------------------+
+```
+
+**What each piece does, in one line:**
+
+- **API Gateway.** Auth (who is this), rate limit (no bots), basic shape checks.
+- **Post Service.** Owns the post. Returns full post content given a post_id.
+- **Posts DB.** Source of truth for post content. Sharded by post_id.
+- **Kafka (posts.created).** Stream of new posts. Glue between writes and fan-out.
+- **Fan-out Dispatcher.** Reads new post events. Decides push vs pull based on author follower count.
+- **Fan-out Workers.** Write post_ids into each follower's feed list. Auto-scale on queue depth.
+- **Timeline Store.** Per-user list of recent post_ids. Redis for hot users, Cassandra for cold.
+- **Per-author Recent Posts Cache.** The pull-path target. Celebrities' posts land here for read-time merging.
+- **Timeline Service.** The read path. Pulls from both push and pull stores, merges, ranks, hydrates, returns.
+- **Ranking Service.** Stateless ML scoring. Takes ~200 candidates, returns scores.
 
 </details>
 
-## Step 5: handling the heavy follower (a user who follows 5000 accounts)
+---
 
-In a push-only world, this user's timeline has 5000 sources writing to it. Fine. In hybrid (push + pull-for-celebs), the same user might follow 50 celebrities. Every timeline load does 50 parallel reads. Is that OK? How do you make it OK?
+## Step 5: The celebrity problem (pull at read time)
 
-<details>
-<summary><b>Reveal: heavy-follower handling</b></summary>
+A celebrity posts. We do not push to their 100 million followers. Good. But now a follower opens their feed. How do we get the celebrity's post in there?
 
-50 parallel reads per timeline load is OK if:
+Walk through it in your head. The user follows 50 celebrities. They open their app. What happens?
 
-1. Each read is fast (under 20ms): query a per-author "recent posts" list, which is itself cached.
-2. The reads run in parallel, not sequentially: orchestrate them in the Timeline Service.
-3. The merged result is cached: if user X loads their timeline at T1 and T1+30 seconds, the second load reuses most of T1's result.
+<details markdown="1">
+<summary><b>Show: the read flow with pull</b></summary>
 
-The pattern: each celebrity has a "recent 50 posts" list cached in Redis. Pulling from 50 such lists is 50 hits to the same Redis cluster, served from memory, under 20ms total in parallel. That is much cheaper than push, which would have written 100M entries for that celebrity's last post (including writes for users who will never see that timeline today).
+Here is the read flow as a sequence diagram.
 
-The key insight: pull is expensive per active user but bounded; push is cheap per active user but unbounded for celebrities. Hybrid takes the best of both.
+```mermaid
+sequenceDiagram
+    participant Client
+    participant TS as Timeline Service
+    participant TimelineCache as Timeline Cache<br/>(push path)
+    participant CelebCache as Celeb Recent<br/>Posts Cache<br/>(pull path)
+    participant Ranker as Ranking Service
+    participant PostSvc as Post Service
+
+    Client->>TS: GET /timeline/home
+    TS->>TimelineCache: get top 200 post_ids for user
+    TimelineCache-->>TS: 200 post_ids (5ms)
+
+    TS->>TS: which celebs does user follow?
+    Note over TS: read from cache (2ms)
+
+    par parallel pull from each celeb
+        TS->>CelebCache: recent posts for celeb A
+        TS->>CelebCache: recent posts for celeb B
+        TS->>CelebCache: recent posts for celeb C
+    end
+    CelebCache-->>TS: ~300 post_ids from 50 celebs (10ms)
+
+    TS->>Ranker: score 500 candidates
+    Ranker-->>TS: scored list (30ms)
+
+    TS->>TS: pick top 50, apply diversity rules
+    TS->>PostSvc: hydrate 50 post_ids to full content
+    PostSvc-->>TS: 50 full posts (20ms)
+    TS-->>Client: 50 ranked posts (~90ms total)
+```
+
+**Why this works:**
+
+1. **Each celebrity has their own "recent posts" cache.** When a celeb posts, we write one entry into one Redis key. Cheap.
+2. **The user follows 50 celebs.** We do 50 parallel reads. Each is a Redis hit. About 10ms total.
+3. **We merge with the pre-built feed.** Push gives ~200 posts. Pull gives ~300. Together: ~500 candidates.
+4. **Rank, pick top 50, hydrate, return.** Total under 200ms.
+
+> **Why hybrid beats push for celebrities.** Push would write 100M entries every time the celeb posts. Most of those followers are offline right now. We did the work for nothing. Pull only does the work when someone actually opens their feed. Much cheaper.
+
+> **Why hybrid beats pull for normal users.** Pull would force every feed load to query every account you follow. If you follow 500 normal people, that is 500 reads per feed load. Push lets us read one cached list instead.
 
 </details>
 
-## Step 6: ranking (timeline is not strict chronological)
+---
 
-Modern timelines are not chronological. Posts are ranked by an ML model: predicted engagement, recency decay, diversity penalties. Where does ranking live in your architecture? Should the precomputed timeline already be ranked, or is ranking on the read path?
+## Step 6: Where does ranking live?
 
-<details>
-<summary><b>Reveal: ranking placement</b></summary>
+Modern feeds are not in time order. They are scored by a machine learning model. Recent posts with high predicted engagement go first. So where in the system does ranking happen?
 
-Ranking lives on the read path, not in the precompute.
+Two choices:
 
-Why:
-- The model changes often (the ML team ships new versions weekly). If you ranked at write time, you'd have to recompute every user's stored timeline whenever the model changed.
-- Ranking inputs are user-state dependent: how recently the viewer interacted with this author, what the viewer is doing right now (which page came before this load), and so on. You can't capture that at write time.
-- Ranking runs on a candidate set of ~200 posts to pick 50. Doing that at read time, after the candidate set is assembled, is bounded and cheap.
+- **Rank at write time.** When a post is fanned out, we already know its score. Store it ranked.
+- **Rank at read time.** Store posts in time order. When the user loads their feed, score the candidates fresh.
 
-Pipeline:
-1. Candidate generation: take the top 200 most recent post_ids from the user's timeline list (push path) plus recent celebrity posts (pull path).
-2. Feature lookup: fetch features (author engagement signals, viewer history) for the candidates. Heavily cached.
-3. Score: send the 200 candidates through the ML scoring service. ~50ms.
-4. Pick top 50, apply diversity rules ("no more than 2 posts from the same author in a row"), return.
+Which one?
 
-The score model is a separate service. The Timeline Service doesn't know how it works; it just sends candidates and gets scores back. That separation matters, because the ranking team owns the model lifecycle.
+<details markdown="1">
+<summary><b>Show: ranking belongs on the read path</b></summary>
+
+Ranking lives on the read path. Always. Three reasons.
+
+**The model changes weekly.** The ML team ships a new version every Tuesday. If we ranked at write time, every model change means recomputing 300 million feeds. Impossible.
+
+**Some signals only exist at read time.** What did the user click on this morning? What page were they just on? The model uses these. None of them exist at write time.
+
+**Ranking is cheap on a small set.** We rank 200 candidates, not 1 billion posts. Scoring 200 items is ~30ms. Do it on the read path.
+
+**The pipeline:**
+
+```mermaid
+flowchart LR
+    A[Get 200 push<br/>candidates] --> D[Merge<br/>~500 candidates]
+    B[Get 300 pull<br/>candidates from celebs] --> D
+    D --> E[Fetch features<br/>~20ms]
+    E --> F[ML scoring<br/>~30ms]
+    F --> G[Apply diversity rules<br/>'no 2 in a row from<br/>same author']
+    G --> H[Pick top 50]
+    H --> I[Hydrate post_ids<br/>to full content]
+    I --> J[Return]
+```
+
+> **Why diversity rules?** Without them, a chatty author drowns out everyone else. Diversity rules force a mix. They are simple but important. Usually "no 2 posts in a row from the same author" and "mix post types."
+
+The ranking service is separate from the timeline service. The ranking team owns it. The timeline team just sends candidates and gets scores back. This separation lets each team move at their own speed.
 
 </details>
 
-## Step 7: read the full solution
+---
 
-You have the core: fan-out, hybrid celebrity handling, ranking placement. The solution covers database choices, multi-region replication, the user "block" feature (which complicates fan-out), and the day-2 problems you only discover after launch.
+## Step 7: Three real cases, one system
+
+Same architecture. Three different users. Each one stresses a different part of the design.
+
+For each, guess which part of the system does the heavy work. Then check.
+
+**A. Aisha posts a selfie.** She has 250 followers. Normal user.
+
+**B. Elon posts a tweet.** He has 200 million followers. Celebrity.
+
+**C. Marcus opens his feed.** He follows 2,000 normal people plus 30 celebrities. Active user.
+
+<details markdown="1">
+<summary><b>Show: what each one teaches</b></summary>
+
+**A. Aisha posts a selfie (push path).**
+
+- Post lands in Posts DB.
+- Posts.created event hits Kafka.
+- Dispatcher checks: 250 followers, under threshold. Push.
+- 250 small messages emitted to timeline.write topic.
+- Fan-out workers write 250 ZADDs into 250 Redis sorted sets.
+- Total time: ~2 seconds from post to all followers' feeds.
+
+This is the common case. 99% of posts go this way.
+
+> *Common bug:* the dispatcher uses a stale follower count. Aisha gained 10 new followers in the last minute, the cache says 240. Those 10 new followers miss this post in their pre-built feed. They will see it next time they reload. Tolerable.
+
+**B. Elon posts a tweet (pull path).**
+
+- Post lands in Posts DB.
+- Posts.created event hits Kafka.
+- Dispatcher checks: 200M followers, over threshold. Skip push.
+- Write post_id into Elon's "recent posts" cache. One write.
+- Done. Total time: under 100ms.
+
+No fan-out work. The cost shifts to read time. Every Elon follower's feed load now does one extra Redis read for Elon's recent posts.
+
+> *Common bug:* the threshold is set too low. A user with 10,000 followers gets treated as a celebrity. Their followers now do an extra pull per feed load for someone who is not actually a celebrity. Sum across many borderline users and the pull side gets expensive.
+
+**C. Marcus opens his feed (read path).**
+
+- Timeline Service gets request.
+- Read top 200 post_ids from Marcus's Redis sorted set (push side). 5ms.
+- Look up Marcus's 30 celeb follows. 2ms.
+- Pull recent posts from each celeb in parallel. 10ms.
+- Merge: ~500 candidates.
+- Send to Ranking Service. 30ms.
+- Hydrate top 50 post_ids to full content. 20ms.
+- Return. ~90ms total.
+
+> *Common bug:* the hydrate step is sequential instead of batched. 50 sequential Post Service calls at 5ms each = 250ms. Always batch. Make 1 call that returns 50 posts.
+
+**The big idea.** One system. Three very different load patterns. The architecture handles all three because we picked the right path for each.
+
+</details>
+
+---
 
 ## Follow-up questions
 
-Try answering each in 3 to 4 sentences before reading the solution.
+Try answering each in 2 or 3 sentences before opening the solution.
 
-1. A user blocks another user. How do you make sure the blocked user's old posts no longer appear in the blocker's timeline? Delete from the precomputed timeline, or filter at read time?
-2. A user unfollows someone. Do you remove that author's posts from their existing timeline immediately, or let them age out naturally?
-3. A user deletes a post. It might be sitting in millions of precomputed timelines. How do you handle that, given that scrubbing 100M timeline lists is expensive?
-4. A new user signs up and follows 50 accounts immediately. Their timeline is empty until those accounts post. How do you bootstrap it?
-5. Cold users. A user who has not opened the app for 30 days has stale timeline data. Do you keep precomputing for them?
-6. Backfill for new follow. User A follows user B. Does A's timeline retroactively get B's last few posts?
-7. Real-time updates (a new post appears while you're scrolling). Push the new post over WebSocket, or just refresh on pull-to-refresh? Trade-offs.
-8. Pagination beyond the first 50. How do you paginate? Cursor on what? What if posts have been deleted since the cursor was issued?
-9. You see in observability that one fan-out worker is processing 100x the load of others. Diagnose.
-10. Your CEO wants to add "see posts from people you don't follow but might like" injection at position 5, 15, 25 of every feed. Where does this go in the pipeline? What is the latency cost?
+1. **User blocks another user.** Old posts from the blocked person might be in the blocker's pre-built feed. Do you scrub the feed, or filter at read time?
+
+2. **User unfollows someone.** Their pre-built feed has that author's posts. Remove them right away, or let them age out?
+
+3. **User deletes a post.** The post might be in 100 million pre-built feeds. How do you handle it? You cannot scrub 100M entries.
+
+4. **New user signs up and follows 50 accounts.** Their feed is empty. How do you bootstrap it?
+
+5. **Cold user.** A user has not opened the app for 30 days. Do you keep pushing to their feed every time someone they follow posts?
+
+6. **Backfill on new follow.** I just followed someone. Do their last 10 posts show up in my feed right away, or do I have to wait for their next post?
+
+7. **Live updates.** A new post lands while I am scrolling. Push it over WebSocket, or wait for pull-to-refresh?
+
+8. **Pagination.** I scroll past 50 posts. How does the cursor work? What if one of the posts at the cursor has been deleted?
+
+9. **One fan-out worker is doing 100x the work of others.** What is wrong? How do you fix it?
+
+10. **CEO wants "you might like" injections.** Put 3 recommended posts at positions 5, 15, 25 of every feed. Where does this live in the pipeline?
+
+11. **Repost (retweet).** A celeb reposts my normal post. Does my post now have to fan out to the celeb's 100M followers?
+
+12. **Private account.** Someone's account is private. Their post should only reach approved followers. How does fan-out know?
+
+13. **Replication lag.** I post. The post is in the primary DB but not the read replica yet. I open my own feed and don't see it. How do you fix it?
+
+14. **Ad slot.** Position 4 of every feed is an ad. Where does the ad get picked? What happens if the ad service is down?
+
+15. **Region failover.** US-East goes down. Users get routed to US-West. Their feeds are stale by a few minutes. What do they see?
+
+---
 
 ## Related problems
 
-- [Chat System (003)](../003-chat-system/question.md). The same delivery and fan-out problem applies to chat (DMs are 1-to-1 fan-out instead of 1-to-many, but the patterns rhyme).
-- [Notification System (010)](../010-notification-system/question.md). The notification pipeline shares the fan-out worker pool pattern and the celebrity problem.
-- [Distributed Cache (009)](../009-distributed-cache/question.md). The timeline store leans hard on Redis; you should know its limits.
-- [Typeahead (005)](../005-typeahead-autocomplete/question.md). Both this problem and search have the "ranked candidate generation" two-stage architecture.
+- **[Chat System (003)](../003-chat-system/question.md).** Same fan-out and delivery problem. DMs are 1-to-1 fan-out instead of 1-to-many, but the patterns rhyme.
+- **[Notification System (010)](../010-notification-system/question.md).** Same fan-out worker pattern. Same celebrity problem when a popular account triggers notifications to millions.
+- **[Distributed Cache (009)](../009-distributed-cache/question.md).** The timeline store leans hard on Redis. Know its limits.
+- **[Typeahead (005)](../005-typeahead-autocomplete/question.md).** Both this problem and search use the "two-stage: candidate generation + ranking" pattern.

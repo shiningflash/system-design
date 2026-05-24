@@ -1,366 +1,513 @@
 ---
 id: 9
-title: Design a Distributed Cache (Redis / Memcached)
+title: Design a Distributed Cache (like Redis or Memcached)
 category: Distributed Systems
 topics: [consistent hashing, replication, eviction, ttl, hot keys]
 difficulty: Medium
 solution: solution.md
 ---
 
-## Scene
+## The scene
 
-Second round. The interviewer pulls up a whiteboard:
+You walk into the second interview round. The interviewer points at the whiteboard and says:
 
-> *You've used Redis. Design it. Not the data structures inside one node, the cluster. How does the cluster work? How does it find the key? What happens when a node dies? How do you add a node without downtime?*
+> *"You have used Redis before, right? Good. Now design it. Not one Redis server. The whole cluster. How does the cluster find a key? What happens when a server dies? How do you add a new server without taking the system down?"*
 
-They cross their arms. This is the question that separates candidates who treat Redis as a magic black box from candidates who treat it as a distributed system. If I open with "Redis stores key-value pairs in memory" I have already lost ground. The interviewer wants the cluster story: hash slots, gossip, replication, failover, resharding.
+They lean back and wait.
 
-The trap is that every other problem in this repo uses a distributed cache as a primitive. I will be asked this question, or something shaped like it, sooner or later.
+This is the question that separates two kinds of candidates. The first kind treats Redis like a magic box. They say *"Redis stores keys in memory"* and stop. The second kind treats Redis like a distributed system. They talk about how many computers share the work, how they find each other, and what happens when one of them dies.
 
-## Step 1: clarify before designing
+If you open with *"Redis stores key-value pairs in memory"* you have already lost ground. The interviewer wants the cluster story. Sharding. Replication. Failover. Resharding.
 
-Five minutes. No drawing yet. The goal is at least six questions that meaningfully change the design.
+A cache is also a tool that you will use again and again in other system designs. URL shorteners use it. News feeds use it. Autocomplete uses it. So you will be asked this question, or something close to it, more than once.
 
-<details>
-<summary><b>Reveal: questions a strong candidate asks</b></summary>
+We will walk this from a small cache for a startup to a giant cache for a company with millions of users. At every step we name what breaks first, then add the smallest fix that solves it.
 
-1. Consistency model. "Strong consistency on writes, or eventual? Can a read after a write return stale data?" Most caches tolerate eventual. If the answer is strong, I am now designing a distributed database, not a cache, and the whole shape changes (synchronous replication, quorum reads, leader election on every write).
-2. Persistence. "Pure in-memory, or do we need durability across restarts?" Memcached has none. Redis has RDB snapshots and AOF logs. The answer decides whether process restart loses data.
-3. Value size and access patterns. "Values small (under 1 KB) or multi-MB? Just GET/SET, or do I need sorted sets, lists, pub/sub?" Memcached is flat KV. Redis is a data-structure server. The answer scopes the API surface.
-4. Traffic shape. "Ops per second? Working set size? Read/write ratio?" Without these I cannot size the cluster. A typical answer: 1M ops/sec, 1 TB working set, 10:1 read:write.
-5. Eviction policy. "When memory is full, what happens? LRU? Reject writes? TTL-only?" Product question. The wrong eviction policy silently corrupts application behavior.
-6. Multi-region. "One region or many? Active-active or active-passive?" Cross-region cache replication is unusual; most teams keep caches regional and let the source-of-truth database deal with multi-region. Confirm.
-7. Client topology. "Smart client that knows topology, or a proxy in front?" Redis Cluster uses smart clients (MOVED redirects); Memcached typically uses a proxy (mcrouter, twemproxy). Different operational properties.
-8. Failure tolerance. "How many node failures must we survive without data loss? Without availability loss?" Drives replication factor and quorum.
+---
 
-A candidate who only asked "how many ops per second" and "how much data" missed consistency, persistence, and eviction. Those three are what the interviewer most wants to hear.
+## A few words you will see a lot
+
+Before we start, here are some terms in plain language. If you already know them, skip ahead.
+
+- **Cache.** A fast store that keeps copies of data so you do not have to ask the slow database every time. Think of a sticky note on your monitor versus walking to the file cabinet.
+- **Key-value store.** A simple kind of database. You ask for a key like `user:42:name`, you get back a value like `"Alice"`. That is it. No tables, no joins.
+- **In-memory.** Stored in RAM, not on disk. RAM is about 1000x faster than disk, but it loses everything when the power goes out.
+- **Shard.** One slice of the data. If your cluster has 12 shards, each shard holds about 1/12 of the keys.
+- **Primary and replica.** The primary is the main copy. The replica is a backup copy that follows the primary. If the primary dies, the replica takes over.
+- **Consistent hashing.** A way to assign keys to servers so that adding or removing one server only re-shuffles a small fraction of keys, not all of them.
+- **Eviction.** When the cache is full and you need to throw out old keys to make room for new ones.
+- **TTL (time-to-live).** A timer on a key. After the timer runs out, the key is gone.
+
+That is enough to start.
+
+---
+
+## Step 1: Ask the right questions
+
+Before you draw anything, sit for five minutes. Write down questions you would ask the interviewer.
+
+A good answer here is not "ten questions about every edge case." It is the small handful of questions that change the design if answered differently.
+
+<details markdown="1">
+<summary><b>Show: 8 questions that matter</b></summary>
+
+1. **How strict is "fresh"?** If I write a value and immediately read it back, do I have to see the new value? Or is it okay to see the old value for a moment? *(Most caches are okay with "eventually fresh." If the interviewer says "must always be fresh," you are now building a database, not a cache. Whole shape changes.)*
+
+2. **What happens on restart?** If a server reboots, do we lose the data, or do we want it back? *(Memcached loses everything. Redis can save to disk. The answer decides if we need persistence.)*
+
+3. **How big are the values? What operations?** Are values small (under 1 KB) or huge (multi-MB)? Just simple get and set? Or do we need lists, sets, sorted sets, pub/sub? *(Memcached is just simple keys. Redis has many data structures. This changes the API surface.)*
+
+4. **How much traffic?** Operations per second? Total data size? Read-to-write ratio? *(Without numbers we cannot size the cluster. A common answer: 1 million operations per second, 1 TB of data, 10 reads per 1 write.)*
+
+5. **What happens when memory is full?** Throw out old keys (LRU)? Reject new writes? Use only TTL? *(This is a product question. The wrong choice silently breaks the app.)*
+
+6. **One region or many?** Just one data center, or also Europe and Asia? *(Cross-region caching is unusual. Most teams keep caches in one region and let the database handle the other regions. Confirm.)*
+
+7. **Smart client or proxy?** Do clients know which server has which key (smart client)? Or do they talk to a proxy that figures it out? *(Redis uses smart clients. Memcached often uses a proxy. Both work, different trade-offs.)*
+
+8. **How many failures must we survive?** One server down without losing data? Two? *(This drives how many replica copies we keep per shard.)*
+
+A candidate who only asks "how many ops per second" and "how much data" missed the three important ones: freshness, persistence, eviction. Those are what the interviewer wants to hear.
 
 </details>
 
-## Step 2: capacity estimates
+---
 
-Assume the interviewer gave me these numbers:
+## Step 2: How big is this thing?
 
-- 1M operations per second sustained, 3M peak
-- 1 TB working set
-- 10:1 read:write ratio
+Let's say the interviewer gave us these numbers:
+
+- 1 million operations per second on a normal day, 3 million at peak
+- 1 TB of cached data
+- 10 reads per 1 write
 - Average value size: 1 KB
 - Average key size: 50 bytes
-- P99 latency target: under 5 ms in-region
-- Durability: tolerate one node failure per shard with zero data loss
+- Target: P99 latency under 5 ms in the same region
+- Survive one server failure per shard without losing data
 
-Compute on paper before revealing:
+Work out these on paper before peeking:
 
 1. Reads per second and writes per second at peak
 2. Network bandwidth at peak
-3. Memory per node with a 6-node cluster, replication factor 2
-4. Memory per node with a 12-node cluster
-5. TCP connection count from 1000 application servers each pooling 50
+3. Memory per server in a 6-server cluster (with 2 copies of data)
+4. Memory per server in a 12-server cluster
+5. How many TCP connections do we have if 1000 app servers each open 50 connections?
 
-<details>
-<summary><b>Reveal: the math</b></summary>
+<details markdown="1">
+<summary><b>Show: the math</b></summary>
 
-Reads and writes. At 3M ops/sec peak with 10:1 read:write:
+**Reads and writes at peak.** 3 million ops/sec with 10:1 read-to-write:
 
-- Reads: ~2.7M/sec
-- Writes: ~300K/sec
+- Reads: about 2.7 million per second
+- Writes: about 300 thousand per second
 
-A single Redis node tops out around 100K-200K ops/sec on simple GET/SET, depending on hardware and pipelining. Higher with pipelining (commands batched on the wire), lower with complex commands. Need at least 15-30 nodes to handle 3M ops/sec before headroom.
+One Redis server tops out around 100K-200K ops/sec on simple get/set. (Higher with pipelining. Pipelining means batching many commands together on the wire to save round trips. Lower with complex commands.) So we need at least 15-30 servers to handle 3M ops/sec before we even add safety headroom.
 
-Network bandwidth at peak. Each op moves roughly 50 byte key + 1 KB value + ~20 byte protocol overhead = ~1.1 KB. 3M times 1.1 KB = 3.3 GB/sec aggregate. Across 30 nodes, ~110 MB/sec per node. Comfortable within a 25 Gbps NIC budget (~3 GB/sec per node). Watch out: replication doubles write bandwidth for primaries.
+**Network bandwidth at peak.** Each op moves about 50 bytes key + 1 KB value + 20 bytes protocol overhead = around 1.1 KB. 3M times 1.1 KB = about 3.3 GB/sec across all servers. Across 30 servers, that is 110 MB/sec per server. A 25 Gbps network card has about 3 GB/sec to spare, so this is comfortable. One thing to watch: replication doubles the write bandwidth on the primary server.
 
-Memory per node, 6-node cluster, RF=2. 1 TB working set times 2 copies = 2 TB total. Across 6 nodes, ~340 GB per node. Doable on the right instance (r7g.16xlarge has 512 GB), but blast radius of a single failure is huge: ~170 GB of primary keyspace briefly unavailable.
+**Memory per server, 6 servers, 2 copies.** 1 TB times 2 copies = 2 TB total. Across 6 servers = 340 GB per server. Doable on the right machine (an r7g.16xlarge has 512 GB). But if one server dies, 170 GB of primary data is briefly unavailable. Big blast radius.
 
-Memory per node, 12-node cluster, RF=2. 2 TB total / 12 = ~170 GB per node. Smaller blast radius. Each node owns ~85 GB primary. r7g.8xlarge (256 GB) fits with headroom.
+**Memory per server, 12 servers, 2 copies.** 2 TB total / 12 = 170 GB per server. Smaller blast radius. An r7g.8xlarge (256 GB) fits with room to spare.
 
-Plus overhead: Redis itself uses ~20% more RAM than the dataset due to encoding, expiration metadata, and replication buffers. Budget 200 GB instances for a 170 GB dataset.
+Plus overhead: Redis itself uses about 20% more RAM than the raw data, because of internal encoding, expiration metadata, and replication buffers. So budget 200 GB instances for 170 GB of dataset.
 
-Connection count. 1000 servers times 50 connections = 50K client connections. With Redis Cluster smart clients, every client opens connections to every shard primary. 50K times 12 = 600K connections across the cluster, ~50K per node.
+**Connections.** 1000 servers times 50 connections = 50,000 client connections. With smart clients, every client opens a connection to every shard primary. 50K times 12 = 600K connections across the cluster, about 50K per server.
 
-Redis handles this on a single event loop. 50K idle connections is fine. 50K active connections at 200K ops/sec means each connection does 4 ops/sec, light. But each connection costs ~20 KB of buffer memory in Redis: 50K times 20 KB = 1 GB per node just for connection state. Account for it.
+Redis handles this on one event loop. 50K idle connections is fine. But each connection costs about 20 KB of buffer memory inside Redis. 50K times 20 KB = 1 GB per server just for connection state. Worth knowing.
 
-The shape that matters. The cluster is bottlenecked by per-node CPU (single-threaded event loop) and memory, not network. Number of nodes and replication factor are driven by per-node ops/sec ceiling and blast-radius tolerance, not raw capacity.
+**What the math is telling you.**
 
-</details>
-
-## Step 3: partitioning
-
-I have a key. I have N nodes. How do I decide which node owns the key? Three serious approaches: modulo hashing, consistent hashing, rendezvous (HRW) hashing. Ten minutes. Write down the pros and cons of each, and what happens when nodes come and go.
-
-<details>
-<summary><b>Reveal: comparison of partitioning schemes</b></summary>
-
-| Scheme | How it works | Cost to add/remove a node | Distribution |
-|--------|-------------|---------------------------|--------------|
-| Modulo hashing | `node = hash(key) % N` | Catastrophic. Changing N from 6 to 7 reshuffles ~6/7 of keys. Cluster is unusable during rehash. | Perfectly even. |
-| Consistent hashing | Map keys and nodes onto a ring; key goes to the next node clockwise. | Only ~1/N of keys move. Adding one node to a 12-node cluster moves ~8% of keys, all to the new node. | Uneven with few nodes. Fixed by virtual nodes. |
-| Rendezvous (HRW) hashing | For each key, compute `hash(key, node_id)` for every node; key goes to the highest score. | Only ~1/N of keys move. Same as consistent hashing. | Even by construction. No virtual nodes needed. |
-
-Consistent hashing with virtual nodes is the standard answer.
-
-The naive ring (one position per node) gives uneven distribution: with 6 nodes, one node might own 30% of the keyspace and another 5%. The fix: 100 to 200 virtual nodes (vnodes) per real node at different ring positions. With 1200 vnodes for 6 nodes, distribution converges close to uniform.
-
-Redis Cluster uses a variant: 16384 hash slots, statically. Each key hashes to `CRC16(key) mod 16384`. Slots are assigned to nodes. Rebalancing moves slots. Mathematically equivalent to consistent hashing with 16384 vnodes globally, but with explicit slot ownership rather than ring traversal.
-
-Memcached takes a different path. The protocol has no built-in clustering; clustering is a client concern. Clients use libketama (consistent hashing with vnodes) to pick a server. No server-side rebalancing; if I change the client config, keys move and I accept the cache miss storm.
-
-Migration math.
-
-12-node cluster, ~85 GB per node. I add node 13. With consistent hashing, ~1/13 of keys move, distributed across the 12 old nodes (each gives ~1/12 of its keys to node 13):
-
-- Each old node sends ~7 GB to node 13.
-- Node 13 receives ~85 GB total.
-- At 100 MB/sec migration rate (throttled to not saturate the network), ~85 GB / 100 MB/sec = 850 seconds, about 14 minutes.
-
-During migration, what happens to lookups for keys being moved? Redis Cluster uses `ASK` redirects: if a key is in flight, the client first tries the old node, gets an `ASK` pointing to the new node, retries on the new node. After migration completes, the old node responds with `MOVED` for that slot.
-
-Removing a node is the reverse: redistribute its slots to survivors, then take it down. Plan migration to complete before decommission.
-
-Honest trade-off. Consistent hashing minimizes movement but does not eliminate it. A naive client that ignores `MOVED`/`ASK` and just retries on the old node will see cache misses (and possibly fall through to the source-of-truth database) during the migration window. Migration is not free; it is just contained.
+The bottleneck is per-server CPU, not memory or network. (Redis runs one main thread, so per-server CPU is limited.) The cluster size is driven by how many ops one server can handle, and how much data you are willing to lose if one server dies. Not by how much storage you need.
 
 </details>
 
-## Step 4: sketch the architecture
+---
 
-Intentionally incomplete diagram. Fill in the five `[ ? ]` boxes. Hint: how does the client find a node, how do nodes find each other, what sits next to each primary for durability, what runs across all nodes to keep the cluster healthy?
+## Step 3: How do we find a key?
 
-```
-                ┌────────────────────────┐
-                │   Application Server    │
-                │   ┌────────────────┐   │
-                │   │  [ ? ]         │   │  (knows the cluster topology,
-                │   └───────┬────────┘   │   picks the right node for a key)
-                └───────────┼────────────┘
-                            │
-                            ▼
-        ┌───────────────────────────────────────────────┐
-        │            [ ? ]                              │  (decides which node owns the key:
-        │                                               │   slot/hash → node mapping)
-        └────────┬──────────────┬──────────────┬────────┘
-                 │              │              │
-                 ▼              ▼              ▼
-         ┌────────────┐  ┌────────────┐  ┌────────────┐
-         │ Shard 1    │  │ Shard 2    │  │ Shard 3    │
-         │            │  │            │  │            │
-         │ ┌────────┐ │  │ ┌────────┐ │  │ ┌────────┐ │
-         │ │Primary │ │  │ │Primary │ │  │ │Primary │ │
-         │ └───┬────┘ │  │ └───┬────┘ │  │ └───┬────┘ │
-         │     │ repl │  │     │ repl │  │     │ repl │
-         │ ┌───▼────┐ │  │ ┌───▼────┐ │  │ ┌───▼────┐ │
-         │ │ [ ? ]  │ │  │ │ [ ? ]  │ │  │ │ [ ? ]  │ │  (takes over on primary failure)
-         │ └────────┘ │  │ └────────┘ │  │ └────────┘ │
-         └────────────┘  └────────────┘  └────────────┘
-                 ▲              ▲              ▲
-                 └──────────────┼──────────────┘
-                                │
-                       ┌────────▼─────────┐
-                       │    [ ? ]         │  (every node talks to every other node,
-                       │                  │   exchanges topology and health)
-                       └──────────────────┘
-```
+You have a key like `user:42:profile`. You have 12 servers. Which server has that key?
 
-<details>
-<summary><b>Reveal: complete architecture</b></summary>
+This is the central question. Three serious approaches.
+
+<details markdown="1">
+<summary><b>Show: compare three ways to assign keys</b></summary>
+
+| Way | How it works | Cost to add or remove a server | How even is the spread? |
+|-----|-------------|-------------------------------|-------------------------|
+| **Modulo hashing** | `server = hash(key) % N` | Disaster. Going from 6 to 7 servers re-shuffles about 6/7 of all keys. | Perfectly even. |
+| **Consistent hashing** | Put keys and servers on a ring. Key goes to the next server clockwise. | About 1/N of keys move when you add one server. | Uneven with few servers. Fix with virtual nodes. |
+| **Rendezvous (HRW)** | For each key, score every server. Highest score wins. | About 1/N of keys move. Same as consistent hashing. | Even by design. |
+
+> **Why consistent hashing and not modulo?** With modulo, adding one new server changes the assignment of almost every key. All those keys then miss the cache, slamming the database. With consistent hashing, only about 1/N of keys move when you add a server. That is the whole reason it exists.
+
+**Consistent hashing with virtual nodes is the standard answer.**
+
+The simple ring (one position per server) gives uneven spread. With 6 servers, one server might own 30% of the ring and another 5%. The fix: give each real server many (100-200) virtual positions on the ring. With 1200 virtual nodes for 6 servers, the spread becomes close to uniform.
+
+**Redis Cluster uses a variant: 16384 fixed slots.** Each key hashes to `CRC16(key) mod 16384`. Slots are assigned to servers. Adding a server moves some slots. Mathematically the same as 16384 virtual nodes, but with explicit slot ownership.
+
+**Memcached takes a different path.** The protocol has no built-in clustering. The client library does the work. Clients use libketama (consistent hashing with virtual nodes) to pick a server. No server-side rebalancing. If you change the client config, keys move and you accept the cache miss storm.
+
+### A simple ASCII picture of the ring
 
 ```
-                ┌────────────────────────────────┐
-                │   Application Server            │
-                │   ┌────────────────────────┐   │
-                │   │   Smart Client Library  │   │  Caches slot→node map.
-                │   │   (Lettuce, Jedis,      │   │  Picks node by CRC16(key) % 16384.
-                │   │    redis-py-cluster)    │   │  Reacts to MOVED/ASK redirects.
-                │   └───────────┬────────────┘   │
-                └───────────────┼────────────────┘
-                                │
-                                ▼
-        ┌───────────────────────────────────────────────────┐
-        │   Hash Slot Ring (16384 slots)                     │
-        │   slot = CRC16(key) % 16384                        │
-        │   slot → owning node, kept in sync by gossip       │
-        └────────┬──────────────┬──────────────┬─────────────┘
-                 │              │              │
-                 ▼              ▼              ▼
-         ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-         │  Shard 1     │ │  Shard 2     │ │  Shard 3     │
-         │  slots 0-5460│ │  5461-10922  │ │  10923-16383 │
-         │              │ │              │ │              │
-         │ ┌──────────┐ │ │ ┌──────────┐ │ │ ┌──────────┐ │
-         │ │ Primary  │ │ │ │ Primary  │ │ │ │ Primary  │ │
-         │ │ accepts  │ │ │ │          │ │ │ │          │ │
-         │ │ writes   │ │ │ │          │ │ │ │          │ │
-         │ └────┬─────┘ │ │ └────┬─────┘ │ │ └────┬─────┘ │
-         │      │ async │ │      │       │ │      │       │
-         │      │ repl  │ │      │       │ │      │       │
-         │ ┌────▼─────┐ │ │ ┌────▼─────┐ │ │ ┌────▼─────┐ │
-         │ │ Replica  │ │ │ │ Replica  │ │ │ │ Replica  │ │
-         │ │ serves   │ │ │ │          │ │ │ │          │ │
-         │ │ reads    │ │ │ │          │ │ │ │          │ │
-         │ │ promotes │ │ │ │          │ │ │ │          │ │
-         │ │ on fail  │ │ │ │          │ │ │ │          │ │
-         │ └──────────┘ │ │ └──────────┘ │ │ └──────────┘ │
-         └──────────────┘ └──────────────┘ └──────────────┘
-                 ▲              ▲              ▲
-                 └──────────────┼──────────────┘
-                                │
-                       ┌────────▼─────────────┐
-                       │  Gossip Protocol      │  Every node pings a few peers
-                       │  (cluster bus on a    │  per second over a separate
-                       │  separate port)       │  TCP port. Exchanges:
-                       │                       │   - node liveness
-                       │                       │   - slot ownership map
-                       │                       │   - epoch/version numbers
-                       │                       │   - failover votes
-                       └───────────────────────┘
+              slot 0 / 16384
+                    .
+            .               .
+        S3 vnode A       S1 vnode A
+       .                         .
+      .                           .
+    S2 vnode B                  S2 vnode A
+      .                           .
+       .                         .
+        S3 vnode B       S1 vnode B
+            .               .
+                    .
+              slot 8192
+
+  Each S1, S2, S3 has many vnodes scattered around.
+  A key hashes to a point on the ring.
+  Walk clockwise to find the next vnode. That server owns the key.
 ```
 
-Component responsibilities:
+### Migration math
 
-- Smart Client Library. Holds the slot map locally. Sends each command directly to the right primary. If topology changed and the client targets the wrong node, the node responds `MOVED <slot> <new_address>` and the client updates its map. `ASK` is the same idea but only for the duration of a slot migration.
-- Hash Slot Ring. 16384 fixed slots. Each slot owned by exactly one primary at any moment. Slot map replicated across all nodes via gossip.
-- Primary per shard. Single writer for its slot range. Holds canonical data in memory.
-- Replica per shard. Async-replicated copy. Can serve reads (slightly stale). Promoted to primary if the primary dies.
-- Gossip protocol. The cluster's nervous system. Every node sends a `PING` to a small random subset of peers every ~100ms, including its view of the topology. After enough rounds, every node converges. Detects failures within a few seconds. Coordinates failover votes.
+Say we have 12 servers, 85 GB per server. We add server 13. With consistent hashing, about 1/13 of keys move, spread across the 12 old servers:
 
-For Memcached, the picture is simpler: no built-in cluster, no gossip, no replication. The "cluster" lives only in the client library, which consistent-hashes across a static list of servers. If a server dies, clients detect the connection failure, mark the server dead, and re-hash to the survivors. No automatic failover. Intentional: Memcached prizes simplicity and assumes the application survives any single key disappearing.
+- Each old server sends about 7 GB to server 13
+- Server 13 receives about 85 GB total
+- At 100 MB/sec migration rate (throttled so we do not saturate the network), 85 GB / 100 MB/sec = about 14 minutes
+
+**What happens to lookups for keys being moved?** Redis Cluster uses `ASK` redirects. If a key is in flight, the client first tries the old server. The old server says `ASK` and points to the new server. Client retries on the new server. After migration is done, the old server responds with `MOVED` for that whole slot, and the client updates its slot map.
+
+**Honest trade-off.** Consistent hashing reduces movement. It does not eliminate it. A dumb client that ignores `MOVED` and `ASK` and just retries on the old server will see cache misses (and may fall through to the database) during the migration window. Migration is not free. It is just contained.
 
 </details>
 
-## Step 5: eviction and expiration
+---
 
-The cache fills up. Now what? Two distinct mechanisms, often confused: expiration (TTL passes) and eviction (memory pressure forces removal regardless of TTL).
+## Step 4: Draw the system
 
-Ten minutes. List the policies Redis offers and when to choose each. What is "approximated LRU" and why does Redis use it instead of true LRU?
+Some boxes are missing. Try to fill in the five `[ ? ]` spots before peeking. Hint: how does the client find a server? How do servers find each other? What sits next to each primary for safety? What runs across all servers to keep the cluster healthy?
 
-<details>
-<summary><b>Reveal: eviction policies and the LRU approximation</b></summary>
+```
+              +----------------------+
+              |  Application Server   |
+              |   +---------------+   |
+              |   |   [ ? ]       |   |  (knows the cluster layout,
+              |   +-------+-------+   |   picks the right server)
+              +-----------+-----------+
+                          |
+                          v
+        +----------------------------------------+
+        |          [ ? ]                          |  (decides which server
+        |                                         |   owns a given key)
+        +-----+--------------+-------------+------+
+              |              |             |
+              v              v             v
+       +------------+ +------------+ +------------+
+       |  Shard 1   | |  Shard 2   | |  Shard 3   |
+       |            | |            | |            |
+       | +--------+ | | +--------+ | | +--------+ |
+       | |Primary | | | |Primary | | | |Primary | |
+       | +---+----+ | | +---+----+ | | +---+----+ |
+       |     | repl | |     |      | |     |      |
+       | +---v----+ | | +---v----+ | | +---v----+ |
+       | | [ ? ]  | | | | [ ? ]  | | | | [ ? ]  | |  (takes over if primary dies)
+       | +--------+ | | +--------+ | | +--------+ |
+       +------------+ +------------+ +------------+
+              ^             ^             ^
+              +-------------+-------------+
+                            |
+                   +--------v--------+
+                   |    [ ? ]        |  (every server talks to every other
+                   |                 |   server, sharing health info)
+                   +-----------------+
+```
 
-Expiration (TTL).
+<details markdown="1">
+<summary><b>Show: the full architecture</b></summary>
 
-`SET key value EX 60` gives the key a 60-second TTL. Two ways to remove an expired key:
+```
+              +----------------------------+
+              |  Application Server         |
+              |   +-------------------+    |
+              |   |  Smart Client Lib  |    |  Caches slot-to-server map.
+              |   |  (Lettuce, Jedis,  |    |  Picks server by
+              |   |   redis-py-cluster)|    |  CRC16(key) % 16384.
+              |   +---------+---------+    |  Reacts to MOVED/ASK.
+              +-------------+--------------+
+                            |
+                            v
+        +----------------------------------------------+
+        |  Hash Slot Ring (16384 fixed slots)           |
+        |  slot = CRC16(key) % 16384                    |
+        |  slot -> owning server, kept in sync via      |
+        |  gossip                                       |
+        +----+-----------------+----------------+-------+
+             |                 |                |
+             v                 v                v
+      +--------------+   +--------------+   +--------------+
+      |  Shard 1     |   |  Shard 2     |   |  Shard 3     |
+      |  slots       |   |  slots       |   |  slots       |
+      |  0-5460      |   |  5461-10922  |   |  10923-16383 |
+      |              |   |              |   |              |
+      | +----------+ |   | +----------+ |   | +----------+ |
+      | | Primary  | |   | | Primary  | |   | | Primary  | |
+      | | takes    | |   | |          | |   | |          | |
+      | | writes   | |   | |          | |   | |          | |
+      | +----+-----+ |   | +----+-----+ |   | +----+-----+ |
+      |      | async  |   |      |      |   |      |      |
+      |      | repl   |   |      |      |   |      |      |
+      | +----v-----+ |   | +----v-----+ |   | +----v-----+ |
+      | | Replica  | |   | | Replica  | |   | | Replica  | |
+      | | can      | |   | |          | |   | |          | |
+      | | serve    | |   | |          | |   | |          | |
+      | | reads    | |   | |          | |   | |          | |
+      | | promoted | |   | |          | |   | |          | |
+      | | on fail  | |   | |          | |   | |          | |
+      | +----------+ |   | +----------+ |   | +----------+ |
+      +--------------+   +--------------+   +--------------+
+             ^                 ^                ^
+             +-----------------+----------------+
+                               |
+                      +--------v---------+
+                      |  Gossip Protocol  |  Every server pings a few
+                      |  (cluster bus on  |  peers per second.
+                      |   a separate      |  Shares:
+                      |   TCP port)       |   - who is alive
+                      |                   |   - slot ownership map
+                      |                   |   - epoch numbers
+                      |                   |   - failover votes
+                      +-------------------+
+```
 
-- Passive. When a client tries to read the key, Redis notices it has expired and deletes it before responding. Cheap. But an expired key the application never reads sits in memory forever.
-- Active. A background job samples 20 random keys with TTLs every 100ms. If more than 25% are expired, sample again immediately. Bounds maximum staleness in memory without scanning the whole keyspace.
+**What each piece does, in one line each:**
 
-Both run together. Active sampling keeps memory usage close to actual live keys.
+- **Smart Client Library.** Holds the slot map locally. Sends each command directly to the right primary. If the topology changed and the client targets the wrong server, the server responds `MOVED <slot> <new_address>` and the client updates its map. `ASK` is the same idea but only for the duration of a slot migration.
 
-Eviction policies (when `maxmemory` is hit).
+- **Hash Slot Ring.** 16384 fixed slots. Each slot owned by exactly one primary at a time. The slot map is replicated across all servers via gossip.
 
-| Policy | Behavior |
-|--------|----------|
-| `noeviction` | Reject writes with an error. Reads still work. Application has to handle the rejection. |
-| `allkeys-lru` | Evict the approximate least-recently-used key from anywhere in the keyspace. |
+- **Primary per shard.** The single writer for its slot range. Holds the real data in memory.
+
+- **Replica per shard.** An async copy. Can serve reads (slightly stale). Promoted to primary if the primary dies.
+
+- **Gossip protocol.** The cluster's nervous system. Every server sends a `PING` to a small random subset of peers every 100ms, sharing its view of the topology. After a few rounds, every server converges on the same view. Detects failures within a few seconds. Coordinates failover votes.
+
+**For Memcached, the picture is simpler.** No built-in cluster. No gossip. No replication. The "cluster" lives only in the client library, which consistent-hashes across a static list of servers. If a server dies, clients notice the broken connection, mark it dead, and re-hash to the survivors. No automatic failover. This is on purpose. Memcached likes simplicity and assumes the application can handle any key disappearing.
+
+</details>
+
+---
+
+## Step 5: When memory fills up
+
+The cache fills up. Now what?
+
+There are two different things people confuse: **expiration** (TTL ran out) and **eviction** (memory is full, throw something out even if its TTL is still good).
+
+Here is a flowchart of the eviction decision:
+
+```mermaid
+flowchart TD
+    A[Write comes in] --> B{Memory full?}
+    B -- No --> C[Just write]
+    B -- Yes --> D{What policy?}
+    D -- noeviction --> E[Reject the write]
+    D -- allkeys-lru --> F[Sample 5 random keys]
+    F --> G[Evict the oldest one]
+    G --> C
+    D -- allkeys-lfu --> H[Sample 5 random keys]
+    H --> I[Evict the least-used one]
+    I --> C
+    D -- volatile-ttl --> J[Find key with soonest TTL]
+    J --> K[Evict it]
+    K --> C
+```
+
+<details markdown="1">
+<summary><b>Show: expiration vs eviction, and why "approximated LRU"</b></summary>
+
+### Expiration (TTL)
+
+`SET key value EX 60` gives the key a 60-second TTL. Two ways the key gets removed:
+
+- **Passive.** When a client tries to read the key, Redis notices it has expired and deletes it before responding. Cheap. But if no one ever reads it, the expired key sits in memory forever.
+- **Active.** A background job samples 20 random TTL keys every 100ms. If more than 25% are expired, it samples again right away. This keeps memory close to actual live keys without scanning the whole keyspace.
+
+Both run together.
+
+### Eviction policies (when `maxmemory` is hit)
+
+| Policy | What it does |
+|--------|-------------|
+| `noeviction` | Reject writes with an error. Reads still work. Application must handle the error. |
+| `allkeys-lru` | Evict the approximate least-recently-used key from anywhere. |
 | `volatile-lru` | Evict the approximate LRU key, but only from keys with a TTL. |
 | `allkeys-lfu` | Evict the approximate least-frequently-used key (counts access frequency over a decay window). |
-| `volatile-lfu` | Same as `allkeys-lfu` but restricted to keys with a TTL. |
+| `volatile-lfu` | Same as above but only TTL keys. |
 | `allkeys-random` | Evict a random key. |
 | `volatile-random` | Evict a random key from those with TTL. |
-| `volatile-ttl` | Evict the key with the soonest TTL expiration. |
+| `volatile-ttl` | Evict the key with the soonest TTL. |
 
-Choice depends on workload:
+**How to choose:**
 
-- Pure cache: `allkeys-lru` or `allkeys-lfu`. I do not care about specific keys; keep the hot set.
-- Mixed cache + queue/state: `volatile-lru`. Put TTLs on truly cacheable keys; leave critical keys (counters, locks) without TTL so eviction skips them.
-- No eviction allowed: `noeviction` with monitoring. Used when the cache is the source of truth (which I should not be doing, but sometimes I am).
+- **Pure cache:** `allkeys-lru` or `allkeys-lfu`. You do not care about specific keys; keep the hot ones.
+- **Mixed cache + counters or locks:** `volatile-lru`. Put TTLs on cacheable keys. Leave critical keys (counters, locks) without TTL so eviction skips them.
+- **No eviction allowed:** `noeviction` with strict monitoring. Used when the cache is the only copy of the data, which you should usually avoid.
 
-Approximated LRU.
+### What is "approximated LRU" and why?
 
-True LRU needs a doubly-linked list of every key. Every access moves the touched key to the head. With 100M keys and millions of ops/sec, the pointer overhead hurts: ~16 bytes per key for prev/next pointers, plus cache-unfriendly random pointer chasing.
+True LRU needs a doubly-linked list of every key. Every access moves the touched key to the front of the list. With 100M keys and millions of ops/sec, the cost hurts: about 16 bytes per key just for prev/next pointers, plus cache-unfriendly random pointer chasing.
 
-Redis approximates. Sample 5 keys at random (configurable, default 5, can raise to 10 for closer-to-true LRU) and evict the oldest of the sample. With sample size 10, the result is statistically close to true LRU at a fraction of the overhead.
+Redis approximates. Sample 5 random keys (configurable, can go up to 10) and evict the oldest of the sample. With a sample size of 10, the result is statistically very close to true LRU at a tiny fraction of the cost.
 
-How "oldest" is tracked: every key has a 24-bit "last access time" field (`lru` field in the object header), updated on read or write. Sampling reads this field. No linked list, no pointer overhead.
+> **Why this matters:** with 100M keys, no linked list saves 1.6 GB of RAM per server. That is a real number.
 
-Trade-off: occasionally evicts a not-quite-oldest key. For cache use cases this is invisible. Memory savings (no list pointers across 100M keys = 1.6 GB saved per node) is significant.
+How "oldest" is tracked: every key has a 24-bit "last access time" field in its object header, updated on read or write. Sampling reads this field. No linked list, no pointer overhead.
 
-LFU is implemented similarly: sampled, with a counter that increments on access and decays over time so old-frequent keys do not stay sticky forever.
+Trade-off: sometimes evicts a not-quite-oldest key. For cache use cases this is invisible.
 
-</details>
-
-## Step 6: replication and failover
-
-Each primary has one or more replicas. When the primary dies, a replica takes over. How: synchronously or asynchronously? Quorum or unanimous? Who picks the new primary?
-
-Ten minutes:
-
-- Default async replication. What is the data loss window?
-- Synchronous option. What is the latency cost?
-- How does the cluster detect a primary is down?
-- Who decides on the new primary?
-- What if the "dead" primary comes back?
-
-<details>
-<summary><b>Reveal: replication and failover</b></summary>
-
-Async replication (default).
-
-Primary handles the write, replies to the client, queues the write for replication. Replicas pull from the primary's replication buffer and apply.
-
-- Latency: write returns as soon as the primary commits to memory. Replicas catch up in milliseconds under normal conditions.
-- Data loss window: the writes in the buffer that have not yet reached the replica. Under steady-state load, a handful of operations (a few KB). Under load spike, larger.
-- If the primary dies before replication catches up, those writes are lost.
-
-This is the right default for cache workloads. I am caching, not storing the only copy.
-
-Synchronous replication (the `WAIT` command).
-
-After a write, the client can issue `WAIT <numreplicas> <timeout_ms>`. Blocks until the specified number of replicas have acked the previous writes, or the timeout fires.
-
-- Latency: bounded by the slowest of the N replicas. One replica same-AZ adds ~1ms. Cross-AZ adds ~5-10ms.
-- Data loss window: zero if I wait for all replicas. But `WAIT` does not give true synchronous semantics if the primary crashes after the write but before the WAIT returns; I still need a fencing mechanism to prevent a stale primary from accepting writes after a partition.
-
-Sync replication is rare for caches. Use it only for the small subset of writes intolerant to loss (a financial counter, a deduplication marker).
-
-Failure detection.
-
-Redis Cluster uses gossip-based detection. Each node pings a random subset of peers every 100ms. If a node fails to respond for ~5 seconds, the pinging node marks it PFAIL (possibly failed) and gossips this. Once a majority of primaries report PFAIL for the same node, it becomes FAIL (cluster-wide consensus that it is down).
-
-Threshold is configurable. Lower = faster failover but more false positives during network blips. Higher = more conservative but slower recovery.
-
-Leader election (failover).
-
-When a primary is declared FAIL, its replicas race to take over.
-
-1. Each replica waits a small delay proportional to its replication lag (least-lagging goes first).
-2. The replica requests votes from all other primaries: "should I take over for failed primary X?"
-3. Other primaries vote yes if they agree X is FAIL and the requesting replica is the only one asking within an epoch.
-4. With a majority vote, the replica promotes itself, claims the slot range, and gossips the new topology.
-5. Clients discover the new primary via `MOVED` redirects on the next request.
-
-Total failover time: typically 5-15 seconds in well-tuned clusters. Most of that is the detection window; the actual promotion takes under a second.
-
-Memcached has no failover. Server dies, the client library notices, hashes to remaining servers. Keys on the dead server are simply gone until it returns.
-
-The "old primary returns" problem.
-
-The old primary was network-partitioned, not dead. Now it can talk again. The cluster has already promoted a replica.
-
-On first gossip exchange, the returning primary learns its epoch is stale. It demotes itself to replica of the new primary, discards in-memory state, syncs. Any writes accepted during the partition window are lost. Canonical CAP trade-off: the cluster chose availability (let the new primary take writes during the partition) and accepts that partitioned writes on the old primary cannot be reconciled.
-
-To minimize this: use `min-replicas-to-write` so a primary refuses writes if it cannot reach at least one replica. Trades availability for consistency. Some teams set this; most accept the small loss window for caches.
+LFU is similar: each key has a small counter that goes up on access and decays over time, so old-but-popular keys do not stay sticky forever.
 
 </details>
 
-## Step 7: read the full solution
+---
 
-That is the heart: partitioning, replication, failover, eviction. The solution adds persistence options (RDB vs AOF), the hot key and big key problems, encoding tricks for memory efficiency, and the day-2 problems that determine whether the cluster survives production.
+## Step 6: When a server dies
+
+Each primary has one or more replicas. When the primary dies, a replica takes over. How does that happen?
+
+Here is a state diagram of the failover dance:
+
+```mermaid
+stateDiagram-v2
+    [*] --> PrimaryAlive: Cluster boots up
+    PrimaryAlive --> PrimaryAlive: Pings every 100ms
+    PrimaryAlive --> PFAIL: No ping reply for ~5s
+    PFAIL --> PrimaryAlive: Ping reply comes back
+    PFAIL --> FAIL: Majority of primaries agree it is down
+    FAIL --> ReplicaElection: Replicas race to take over
+    ReplicaElection --> NewPrimary: Replica gets majority vote
+    NewPrimary --> ClientsReconnect: Gossip spreads the new map
+    ClientsReconnect --> [*]: Clients get MOVED and update
+```
+
+<details markdown="1">
+<summary><b>Show: async vs sync, detection, election, and the "old primary returns" problem</b></summary>
+
+### Async replication (default)
+
+Primary handles the write, replies to the client, and queues the write for replication. Replicas pull from the primary's replication buffer and apply.
+
+- **Latency:** write returns as soon as the primary commits to memory. Replicas catch up in milliseconds under normal conditions.
+- **Data loss window:** the writes still in the buffer that have not reached the replica. Under normal load, just a handful of operations.
+- **If the primary dies before replication catches up, those writes are lost.**
+
+This is the right default for cache workloads. The cache is not the only copy of the data.
+
+### Synchronous replication (the `WAIT` command)
+
+After a write, the client can issue `WAIT <num_replicas> <timeout_ms>`. This blocks until that many replicas have acked the previous writes, or the timeout fires.
+
+- **Latency:** bounded by the slowest of the N replicas. One same-AZ replica adds about 1ms. Cross-AZ adds 5-10ms.
+- **Data loss window:** zero if you wait for all replicas. But `WAIT` is not true synchronous semantics; if the primary crashes between the write and the WAIT, things get fuzzy.
+
+Sync replication is rare for caches. Use it only for the small set of writes that cannot tolerate loss (a financial counter, a deduplication marker).
+
+### How do we detect the primary is down?
+
+Gossip-based detection. Each server pings a few random peers every 100ms. If a server fails to reply for about 5 seconds, the pinging server marks it `PFAIL` (possibly failed) and gossips this. Once a majority of primaries agree, the state becomes `FAIL` (cluster-wide consensus that it is down).
+
+> Lower threshold = faster failover but more false positives during network blips. Higher = slower recovery. Default 5s is usually fine.
+
+### Leader election
+
+When a primary is declared `FAIL`, its replicas race to take over.
+
+1. Each replica waits a small delay proportional to its replication lag (the most-current replica goes first).
+2. The replica asks all other primaries for votes: "should I take over for failed primary X?"
+3. Other primaries vote yes if they agree X is `FAIL` and the requesting replica is the only one asking in this epoch (term number).
+4. With a majority vote, the replica promotes itself, claims the slot range, and gossips the new layout.
+5. Clients learn the new primary via `MOVED` redirects on the next request.
+
+Total failover time: usually 5-15 seconds. Most of that is the detection window; the actual promotion takes under a second.
+
+Memcached has no failover. Server dies, the client library notices, hashes to remaining servers. Keys on the dead server are simply gone until it comes back.
+
+### The "old primary returns" problem
+
+The old primary was network-partitioned, not actually dead. Now it can talk again. The cluster has already promoted a replica.
+
+On its first gossip exchange, the returning server learns its epoch is stale. It demotes itself to a replica of the new primary, throws away its in-memory state, and syncs from the new primary. Any writes accepted during the partition window are lost.
+
+This is the classic CAP trade-off: the cluster chose availability (let the new primary take writes during the partition) and accepts that writes on the old primary cannot be reconciled.
+
+To make this smaller: use `min-replicas-to-write` so a primary refuses writes if it cannot reach at least one replica. Trades a bit of availability for less data loss. Some teams set this. Most caches accept the small loss window.
+
+</details>
+
+---
+
+## Step 7: A GET, drawn end to end
+
+Here is a Mermaid sequence of a simple GET request:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant CL as Cluster Client (smart SDK)
+    participant H as Hash function
+    participant P as Shard Primary
+    C->>CL: GET user:42:profile
+    CL->>H: CRC16(key) % 16384
+    H-->>CL: slot 5798
+    CL->>CL: slot_map[5798] = shard 2 primary
+    CL->>P: GET user:42:profile
+    alt Hit
+        P-->>CL: value
+        CL-->>C: value
+    else Miss
+        P-->>CL: nil
+        CL-->>C: nil (caller will fetch from DB)
+    end
+    alt Topology changed
+        P-->>CL: MOVED 5798 10.0.3.4:6379
+        CL->>CL: update slot_map[5798]
+        CL->>P: retry on new server
+    end
+```
+
+---
 
 ## Follow-up questions
 
-Answer each in 2 to 3 sentences before reading the solution.
+Try to answer each in 2 or 3 sentences before opening the solution.
 
-1. Hot key. One key gets 500K req/s. It lives on one shard. That shard's CPU pegs. What do I do?
-2. Big key. One key holds a sorted set with 2M entries. `ZRANGE 0 -1` stalls the event loop for 800ms. Every other op queues behind it. How do I prevent and how do I recover?
-3. I set a TTL of 60 seconds on a million keys at once (bulk import). 60 seconds later, application latency P99 doubles. Why? Fix it without changing the TTL.
-4. Persistence. When RDB? When AOF? When both? When neither? What does each cost in latency and data loss window?
-5. Resharding. 6 nodes growing to 12. How do I do it without dropping ops/sec or losing data? How long does it take?
-6. Network partition. Two nodes in one DC can talk to each other but not to the rest of the cluster. What happens? Will the partition try to elect its own primaries?
-7. Memory fragmentation. Redis reports `used_memory_rss / used_memory = 1.8`. Translate that for the interviewer and say what I do about it.
-8. Cache stampede. A popular cache key expires. 10,000 concurrent requests miss, hit the database. Database melts. How do I prevent this in the cache layer?
-9. Inconsistent reads. A user writes `SET balance 100`, immediately reads back, sees the old value. Why? When can this happen in a cluster that uses replicas for reads?
-10. Cache hit rate dropped from 95% to 60% overnight. No deploys. What is my investigation path?
+1. **Hot key.** One key gets 500,000 requests per second. It lives on one shard. That shard's CPU pegs at 100%. What do you do?
+
+2. **Big key.** One key holds a sorted set with 2 million entries. A single `ZRANGE 0 -1` stalls the event loop for 800ms. Every other operation queues behind it. How do you prevent this, and how do you recover?
+
+3. **TTL stampede.** You set a TTL of 60 seconds on a million keys at once (bulk import). 60 seconds later, the application's P99 latency doubles. Why? Fix it without changing the TTL.
+
+4. **Persistence.** When should you use RDB? When AOF? When both? When neither? What does each cost in latency and data loss window?
+
+5. **Resharding.** Six servers growing to twelve. How do you do this without dropping operations per second or losing data? How long does it take?
+
+6. **Network partition.** Two servers in one data center can talk to each other but not to the rest of the cluster. What happens? Will the partition try to elect its own primaries?
+
+7. **Memory fragmentation.** Redis reports `used_memory_rss / used_memory = 1.8`. Explain what that means in plain words, and what you would do about it.
+
+8. **Cache stampede.** A popular key expires. 10,000 concurrent requests miss, all hit the database. The database melts. How do you prevent this in the cache layer?
+
+9. **Read-after-write surprise.** A user writes `SET balance 100`, immediately reads back, and sees the old value. Why? When can this happen in a cluster that uses replicas for reads?
+
+10. **Hit rate crash.** Cache hit rate dropped from 95% to 60% overnight. No deploys happened. What is your investigation path?
+
+---
 
 ## Related problems
 
-- [URL Shortener (001)](../001-url-shortener/question.md), uses this cache heavily on the redirect path. The hot key problem there is the same one analyzed here.
-- [News Feed (002)](../002-news-feed/question.md), timeline store is a Redis cluster. Sorted-set encoding, hot-key replicas, cold-user eviction all come from this design.
-- [Typeahead Autocomplete (005)](../005-typeahead-autocomplete/question.md), the prefix index sits in the same kind of distributed cache. The big-key problem is acute there (top prefixes hold large suggestion lists).
+- **[URL Shortener (001)](../001-url-shortener/question.md).** Uses this cache heavily on the redirect path. The hot key problem there is the same one analyzed here.
+- **[News Feed (002)](../002-news-feed/question.md).** The timeline store is a Redis cluster. Sorted-set encoding, hot-key replicas, cold-user eviction all come from this design.
+- **[Typeahead Autocomplete (005)](../005-typeahead-autocomplete/question.md).** The prefix index sits in the same kind of distributed cache. The big-key problem is acute there (top prefixes hold large suggestion lists).

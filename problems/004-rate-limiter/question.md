@@ -7,82 +7,106 @@ difficulty: Medium
 solution: solution.md
 ---
 
-## Scene
+## The scene
 
-Second round of an onsite. The interviewer runs the API gateway team at a SaaS company. They put one sentence in the doc:
+You walk into the second round of an onsite. The interviewer runs the API gateway team at a SaaS company. They write one sentence on the whiteboard.
 
-> *Design a rate limiter for our public API.*
+> *"Design a rate limiter for our public API."*
 
-Almost as an afterthought: "We have free, pro, and enterprise tiers. Each tier has different limits. The API is behind a fleet of gateway servers. Make it work."
+Then they add: *"We have free, pro, and enterprise tiers. Each tier has a different limit. The API runs on 200 gateway servers. Make it work."*
 
-This problem looks small and isn't. Candidates jump to "token bucket in Redis" inside 30 seconds and then run out of things to say. The algorithm is rarely the interesting part. What matters is where the limiter sits, what happens when Redis dies, how you share counters across N gateway nodes, and how you avoid making every API call slower because of the check itself.
+It looks small. It is not. Most candidates say "token bucket in Redis" in 30 seconds and then run out of things to say. The algorithm is the easy part. The hard parts are:
 
-## Step 1: clarify before you design
+- Where does the limiter sit?
+- What happens when Redis dies?
+- How do 200 gateway nodes share one counter?
+- How do we not make every API call slower because of the check itself?
 
-Take five minutes. Write down at least six questions you'd ask before drawing anything. The interviewer is watching whether you treat "rate limiter" as a small problem or as the cross-cutting concern it actually is.
+We will walk through all of this. We will start small and grow the design step by step.
 
-<details>
-<summary><b>Reveal: questions a strong candidate asks</b></summary>
+> **Why a rate limiter at all?** Without one, a single buggy client (or one attacker) can hammer your API and bring everything down for everyone else. The limiter is the bouncer at the door. It lets only a fair number of requests through per client per second.
 
-1. **Traffic shape.** What is total API QPS? P99 per-client QPS? How many distinct clients? Without this you can't size Redis, decide between in-memory and shared state, or know whether one shard is enough. Typical answer: 100K total QPS, 100K distinct clients, P99 client at 100 req/sec.
-2. **What you limit on.** Per IP? Per API key? Per user_id? Per route? Some combination? This is the single most important question. A limiter on IP fails the moment a corporate NAT puts 10,000 employees behind one address. A limiter on API key is invisible to abusers who rotate keys. Real systems layer several keys.
-3. **Limit semantics.** Is it 100 requests per minute, or 100 in a rolling 60-second window? Bursts allowed? Fixed windows are easier; sliding windows are more accurate. Bursts are usually allowed so the API feels responsive on short spikes.
-4. **Tiers.** Static per tier, or per customer with overrides? Most real systems have both: a default per tier, plus per-customer overrides for enterprise accounts that negotiated higher limits.
-5. **Failure mode.** If the limiter's backing store is down, do we fail-open (allow everything) or fail-closed (reject everything)? Business question disguised as a technical one. Most public APIs fail-open; payment APIs fail-closed.
-6. **Response format.** On a throttle, do we return 429 with `Retry-After`? Do we expose `X-RateLimit-Remaining` for well-behaved clients? Standardized headers are table stakes.
-7. **Granularity.** Limit on request count, or on cost? An expensive search query should weigh more than a cheap lookup. Cost-based limits are common at scale and add complexity.
-8. **Latency budget.** How many milliseconds can the limiter add per request? Under 1ms means in-process. Under 5ms means a local Redis hop. Over 10ms is a problem.
+---
 
-If you walked in asking only "what is the limit?" you missed the architecture-defining questions. Granularity (what you limit on) and failure mode shape everything that follows.
+## Step 1: Ask the right questions
+
+Before you draw anything, sit for five minutes. Write down questions you would ask the interviewer.
+
+A good answer here is not "ten questions about every edge case." It is the small handful of questions that change the design if the answer changes.
+
+<details markdown="1">
+<summary><b>Show: 8 questions that matter</b></summary>
+
+1. **What do you limit on?** Per IP? Per API key? Per user_id? Per route? Some mix? *(This is the biggest question. A per-IP limit fails the moment a company NAT puts 10,000 employees behind one address. A per-API-key limit is useless against an attacker who rotates keys. Real systems use layers.)*
+
+2. **What does the limit mean?** Is it 100 requests per minute on the clock? Or 100 in any rolling 60-second window? Are short bursts okay? *(Fixed windows are easier. Sliding windows are more fair. Bursts are usually allowed so the API feels snappy.)*
+
+3. **Same limit for everyone?** Or does each tier (free, pro, enterprise) have its own? Can one big customer get an override? *(Almost always tiered with overrides. Shapes the config store.)*
+
+4. **What if the store is down?** If Redis dies, do we let everything through (fail-open) or block everything (fail-closed)? *(This is a business question disguised as a technical one. Most public APIs fail-open. Payment APIs fail-closed.)*
+
+5. **What do we return on a reject?** A 429 with `Retry-After`? Headers like `X-RateLimit-Remaining` so good clients can self-throttle? *(Headers are table stakes. Skipping them is a red flag.)*
+
+6. **Count requests, or cost?** Is one search query worth the same as one health check? Or should the search cost 5 "units"? *(Cost-based limits are common at scale and add real complexity.)*
+
+7. **How much latency can the check add?** Under 1ms means in-process. Under 5ms means one Redis round trip. Over 10ms is a problem. *(Sets the latency budget.)*
+
+8. **Traffic numbers.** Total QPS? P99 per-client QPS? How many distinct clients? *(Without this you cannot size Redis.)*
+
+The two that matter most: **what do you limit on** and **what happens when the store is down**. If you skip those, you are answering a different (smaller) problem.
 
 </details>
 
-## Step 2: capacity estimates
+---
 
-Say the interviewer answers:
+## Step 2: How big is this thing?
 
-- 100K total API QPS, peak 300K
+The interviewer gives you these numbers:
+
+- 100K total API requests per second, peak 300K
 - 100K distinct API keys
-- Limits: 100 req/min free, 1000 req/min pro, 10000 req/min enterprise
-- Most clients are at 1-10% of their limit; a small fraction sit at 80%+
-- 200 gateway nodes in the fleet
-- Limit checks add no more than 2ms P99 per request
+- Free tier: 100 req/min. Pro: 1,000/min. Enterprise: 10,000/min.
+- Most clients sit at 1 to 10 percent of their limit. A few sit near the cap.
+- 200 gateway nodes in the fleet.
+- The check must add no more than 2ms at P99.
 
-Compute these before peeking:
+Try the math first. Compute:
 
-1. Counter updates per second
-2. State size to track 100K clients
-3. Per-node QPS each limiter has to handle
-4. Redis read+write rate if every check is a round trip
-5. Wire cost of one check (request + response bytes)
+1. How many counter updates per second?
+2. How much memory to track all 100K clients?
+3. How many limit checks per second on each gateway node?
+4. How many Redis ops per second if every check is a round trip?
 
-<details>
-<summary><b>Reveal: the math</b></summary>
+<details markdown="1">
+<summary><b>Show: the math</b></summary>
 
 **Counter updates per second.**
-Every request increments a counter. 300K QPS peak = **300K counter writes/sec**. Keep a few counters per client (per-minute, per-hour, per-route) and multiply by 3 to 5. Call it ~1M Redis ops/sec at peak across the cluster.
+Every request bumps a counter. 300K QPS at peak means **300K writes per second** baseline. Keep a few counters per client (per-minute, per-hour, per-route) and you multiply by 3 to 5. Call it **~1M Redis ops/sec at peak**.
 
-**State size.**
-100K clients x ~3 counters each x ~100 bytes per counter record (key + integer + TTL metadata) = **30MB**. Negligible. Fits on one Redis node. We'll still shard for availability, not capacity.
+**Memory for state.**
+100K clients x ~3 counters each x ~100 bytes per counter = **30MB**. Tiny. Fits on one Redis node. We still shard for availability, not for capacity.
 
 **Per-node QPS.**
-300K / 200 gateway nodes = **1500 QPS per gateway node**. Each node performs 1500 limit checks per second. Trivial in-process. Each one talking to Redis is 1500 network round trips per node per second.
+300K / 200 gateway nodes = **1,500 checks per second per gateway**. Easy in-process. But each check that talks to Redis is one network round trip. That is 1,500 round trips per node per second.
 
-**Redis read+write rate.**
-If every check is a Redis call: 300K req/sec × ~2 ops (read counter + conditional increment) = **600K ops/sec**. A single Redis instance handles ~100K ops/sec comfortably, so we shard, batch, or cache locally.
+**Redis ops if every check is a round trip.**
+300K req/sec x 2 ops per check (read, then maybe increment) = **600K ops/sec** on the Redis cluster. One Redis instance handles about 100K ops/sec comfortably. So we shard, or cache locally, or both.
 
-**Wire cost per check.**
-Redis INCR + EXPIRE pipelined: ~80 bytes request, ~40 bytes response. At 300K QPS that's **~36MB/sec of internal traffic**. Not a problem, but worth noting the limiter generates real load on its own dependencies.
+**What the math tells us:**
 
-**Key insight from the math.** State is tiny. The cost is round-trip count, not data volume. The whole design pressure is around *how many times we touch the backing store per request*, not how much we store.
+The state is small. The challenge is **how many times we touch the store per request**, not how much we store.
+
+> Why this matters: Every saved Redis round trip saves real latency and money. The whole design centers on cutting round trips for hot keys.
 
 </details>
 
-## Step 3: choose the algorithm
+---
 
-Five common algorithms. Each makes a different trade between memory, accuracy, and burst handling. Before reading on, list them and the trade each makes. Then write one scenario where each is the wrong choice.
+## Step 3: Pick the algorithm
 
-The five:
+There are five common rate limiting algorithms. Each makes a different trade between memory, accuracy, and how it handles bursts.
+
+Try to guess the rough idea of each before reading on:
 
 - Token bucket
 - Leaky bucket
@@ -90,208 +114,246 @@ The five:
 - Sliding window log
 - Sliding window counter
 
-<details>
-<summary><b>Reveal: comparison table</b></summary>
+Here is a quick flowchart of how to pick one:
 
-| Algorithm | How it works | Memory per client | Burst behavior | Boundary accuracy | When wrong |
-|-----------|-------------|------------------|----------------|-------------------|-----------|
-| Token bucket | A bucket holds up to N tokens. Refilled at rate R tokens/sec. Each request consumes one; empty bucket means reject. | ~16 bytes (token count + last refill ts) | Allows bursts up to bucket size, then throttles to refill rate. | N/A (continuous) | When you want strict no-bursts. Use leaky bucket. |
-| Leaky bucket | Requests queue into a bucket. Bucket drains at fixed rate R. Full bucket means reject. | ~16 bytes + the queue | Smooths spikes by queuing rather than rejecting. Output is strictly constant. | N/A (continuous) | When latency matters more than smoothing. Queues add delay. |
-| Fixed window counter | Count requests in the current N-second window. Window resets at fixed clock boundaries. | ~16 bytes | Allows 2x burst at boundary. | Bad: a client can send N at 11:59:59 and N more at 12:00:00. | When you advertise "100/min" and clients notice the doubling. |
-| Sliding window log | Store the timestamp of every request in the last window. Count >= N means reject. | O(N) per client (can be MB for high limits) | Exact. | Best possible. | When N is large. 10,000 timestamps x 8 bytes = 80KB per client x 100K clients = 8GB. |
-| Sliding window counter | Weighted average of current and previous fixed window. Approximates true sliding without storing every request. | ~24 bytes (two counters + ts) | Close to ideal. No boundary doubling. | ~99% accurate vs true sliding. | When you need exact correctness (rare; the approximation is fine even for billing-grade APIs). |
+```mermaid
+flowchart TD
+    Start[I need a rate limiter] --> Q1{Need exact accuracy?}
+    Q1 -- Yes, small N --> SWLog[Sliding Window Log]
+    Q1 -- No, approx OK --> Q2{Want explicit bursts?}
+    Q2 -- Yes --> TB[Token Bucket]
+    Q2 -- No, smooth output --> LB[Leaky Bucket]
+    Q2 -- No, count-based --> Q3{Care about boundary doubling?}
+    Q3 -- No, simple is fine --> FW[Fixed Window]
+    Q3 -- Yes, no doubling --> SWC[Sliding Window Counter]
 
-**My recommendation: sliding window counter.**
+    style SWC fill:#cfc
+    style TB fill:#ccf
+```
 
-- Memory is O(1) per client, like fixed window. No per-request storage.
-- Boundary doubling is gone. The weighted average smooths across the boundary.
-- Implementable in a Redis Lua script in ~10 lines, atomic, P99 under 1ms.
-- The 1% inaccuracy is invisible to clients and acceptable for almost every use case.
+<details markdown="1">
+<summary><b>Show: side-by-side comparison</b></summary>
 
-Token bucket is a strong second choice and is what AWS, Stripe, and most production APIs actually use. It's harder to implement atomically in a distributed setting (the refill calculation is stateful) but maps cleanly onto a Lua script too.
+| Algorithm | How it works | Memory per client | Burst behavior | Boundary problem | When it is wrong |
+|-----------|--------------|-------------------|----------------|------------------|-------------------|
+| **Token bucket** | A bucket holds up to N tokens. It refills at R tokens/sec. Each request takes one. Empty = reject. | ~16 bytes | Allows bursts up to bucket size, then throttles to R | None | When you want zero bursts |
+| **Leaky bucket** | Requests enter a queue. The queue drains at fixed rate R. Full queue = reject. | ~16 bytes plus the queue | Smooths spikes by queuing them | None | When latency matters (queuing adds delay) |
+| **Fixed window** | Count requests in the current minute. Window resets on the clock. | ~16 bytes | Allows 2x burst right at the boundary | Bad: 100 at 11:59:59 plus 100 at 12:00:00 | When clients notice the doubling |
+| **Sliding window log** | Store the timestamp of every request in the last window. | O(N), can be many MB | Exact | Best possible | When N is large (10K x 8 bytes x 100K clients = 8GB) |
+| **Sliding window counter** | Weighted blend of the current window count and the previous window count. | ~24 bytes | Close to ideal, no boundary jump | ~99% accurate vs true sliding | When you need exact correctness (rare) |
 
-The interviewer is testing whether you know *why* a sliding window counter exists, not which algorithm has the prettiest name. The why: fixed window has a boundary problem, sliding window log uses too much memory, the counter is the cheap approximation that fixes both.
+**My pick: sliding window counter.**
+
+- O(1) memory per client (like fixed window).
+- No boundary doubling.
+- Fits in a ~10-line Redis Lua script. Atomic. P99 under 1ms.
+- The 1% inaccuracy is invisible to clients.
+
+**Token bucket** is a strong second choice. AWS and Stripe use it. Pick it when you want explicit burst control (200 right now, then 1 per second after).
+
+> Why this matters: most candidates pick token bucket because they have heard of it. The real question is *why* a sliding window counter exists. The answer: fixed window has the boundary problem, sliding window log uses too much memory, and the counter is the cheap fix for both.
 
 </details>
 
-## Step 4: incomplete architecture diagram
+---
 
-Fill in the `[ ? ]` placeholders. Decide:
+## Step 4: A picture of the token bucket
 
-- Where the rate limiter sits (gateway, sidecar, in-process library?)
-- Where state lives (in-process map, local Redis, central Redis, both?)
-- What happens when the state store is unreachable
-- How counters stay consistent across N gateway nodes
+The token bucket is the easiest to visualize. Think of a real bucket that holds, say, 200 tokens. A pipe drips 1 token per second into it. Each request scoops out 1 token. If the bucket is empty, the request is rejected.
+
+```mermaid
+stateDiagram-v2
+    [*] --> HasTokens
+    HasTokens --> HasTokens: Refill (R tokens/sec, capped at bucket size)
+    HasTokens --> Empty: Last token taken
+    Empty --> HasTokens: Refill drips in
+    HasTokens --> Allowed: Request arrives, take 1 token
+    Empty --> Rejected: Request arrives, no tokens, return 429
+    Allowed --> [*]
+    Rejected --> [*]
+```
+
+Two things to notice:
+
+- **Idle time fills the bucket.** If nobody calls for a minute, the bucket fills up (capped at its size). The next burst can scoop out everything at once.
+- **Sustained calls throttle to the refill rate.** Once the bucket drains, you can only call as fast as the bucket refills.
+
+> Real world: a bucket of size 200 with refill rate 1/sec lets a client send 200 requests in one second, then slows them to 1/sec after that. Good for clients that batch-load and then idle.
+
+---
+
+## Step 5: Where does the limiter live?
+
+You have four options for where the limiter runs. Try to fill in the gaps below. Where would *you* put it?
 
 ```
-   Client ────►   ┌────────────┐
-                  │  [ ? ]     │  (terminates TLS, routes by host)
-                  └──────┬─────┘
-                         │
-                         ▼
-                  ┌────────────┐
-                  │   [ ? ]    │  (where does the limiter run?)
-                  │            │  ┌───────────────┐
-                  │            ├─►│  [ ? ]        │  (shared state? local? both?)
-                  │            │  └───────────────┘
-                  └──────┬─────┘
-                         │  allowed? → forward
-                         │  rejected? → 429
-                         ▼
-                  ┌────────────┐
-                  │ API Service│
-                  └────────────┘
+   Client ───►   +-------------+
+                 |   [ ? ]     |  (TLS, route by host)
+                 +------+------+
+                        |
+                        v
+                 +-------------+
+                 |   [ ? ]     |  (where does the limiter run?)
+                 |             |  +---------------+
+                 |             |->|   [ ? ]       |  (shared state? local? both?)
+                 |             |  +---------------+
+                 +------+------+
+                        |  allowed? -> forward
+                        |  rejected? -> 429
+                        v
+                 +-------------+
+                 |  API service|
+                 +-------------+
 
    Failure path: if [ ? ] is unreachable, the limiter must decide:
                  fail-open (allow) or fail-closed (reject)?
 ```
 
-<details>
-<summary><b>Reveal: complete architecture</b></summary>
+<details markdown="1">
+<summary><b>Show: the full picture and why</b></summary>
 
 ```
-   Client ────►   ┌────────────────┐
-                  │  Load Balancer │  Anycast IP, TLS termination
-                  │  (L7)          │  Health-checks gateway nodes
-                  └────────┬───────┘
-                           │
-                           ▼
-                  ┌────────────────┐
-                  │  API Gateway   │  Stateless. Runs the rate limiter
-                  │  (200 nodes)   │  as in-process middleware.
-                  │                │  Each node keeps a small local LRU
-                  │  ┌──────────┐  │  cache of recent counter values.
-                  │  │ Limiter  │  │
-                  │  │ middlewar│──┼─────────┐
-                  │  └──────────┘  │         │ Lua script:
-                  └────────┬───────┘         │ atomic INCR + EXPIRE +
-                           │                 │ window math, returns
-                           │ allowed         │ (allowed, remaining, reset_at)
-                           ▼                 ▼
-                  ┌────────────────┐  ┌────────────────────┐
-                  │  API Service   │  │   Redis Cluster    │
-                  │                │  │  Sharded by key    │
-                  └────────────────┘  │  hash. Replicated. │
-                                      │  6 primary shards, │
-                                      │  one replica each. │
-                                      └─────────┬──────────┘
-                                                │
-                                                │ async dump
-                                                ▼
-                                      ┌────────────────────┐
-                                      │  Cold counter      │  For abuse forensics:
-                                      │  archive (S3 + CH) │  reconstruct a bad
-                                      │                    │  actor's rate history.
-                                      └────────────────────┘
+   Client ───►   +-----------------+
+                 |  Load Balancer  |  Anycast IP, TLS termination,
+                 |  (L7)           |  health-checks gateways
+                 +--------+--------+
+                          |
+                          v
+                 +-----------------+
+                 |  API Gateway    |  Stateless. Runs the limiter
+                 |  (200 nodes)    |  as in-process middleware.
+                 |                 |  Each node keeps a small LRU
+                 |  +-----------+  |  cache of recent counter values.
+                 |  | Limiter   |  |
+                 |  | middleware|--+-----------+
+                 |  +-----------+  |           |  Lua script:
+                 +--------+--------+           |  atomic check + INCR,
+                          |                    v  returns
+                          |  allowed   +-----------------+
+                          v            |  Redis Cluster  |
+                 +-----------------+   |  Sharded by key |
+                 |   API Service   |   |  hash, replicated|
+                 +-----------------+   +-----------------+
 
-   Failure path: if Redis cluster is unreachable from a gateway node,
-   that node falls back to per-node in-process counters with a stricter
-   tier-based ceiling (e.g. burst x 1.5). Fail-open with a safety net:
-   we keep serving, each node enforces independently with no
-   coordination. Critical alert immediately.
+   Failure path: if Redis is unreachable from a gateway node,
+   that node falls back to in-process counters with a stricter
+   ceiling. Loud alert immediately.
 ```
 
-Why each piece is here:
+**Why each piece is here:**
 
-- L7 load balancer isn't the place for rate limiting. LBs operate at connection level; rate limiting needs application-level identity (API key, user_id). Limits at the LB only cover per-IP, which is the weakest defense.
-- Gateway with in-process middleware. The limiter is a library, not a service. Calling out to a separate "rate limiter service" adds a network hop per request and doubles the latency budget. In-process middleware plus remote Redis is the standard.
-- Per-node LRU. A tiny local cache of "this key was just at N requests, don't ask Redis for 100ms" cuts Redis QPS by 80%+ for hot clients. More on this in Step 5.
-- Redis cluster. Shared state across nodes. Sharded by client key hash, replicated for failover. Lua scripts evaluate atomically, which is what makes "check counter and decrement" safe under concurrent requests.
-- Cold archive. When you investigate why client X got blocked yesterday, in-Redis counters with TTL have already expired. Stream rejected events to S3 + ClickHouse for forensics.
+- **The load balancer is not the limiter.** Load balancers see TCP connections. They cannot see the API key inside the HTTP request. A limiter at the LB can only do per-IP, which is the weakest defense (NAT, IP rotation).
+
+- **In-process middleware on the gateway.** The limiter is a *library*, not a separate service. Calling out to a "rate limiter service" would add one network hop per API call. That doubles the latency budget.
+
+- **Per-node LRU cache (the trick).** A tiny local cache says "this key was already over the limit 50ms ago, don't ask Redis again." This cuts Redis traffic by 80% or more for abusive clients. More on this in Step 6.
+
+- **Redis cluster for shared state.** All 200 gateway nodes share counters here. Sharded by client key. Lua scripts run atomically (read + check + increment in one shot).
+
+- **Cold archive (optional).** When a customer asks "why did you block me yesterday?", the Redis counters have already expired. Stream rejection events to S3 + ClickHouse so you can answer the question.
 
 </details>
 
-## Step 5: distributed state
+---
 
-200 gateway nodes. Each one is processing rate limit checks. How do you share counters across them so a client can't get N requests through each node and effectively get 200N total?
+## Step 6: How do 200 nodes share one counter?
 
-Three approaches. Write the pros and cons of each, then read on.
+This is the heart of the design. Without sharing, every gateway has its own count. A client could get N requests through each node and effectively get 200N total.
 
-- Central Redis. Every check is a remote call.
-- In-process counters with periodic gossip. Each node keeps its own counters; nodes broadcast their counts every few seconds.
-- Local-first with remote reconciliation. Each node has a local counter, drains to Redis on a short interval, reads back the global value periodically.
+You have three real options. Think through each before reading on:
 
-<details>
-<summary><b>Reveal: comparison and recommendation</b></summary>
+- **Central Redis.** Every check is a remote call.
+- **Local counters with gossip.** Each node has its own counter. Nodes broadcast their counts every few seconds.
+- **Local-first with reconciliation.** Each node has a local counter, drains it to Redis on a schedule.
 
-| Approach | Accuracy | Latency overhead | Failure behavior | When to use |
-|----------|---------|------------------|------------------|------------|
-| Central Redis every check | Exact (Lua script makes it atomic) | 1-2ms per request | Redis down = limiter down. Must fail-open or fail-closed. | Default. The right answer at this scale. |
-| Periodic gossip | Lags. A client can burst Nx200 before gossip catches up. | Sub-millisecond | No coordination; nodes survive independently. | When latency budget is brutally tight and limits are soft (advisory, not security). |
-| Local-first with reconciliation | Approximate. Drift bounded by reconcile interval. | Sub-millisecond on hot path; one Redis hop per N requests in background. | Survives short Redis outages. Drift grows linearly with outage length. | When you want both low latency and central state and can tolerate ~10% drift. |
+<details markdown="1">
+<summary><b>Show: compare and pick</b></summary>
 
-**My recommendation: central Redis with Lua scripts, plus per-node LRU to suppress hot-key check traffic.**
+| Approach | Accuracy | Latency | If Redis dies | Use when |
+|----------|----------|---------|----------------|----------|
+| **Central Redis** (atomic Lua) | Exact | 1 to 2ms per check | Limiter is down. Pick fail-open or fail-closed. | Default. The right answer at this scale. |
+| **Gossip** | Lags. Burst of Nx200 before gossip catches up. | Sub-millisecond | Each node keeps going | Latency is brutally tight and limits are soft |
+| **Local-first** | Approximate. Drift bounded by interval. | Sub-ms on hot path | Survives short outages. Drift grows with outage length. | Low latency *and* central state needed, ~10% drift is okay |
+
+**My pick: central Redis with Lua scripts, plus a per-node LRU cache to skip Redis for known-hot keys.**
 
 Per-request flow:
 
-1. Compute the key, e.g. `rl:{api_key}:{route}:{minute_window}`.
-2. Check local LRU. If the cached count is already over the limit, reject immediately. **No Redis call.**
-3. Otherwise execute the Lua script on Redis. Script does: `INCR key; if new value > limit, return rejected; else EXPIRE key window_seconds; return allowed + remaining`. Atomic.
-4. Update local LRU with the new count. Used for fast-path rejection next time.
+1. Compute the key. Example: `rl:apikey:sk_live_xyz:search:1716381660`.
+2. Check the local LRU. If the cached count is already over the limit, **reject right away. No Redis call.**
+3. Otherwise, run the Lua script on Redis. It does: read current, read previous, check estimate, increment if okay. All atomic.
+4. Update the LRU with the new count.
 
-The local LRU is the trick. For a client hammering at 100x their limit, only the first few requests per window hit Redis; everything else fast-fails locally. Cuts Redis QPS by 90%+ for abusive clients, which is exactly when you need the savings.
+> Why the LRU is the trick: for a client hammering at 100x their limit, only the first few requests per window hit Redis. Everything else fast-fails on the local cache. Redis traffic drops by 90% or more *exactly when you need the savings most*.
 
-Accuracy: requests within the same millisecond can race past the LRU before its update lands. A client might briefly exceed their limit by ~1-2 requests per node before being throttled. With 200 nodes and a 100/min limit, the theoretical overshoot is 400 requests in a window. In practice, well under 10. We accept this; the user-visible difference is invisible.
-
-When Redis fails: see Step 5.5.
+**The small race we accept.** Two requests on different nodes within 1ms can both pass the LRU before its update lands. With 200 nodes and a 100/min limit, the theoretical overshoot is ~400 requests in a window. In practice it is under 10. Invisible to users.
 
 </details>
 
-## Step 5.5: what happens when Redis dies
+---
 
-This is the question that separates senior from mid-level. Walk through three scenarios:
+## Step 7: What happens when Redis dies?
 
-1. One Redis primary shard goes down. Its replica takes over.
-2. The whole Redis cluster is unreachable from a specific gateway node (network partition).
-3. The whole Redis cluster is unreachable from every gateway node.
+This is the question that separates senior from mid-level. Most candidates have not thought it through.
 
-<details>
-<summary><b>Reveal: failure handling</b></summary>
+Three failure modes to walk through:
 
-**Scenario 1: single shard failover.** Replica promoted. ~5 to 30 second window where some keys may be served stale. Acceptable. Use Redis Sentinel or Cluster's automatic failover; the gateway library retries on connection errors.
+1. **One Redis primary shard fails.** Its replica takes over.
+2. **One gateway node loses its Redis connection.** Others still have it.
+3. **The whole Redis cluster is down.** Nothing works.
 
-**Scenario 2: one node loses Redis connectivity, others have it.** That node alone has no shared state. Its limiter falls back to per-node counters. Other nodes are unaffected. The broken node now under-counts (it doesn't see traffic from the other 199 nodes), so a client routed there can get Nx(some multiplier) requests through. The node's limiter sets a stricter local ceiling (e.g. burst x 1.5) to bound the damage. The load balancer marks the node unhealthy if it loses Redis, traffic shifts elsewhere.
+<details markdown="1">
+<summary><b>Show: how to handle each</b></summary>
 
-**Scenario 3: Redis cluster fully down.** Disaster. Two choices:
+**1. Single shard failover.**
+The replica gets promoted. There is a 5 to 30 second window where some keys might serve stale data. Acceptable. Redis Sentinel or Redis Cluster do this automatically. The gateway retries on errors.
 
-- **Fail-open.** Every gateway uses its local LRU as the source of truth. Limits become per-node, not global. A user might get 200x their stated limit. The API stays up. **Right default for public read APIs.**
-- **Fail-closed.** Every check returns rejected. The API stops serving. **Right default for write-heavy payment-grade APIs** where the limits protect against abuse that costs real money.
+**2. One node loses Redis.**
+That node falls back to in-process counters. It now under-counts (it cannot see traffic on the other 199 nodes), so a client routed there can get extra requests. We bound the damage two ways:
+- Set a stricter local ceiling (for example, burst x 1.5).
+- The load balancer marks the node unhealthy. Traffic shifts to other nodes.
 
-Choice should be configurable per route. `/api/search` fails open; `/api/transfer-money` fails closed.
+**3. The whole Redis cluster is down.** This is a disaster. You have two choices.
 
-Whichever you pick, the failure must be loud:
+| Choice | What it does | Right for |
+|--------|--------------|-----------|
+| **Fail-open** | Every gateway uses its local LRU only. Limits become per-node, not global. A client might get 200x their limit. The API keeps serving. | Public read APIs (`/api/search`, `/api/list`). Uptime matters more than perfect enforcement. |
+| **Fail-closed** | Every check returns rejected. The API stops serving. | Payment, login, money transfer. Abuse risk is bigger than downtime risk. |
 
-- Page on Redis cluster availability.
-- Emit a `limiter.degraded_mode` metric per gateway. Spikes mean you know.
-- A separate canary client tests that the limiter actually rejects when over limit; alerts if the limiter is silently broken.
+Make the choice **per route**, not globally. `/api/search` fails open. `/api/transfer-money` fails closed.
 
-The bad answer: "we just use Redis." Can't answer "what happens when Redis goes down" and the interview is over.
+Whatever you pick, make the failure **loud**:
+- Page on Redis cluster down.
+- Emit a `limiter.degraded_mode` metric per gateway.
+- Run a canary that tests the limiter rejects when over limit, so a silently broken limiter is caught.
+
+> The bad answer is "we just use Redis." If you cannot answer "what when Redis dies?", the interview is over.
 
 </details>
 
-## Step 6: response and headers
+---
 
-The limiter has decided to reject. What do you return? What do well-behaved clients need from you so they can back off correctly?
+## Step 8: What you return on a reject
 
-<details>
-<summary><b>Reveal: response format</b></summary>
+The limiter has rejected the request. What do you send back? What do good clients need so they can back off correctly?
 
-HTTP status:
+<details markdown="1">
+<summary><b>Show: the response format</b></summary>
 
-- `429 Too Many Requests`. The standard. Don't use 503; that signals server overload, which is different.
+**HTTP status: 429 Too Many Requests.** Not 503. 503 means "the server is overloaded, try anywhere." 429 means "you specifically are over your limit, others are fine."
 
-Headers (required):
+**Headers (required):**
 
 ```
 HTTP/1.1 429 Too Many Requests
-Retry-After: 28                          # seconds until they can retry
-X-RateLimit-Limit: 100                   # the limit for this key+route
-X-RateLimit-Remaining: 0                 # always 0 on a 429
-X-RateLimit-Reset: 1716381660            # unix ts when the window resets
+Retry-After: 28
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1716381660
 Content-Type: application/json
 ```
 
-Body:
+**Body:**
 
 ```json
 {
@@ -302,39 +364,91 @@ Body:
 }
 ```
 
-Headers on allowed requests too:
+**Send headers on allowed requests too.**
+`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` on every response, not just 429s. Good clients use them to self-throttle before they ever get rejected. The cost is about 30 bytes per response. Nothing.
 
-Send `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` on every response, not just 429s. Good clients use these to self-throttle before they ever get rejected. The cost is ~30 extra bytes per response. Nothing.
+**`Retry-After` is computed, not guessed.**
+- For sliding window: time until enough of the current window has rolled off.
+- For token bucket: time until the next token refills.
+- Don't make the client guess.
 
-`Retry-After` semantics:
-
-- For a sliding window: time until enough of the current window has rolled off that the next request would succeed. Not the time until the entire window resets.
-- For a token bucket: time until the next token refills.
-- Compute it server-side. Don't make the client guess.
-
-Doc URL:
-
-Always include a link to the rate-limit docs. Single most effective thing you can do to reduce support tickets. When developers see the URL in the error, half of them go read the docs instead of opening a ticket.
+**Doc URL.**
+Always include a link to the rate-limit docs. The single most effective thing you can do to cut support tickets. Half the developers who see it go read the docs instead of opening a ticket.
 
 </details>
 
+---
+
+## Step 9: A request, drawn end to end
+
+Here is the full life of one request through the system.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant LB as Load Balancer
+    participant GW as Gateway (with limiter)
+    participant LRU as Local LRU
+    participant R as Redis (Lua script)
+    participant API as API Service
+
+    C->>LB: HTTPS request
+    LB->>GW: Forward
+    GW->>GW: Extract api_key, route
+    GW->>LRU: Check cached count
+    alt LRU says over limit
+        LRU-->>GW: Over limit
+        GW-->>C: 429 Too Many Requests
+    else LRU clean
+        GW->>R: EVALSHA(script, keys, args)
+        R->>R: Read current + previous
+        R->>R: Compute estimate
+        alt Over limit
+            R-->>GW: rejected, retry_after_ms
+            GW-->>C: 429 + headers
+        else Allowed
+            R->>R: INCRBY current, EXPIRE
+            R-->>GW: allowed, remaining
+            GW->>LRU: Update cache
+            GW->>API: Forward request
+            API-->>GW: Response
+            GW-->>C: 200 + X-RateLimit-* headers
+        end
+    end
+```
+
+That whole flow is under 2ms at P99 for the happy path.
+
+---
+
 ## Follow-up questions
 
-Try answering each in 3 to 4 sentences before reading the solution.
+Try to answer each one in 3 or 4 sentences before peeking at the solution.
 
-1. **Multiple keys per request.** A request has an IP, an API key, and a user_id. Check all three rate limits in parallel or in sequence? What if the API key limit allows it but the IP limit doesn't?
-2. **Limits per route.** `/api/search` is expensive; `/api/health` is cheap. Same client. How do you express this in your data model and check logic?
-3. **Cost-based limits.** Instead of "100 requests per minute," the limit is "100 units per minute," and a search query costs 5 units while a lookup costs 1. How does the limiter change?
-4. **Burst allowance.** A client should be able to send a burst of 200 in the first 10 seconds of a minute but still total 1000 in that minute. Which algorithm supports this and how do you configure it?
-5. **IP rotation.** An abuser is rotating through 10,000 residential IPs (botnet). Per-IP limits are useless. What do you do? Hint: layered keys, behavioral signals.
-6. **Customer override.** Enterprise customer X negotiated a 100x limit. Where is that override stored? How fresh must it be? What if the override service is down?
-7. **Distributed accuracy.** Two requests from the same client land on two gateway nodes within 1ms. Both check Redis, both get count=99 (under 100 limit), both INCR. Now count=101 and both were allowed. What is your defense?
-8. **Pre-warming a known burst.** A customer says they'll run a batch job at 2:00 AM that needs 10,000 requests in 60 seconds, way over their normal limit. How do you accommodate it without raising their permanent limit?
-9. **"User spam" vs "user got popular".** A blog post hits HN and suddenly receives 10x traffic to a user's API endpoint. The limiter blocks them. Is that correct? How would you build a smarter signal?
-10. **Limiter is the bottleneck.** Observability shows the limiter middleware itself is adding 8ms to P99 latency. Where do you look first?
+1. **Multiple keys per request.** A request has an IP, an API key, and a user_id. Do you check all three rate limits in parallel or one after the other? What if the API key limit allows it but the IP limit does not?
+
+2. **Limits per route.** `/api/search` is expensive. `/api/health` is cheap. Same client, same tier. How do you express this in your data model?
+
+3. **Cost-based limits.** Instead of "100 requests per minute," the limit is "100 units per minute." A search costs 5 units. A lookup costs 1. What changes in the limiter?
+
+4. **Burst allowance.** A client should be able to send 200 in the first 10 seconds of a minute but still total 1000 in that minute. Which algorithm? How do you configure it?
+
+5. **IP rotation (botnet).** An attacker rotates through 10,000 home IPs. Per-IP limits are useless. What do you do?
+
+6. **Customer override.** Enterprise customer X negotiated a 100x limit. Where do you store the override? How fresh must it be? What if the override service is down?
+
+7. **Distributed accuracy.** Two requests from the same client land on two gateway nodes within 1ms. Both check Redis. Both see count = 99 (under 100 limit). Both INCR. Now count = 101 and both were allowed. What stops this?
+
+8. **Pre-warming a known burst.** A customer says they will run a batch job at 2 AM that needs 10,000 requests in 60 seconds, way over their normal limit. How do you let them through without raising their permanent limit?
+
+9. **"User spam" vs "user got popular".** A blog post hits Hacker News. A user's API endpoint sees 10x traffic. The limiter blocks them. Is that correct? How would you build a smarter signal?
+
+10. **The limiter is the bottleneck.** Your dashboard shows the limiter middleware is adding 8ms to P99 latency. Where do you look first?
+
+---
 
 ## Related problems
 
-- **[URL Shortener (001)](../001-url-shortener/question.md)**. The `POST /links` endpoint sits behind exactly this kind of rate limiter; the design integrates directly with that system.
-- **[Distributed Cache (009)](../009-distributed-cache/question.md)**. The Redis cluster backing the limiter is itself a distributed cache; the eviction, sharding, and replication choices there determine the limiter's failure modes.
-- **[News Feed (002)](../002-news-feed/question.md)**. The `POST /posts` endpoint and the timeline read path both benefit from rate limiting; the cost-based limit pattern in follow-up 3 is what feeds use to throttle expensive ranking queries.
+- **[URL Shortener (001)](../001-url-shortener/question.md).** The `POST /links` endpoint sits behind exactly this kind of limiter. The design plugs in directly.
+- **[Distributed Cache (009)](../009-distributed-cache/question.md).** The Redis cluster backing the limiter *is* a distributed cache. The eviction, sharding, and replication choices there set the limiter's failure modes.
+- **[News Feed (002)](../002-news-feed/question.md).** Both the `POST /posts` endpoint and the timeline read path need rate limiting. The cost-based pattern in follow-up 3 is exactly how feeds throttle expensive ranking queries.

@@ -7,328 +7,505 @@ difficulty: Hard
 solution: solution.md
 ---
 
-## Scene
+## The scene
 
-Second slot of the loop. The interviewer worked on Google's indexing pipeline a long time ago and wants a war-game. They pull up a whiteboard tab and write one line:
+You sit down. The interviewer pulls up a blank whiteboard tab. They type one line.
 
-> *Design a web crawler at Google's scale. Walk me through it.*
+> *"Design a web crawler. Something like Googlebot. Walk me through it."*
 
-Then they wait. Most candidates start by drawing a queue and a worker pool. At this scale that gets you the wrong answer, because the system breaks for reasons that have nothing to do with the queue. Slow down. Figure out what kind of crawler this is before you commit to a shape.
+Then they wait.
 
-## Step 1: clarify before you design
+Most people start by drawing a queue and a pool of workers. That gets you the wrong answer. The hard parts of a web crawler are not the queue. They are:
 
-Take 5 minutes. The shape of the system changes a lot depending on what is being crawled and why. Write down at least seven questions before you peek.
+- Being polite to websites so they do not block you.
+- Not crawling the same page twice when you have billions of pages.
+- Splitting work across hundreds of machines without them stepping on each other.
 
-<details>
-<summary><b>Reveal: questions a strong candidate asks</b></summary>
+We will walk this step by step. At each step we will name what breaks first, then add the smallest fix that solves it.
 
-1. Scope. "HTML only, or also images, video, PDFs, JavaScript-rendered pages?" The default Googlebot answer is HTML first, a separate render path for JS-heavy pages, and a separate pipeline for media. Assume "everything in one pass" and you will design a much larger and slower system than the interviewer wanted.
-2. Seed set. "What are we starting from? A seed list, sitemaps, or the existing web graph?" Cold-starting a crawler is a different problem from running an established one. Real crawlers always have an existing frontier; they never start from zero in production.
-3. Freshness target. "How fresh must the index be? Hourly for news, daily for the rest, monthly for dormant pages?" This drives the recrawl scheduler, which is often a bigger system than the discovery crawler.
-4. Politeness rules. "Do we respect robots.txt strictly? What is the default per-host rate? What is the SLA back to webmasters?" One stranger's site should never be melted by your crawler. Non-negotiable.
-5. Output shape. "What does the crawler produce? Raw HTML to a blob store, parsed text to an indexer, structured records?" Most candidates skip this and end up with no plan for what happens after the fetch.
-6. Scale and budget. "Pages per day? Hosts? Bandwidth budget? Storage budget?" 5 billion fetches per day at 100KB per page is 500TB per day. If the interviewer says 1 billion pages per day, the storage problem is a tenth the size.
-7. JavaScript rendering. "Do we render with a headless browser, or only static HTML?" Rendering is 10x to 100x more expensive than a plain fetch. Treat it as a separate, smaller pipeline.
-8. Trust and abuse. "How do we deal with crawler traps, infinite calendar URLs, spam farms, soft 404s?" The interviewer wants to see whether you understand the adversarial parts of the open web.
+A few words you will see a lot:
 
-If you only asked "how many pages per day", you skipped politeness, scope, and freshness, which together account for most of the design's complexity. Politeness in particular is a load-bearing constraint, not an afterthought.
+- **Crawler.** A program that visits web pages and saves them.
+- **Frontier.** The to-do list of URLs we still need to fetch. Think of it as a giant inbox.
+- **Fetcher.** A worker that does the actual HTTP GET to download a page.
+- **Politeness.** Rules that stop us from hammering one website too hard.
+- **robots.txt.** A small file at `https://site.com/robots.txt` where the site owner tells crawlers what they may and may not fetch.
+- **Bloom filter.** A tiny memory structure that quickly tells you if you have probably seen a URL before. Fast but allowed to be wrong sometimes (false positives).
+- **Canonicalize.** Clean up a URL so different forms of the same URL look identical.
+
+---
+
+## Step 1: Ask the right questions
+
+Before you draw anything, sit for five minutes. Write down questions you would ask the interviewer.
+
+A good answer here is not "20 questions." It is the handful of questions that change the design if answered differently.
+
+<details markdown="1">
+<summary><b>Show: 8 questions that matter</b></summary>
+
+1. **What are we crawling?** Just HTML pages? Also images, PDFs, videos? Also pages that need JavaScript to render? *(Each one is a different pipeline. If you assume "everything" you will design a system 10x bigger than what they wanted.)*
+
+2. **Where do we start?** From a seed list? From sitemaps? Are we adding to an existing crawl, or starting from zero? *(Real crawlers always have an existing list. Starting from scratch is a different problem.)*
+
+3. **How fresh must the index be?** Hourly for news? Daily for blogs? Monthly for dormant pages? *(The recrawl scheduler can be bigger than the main crawler.)*
+
+4. **How polite must we be?** What is the default per-site rate? *(One stranger's website should never go down because of us. This is the most load-bearing rule.)*
+
+5. **What does the crawler output?** Raw HTML to a blob store? Parsed text to an indexer? *(Most candidates skip this and have no plan for what happens after the fetch.)*
+
+6. **How big?** Pages per day? Hosts? Bandwidth? Storage budget? *(5 billion pages/day at 100KB each is 500TB/day. If the answer is 1 billion, the storage problem is 5x smaller.)*
+
+7. **JavaScript rendering?** Headless browser, or only static HTML? *(Rendering is 10x to 100x more expensive than a plain fetch. Treat it as a smaller, separate pipeline.)*
+
+8. **Spam and traps?** How do we deal with calendar widgets that link to the year 9999? Spam farms? Fake "page not found" pages? *(The web is adversarial. The interviewer wants to see if you know that.)*
+
+If you only ask "how many pages per day," you skipped politeness, scope, and freshness. Those three things together are most of the design's complexity.
 
 </details>
 
-## Step 2: capacity estimates
+---
 
-Suppose the interviewer hands you these numbers:
+## Step 2: How big is this thing?
 
-- Crawl target: 5 billion pages per day (the public web is roughly 50 to 100 billion useful pages; we recrawl the most useful subset frequently and the long tail rarely)
-- Average HTML page size: 100KB compressed, ~500KB uncompressed
+Suppose the interviewer gives you these numbers.
+
+- Crawl target: **5 billion pages per day**
+- Average HTML page size: 100KB compressed
 - Average outlinks per page: 20
-- Total URLs known to the system (frontier plus already-seen): 50 billion
-- Distinct hosts in the frontier: 500 million
-- Default politeness: 1 request per host per second
-- Time horizon for storage: 30 days hot, then archived
+- Total URLs the system knows about: 50 billion
+- Distinct hosts (websites): 500 million
+- Default politeness: **1 request per host per second**
+- Storage: 30 days hot, then archived
 
-Do the math yourself before revealing:
+Try to work out these numbers yourself before peeking.
 
-1. Fetches per second (sustained, peak)
-2. Bandwidth in and out at peak
-3. Storage per day for raw HTML, and total for 30 days
-4. Storage for the URL frontier and the seen-URL dedup index
-5. Concurrent host slots needed, given the per-host rate limit and the daily target
-6. Fetcher node count, given one fetcher sustains around 500 simultaneous TCP connections
+1. Fetches per second (steady, and peak)
+2. Bandwidth at peak
+3. Storage per day, and for 30 days
+4. Memory for the "seen URLs" check
+5. How many fetcher machines do we need?
 
-<details>
-<summary><b>Reveal: the math</b></summary>
+<details markdown="1">
+<summary><b>Show: the math</b></summary>
 
-Fetches per second. 5B / 86400 = ~58K fetches/sec sustained. Peak 2x to 3x, call it 150K fetches/sec peak.
+**Fetches per second.**
 
-Bandwidth. At 100KB per page compressed, ingress = 58K × 100KB = 5.8 GB/sec sustained, ~17 GB/sec peak. Roughly 50 to 150 Gbps of inbound bandwidth across the fleet. Real Googlebot pulls more than this; we are sizing one well-fed crawler.
+```
+5,000,000,000 fetches / 86,400 seconds = 58,000 fetches/sec sustained
+Peak is 2-3x that = ~150,000 fetches/sec peak
+```
 
-Storage for raw HTML. 58K/sec × 86400 = 5B pages/day × 100KB = 500TB/day of compressed HTML. 30 days hot = 15PB. After dedup by content hash, expect 20% to 40% savings because near-identical templates show up everywhere. Round to ~10PB hot.
+**Bandwidth.**
 
-URL frontier storage. 50 billion URLs. A canonicalized URL averages ~80 bytes. Add metadata (host_id 4 bytes, priority float 4 bytes, scheduled_at 8 bytes, attempt_count 1 byte, parent ref 8 bytes) and you get ~110 bytes per row. 50B × 110 = ~5.5TB of frontier metadata. Sharded, fits comfortably.
+```
+58,000 fetches/sec * 100KB = 5.8 GB/sec sustained
+Peak: ~17 GB/sec
+That is roughly 50-150 Gbps of inbound bandwidth across the fleet.
+```
 
-Seen-URL dedup index. 50B URLs, each a 128-bit hash in a Bloom filter. A Bloom filter with 50B elements at 1% false positive rate needs ~10 bits per element = 500 Gbit = ~60GB total. Tiny. The whole filter sits in memory across a small cluster.
+**Storage for raw HTML.**
 
-Concurrent host slots. Per-host rate limit = 1 req/sec, so one host delivers 1 page/sec. We need 58K pages/sec, so at least 58K hosts being crawled in parallel at any moment. With 500M hosts in the frontier, hosts are not scarce. The constraint is: do not stack two simultaneous fetches against the same host.
+```
+58,000/sec * 86,400 sec = 5B pages/day
+5B * 100KB = 500 TB/day of compressed HTML
+30 days = 15 PB
+After we dedupe identical pages, save ~30%, so ~10 PB hot.
+```
 
-Fetcher node count. One fetcher node sustains 500 concurrent connections, each connection averages a 1 second fetch (DNS + TCP + TLS + GET + body), so one node = 500 fetches/sec. 150K/sec peak means ~300 fetcher nodes. Add 50% headroom: ~450 nodes.
+**Frontier (the to-do list).**
 
-The point the math leaves you with: storage is large but tractable, bandwidth is large but linear. The real complexity is coordination between 450 nodes that must collectively respect 1 req/sec per host across 500M hosts, with dedup across 50 billion URLs.
+```
+50 billion URLs * ~110 bytes each (URL + small metadata) = ~5.5 TB
+Split across, say, 64 shards = ~85 GB per shard. Fits easily.
+```
+
+**Seen-URL Bloom filter.**
+
+```
+50 billion URLs * 10 bits each (for ~1% false positive rate)
+= 500 Gbit = ~60 GB
+Sits in memory across a small cluster of nodes.
+```
+
+**Fetcher machines.**
+
+```
+One fetcher node handles ~500 fetches/sec (500 open connections,
+each takes ~1 second for DNS + TLS + GET + body).
+
+Peak 150,000/sec / 500 per node = 300 nodes
+Add 50% headroom: ~450 nodes.
+```
+
+**What the math is telling you.**
+
+Storage is large but manageable. Bandwidth is large but linear. The hard part is **coordination**: 450 machines must crawl 5 billion pages per day while collectively respecting "1 request per second" for each of 500 million different websites. That is the real puzzle.
+
+Also: the Bloom filter for 50 billion URLs only takes 60 GB. Tiny. Bloom filters are magic for this kind of problem.
 
 </details>
 
-## Step 3: BFS-like exploration
+---
 
-A crawler is a graph traversal of the web. URLs lead to other URLs through outlinks. Classical BFS visits one level at a time. In a real crawler you cannot do strict BFS because:
+## Step 3: The frontier is a priority list, not a FIFO
 
-- The graph is infinite (calendars, parameter combinations, search result pages).
-- Most pages are not equally important; you want to spend disk on the useful ones.
-- Politeness forces you to interleave hosts, not chase a single host depth-first.
+A crawler walks the web by following links. Page A links to page B, B links to C, and so on. It is a giant graph.
 
-Before reading on, decide: what governs the order of URL visits in your crawler? What data structure holds pending URLs? How do you ensure you do not crawl the same URL twice?
+If you do plain BFS (breadth-first search) you visit links in the order you found them. That sounds fine. It is not. Three problems:
 
-<details>
-<summary><b>Reveal: priority frontier, not pure BFS</b></summary>
+1. **The web is infinite.** A calendar widget links to `?date=2026-05-25`, `?date=2026-05-26`, and so on forever. Plain BFS would happily follow all of them.
+2. **Not all pages are equal.** The CNN homepage matters more than `someguy.geocities.com/page9`. You want to spend disk on the useful ones.
+3. **Politeness forces you to interleave.** You cannot fetch 1000 URLs from one site in a row. You have to spread requests across many sites.
 
-The frontier is a priority queue, not a FIFO. Each URL gets a score based on:
+So what should the frontier actually look like?
 
-- Estimated importance (PageRank, inlink count, or a learned signal).
-- Freshness need (news every hour, static pages monthly).
-- Discovery freshness (newly found URLs go in with a default priority).
-- Penalties for traps (URLs from known-trap patterns get lowered or dropped).
+<details markdown="1">
+<summary><b>Show: the priority frontier and two-layer dedup</b></summary>
 
-URLs are popped in priority order, subject to politeness. The "BFS-like" description is loose: yes, we explore outlinks of fetched pages, but ordering is by priority, not by depth.
+**The frontier is a priority queue.** Each URL has a score made from:
 
-Dedup has two layers:
+- **Importance.** Pages with many incoming links score higher (PageRank-style).
+- **Freshness.** News pages get pulled up so they get recrawled soon.
+- **Penalties.** URLs that look like traps (calendars, session tokens) get pushed way down.
 
-1. URL dedup. Canonicalize the URL (lowercase host, sort query parameters alphabetically, strip session tokens like `?sid=`, drop `#frag`, normalize trailing slashes). Hash the canonical form. Check the Bloom filter; if probably-new, do a confirming lookup in a sharded KV store. If new, add to the frontier and mark seen.
-2. Content dedup. After fetching, hash the meaningful content (strip ads, headers, footers, then hash). If the content hash matches one already stored, we still record the URL but link it to the canonical content. This catches mirror sites and duplicate templates.
+URLs come out highest-priority-first, but only if politeness allows (more on that in Step 5).
 
-Depth vs breadth control. Each URL carries a depth-from-seed counter. Past depth ~20 you almost always stop, because past depth 20 you are inside a calendar widget or a session-token-paginated search result. We also rate-limit "how many URLs we accept from one host per day" so a single trap site cannot flood the frontier.
+**Dedup happens in two layers.**
+
+Layer 1: **URL dedup.** Before adding a URL to the frontier, ask "have we seen this URL before?"
+
+```
+URL arrives  ->  canonicalize (clean it up)
+            ->  hash the cleaned URL
+            ->  ask Bloom filter
+            ->  if Bloom says "probably seen", confirm in the KV store
+            ->  if truly new, add to frontier
+```
+
+Layer 2: **Content dedup.** After fetching, hash the actual page content. If two URLs return the same content (mirror sites, duplicate templates), point them at the same stored blob.
+
+**Depth limit.** Each URL carries a "how many hops from the seed" counter. Past depth 20, almost everything is junk (a calendar, a session-token mess). Stop there.
+
+**Why a Bloom filter at all?** Because checking "have we seen 50 billion URLs" against a real database for every new URL would be too slow and too expensive. The Bloom filter is small, in-memory, and very fast. It can be wrong sometimes (says "seen" when it has not), but then we just do one extra check in the KV store. False positive rate of 1% is fine.
 
 </details>
 
-## Step 4: sketch the high-level architecture
+Here is the dedup decision drawn as a flowchart.
 
-Fill in the five `[ ? ]` placeholders. Think about where the URLs to crawl live, what fetches them, what extracts links, where raw HTML is stored, and what prevents duplicates.
-
-```
-                      seed URLs                  outlinks from fetched pages
-                          │                                    │
-                          ▼                                    │
-                  ┌──────────────────┐                         │
-                  │   [ ? ]          │ ◄───────────────────────┘
-                  │ (holds URLs to   │
-                  │  crawl, ordered) │
-                  └────────┬─────────┘
-                           │ pop next batch (respecting politeness)
-                           ▼
-                  ┌──────────────────┐
-                  │   [ ? ]          │
-                  │ (talks HTTP to   │
-                  │  the open web)   │
-                  └────────┬─────────┘
-                           │ raw HTML
-                           │
-                ┌──────────┴──────────┐
-                ▼                     ▼
-        ┌──────────────┐       ┌──────────────┐
-        │   [ ? ]      │       │   [ ? ]      │
-        │ (durable     │       │ (parses HTML │
-        │  storage of  │       │  and emits   │
-        │  the page)   │       │  new links)  │
-        └──────────────┘       └──────┬───────┘
-                                      │
-                                      ▼
-                              ┌──────────────┐
-                              │   [ ? ]      │
-                              │ (was this    │
-                              │  URL seen?)  │
-                              └──────────────┘
+```mermaid
+flowchart TD
+    A[New URL arrives from link extractor] --> B[Canonicalize the URL]
+    B --> C[Hash the canonical URL]
+    C --> D{Bloom filter:<br/>seen before?}
+    D -->|No, definitely new| F[Add to frontier]
+    D -->|Maybe seen| E{Check KV store:<br/>really seen?}
+    E -->|Yes, already seen| G[Drop. Do nothing.]
+    E -->|No, Bloom was wrong| F
+    F --> H[Mark seen in Bloom + KV]
 ```
 
-<details>
-<summary><b>Reveal: complete architecture</b></summary>
+> Why two layers? Bloom alone is fast but says "maybe seen" for 1% of new URLs. We do not want to drop new URLs by mistake. So when Bloom says "maybe", we check the truth store. Most checks never reach the KV store, so the system stays fast.
+
+---
+
+## Step 4: Draw the system
+
+You know what data the frontier holds. Now draw the components that move URLs through it.
+
+Try to fill in the missing pieces below. Five boxes are missing. Think about: where the to-do URLs live, who downloads pages, where the raw HTML is stored, who finds new links in a page, and who checks if a URL is a duplicate.
 
 ```
-                      seed URLs                  outlinks from fetched pages
-                          │                                    │
-                          ▼                                    │
-                  ┌──────────────────┐                         │
-                  │   URL Frontier   │ ◄───────────────────────┘
-                  │  (priority queue │
-                  │   sharded by     │
-                  │   host hash)     │
-                  └────────┬─────────┘
-                           │ pop next batch (per-host token bucket gates release)
-                           ▼
-                  ┌──────────────────┐
-                  │  Fetcher Pool    │   ~450 nodes.
-                  │  (HTTP/HTTPS,    │   Each node owns a slice of hosts.
-                  │   DNS cache,     │   500 concurrent fetches per node.
-                  │   robots.txt)    │   Honors crawl-delay header.
-                  └────────┬─────────┘
-                           │ raw HTML + headers + status
-                           │
-                ┌──────────┴──────────┐
-                ▼                     ▼
-        ┌──────────────┐       ┌──────────────┐
-        │ Content      │       │ Link         │
-        │ Store        │       │ Extractor    │
-        │ (S3/GCS by   │       │ (parse HTML, │
-        │  content     │       │  canonicalize│
-        │  hash; meta  │       │  outlinks,   │
-        │  in KV)      │       │  filter)     │
-        └──────────────┘       └──────┬───────┘
-                                      │ candidate new URLs
-                                      ▼
-                              ┌──────────────┐
-                              │ Dedup Index  │   Bloom filter + sharded KV.
-                              │ (seen URLs   │   "Probably new?" then confirm
-                              │  hash set)   │   "definitely new" then frontier.
-                              └──────────────┘
-
-  Side flows (not shown in detail):
-    - robots.txt cache, per-host, refreshed every 24h.
-    - DNS cache, per-host, refreshed on TTL.
-    - Recrawl scheduler: a separate job that re-injects already-seen URLs
-      back into the frontier on their refresh cadence.
-    - Trap detector: scans patterns in the frontier; downgrades or drops
-      suspicious branches.
+                seed URLs              outlinks from fetched pages
+                    |                              |
+                    v                              |
+            +------------------+                   |
+            |   [ ? ]          | <-----------------+
+            |  (the to-do list |
+            |   of URLs)       |
+            +--------+---------+
+                     | pop next batch (only URLs we are allowed to fetch now)
+                     v
+            +------------------+
+            |   [ ? ]          |
+            |  (downloads      |
+            |   pages over     |
+            |   HTTP)          |
+            +--------+---------+
+                     | raw HTML
+                     |
+          +----------+----------+
+          v                     v
+   +-------------+        +-------------+
+   |   [ ? ]     |        |   [ ? ]     |
+   | (saves the  |        | (reads the  |
+   |  raw page)  |        |  HTML, pulls|
+   |             |        |  out links) |
+   +-------------+        +------+------+
+                                 |
+                                 v
+                          +-------------+
+                          |   [ ? ]     |
+                          | (have we    |
+                          |  seen this  |
+                          |  URL?)      |
+                          +-------------+
 ```
 
-Component responsibilities:
+<details markdown="1">
+<summary><b>Show: the full architecture</b></summary>
 
-- URL Frontier. The brain. Priority queue per host. Sharded so all URLs for a given host land on the same shard, which makes politeness a single-node decision.
-- Fetcher Pool. The dumb hands. Stateless workers that take a batch of URLs from the frontier, fetch them with appropriate headers, and emit results. DNS cache and robots.txt cache live near the fetcher to avoid hammering DNS and webmasters.
-- Content Store. Raw HTML in object storage, addressed by content hash. Metadata (URL, fetched_at, status code, content hash, parent URL) in a sharded KV store keyed by URL hash.
-- Link Extractor. Parses HTML, finds `<a href>` and equivalent link sources (sitemap-driven, canonical link rel), canonicalizes each URL, filters obvious junk (mailto:, javascript:, fragment-only), and emits candidate URLs to the dedup index.
-- Dedup Index. Bloom filter first ("probably seen"), then a sharded KV confirms. Only confirmed-new URLs go back to the frontier.
+```
+                seed URLs              outlinks from fetched pages
+                    |                              |
+                    v                              |
+            +------------------+                   |
+            |   URL Frontier   | <-----------------+
+            |  priority queue  |
+            |  sharded by host |
+            +--------+---------+
+                     | lease batch of URLs (politeness gate)
+                     v
+            +------------------+
+            |  Fetcher Pool    |  ~450 stateless nodes
+            |  HTTP/HTTPS      |  DNS cache, robots.txt cache,
+            |  500 connections |  honors crawl-delay
+            |  per node        |
+            +--------+---------+
+                     | raw HTML + status
+                     |
+          +----------+----------+
+          v                     v
+   +-------------+        +-------------+
+   | Content     |        | Link        |
+   | Store       |        | Extractor   |
+   | (S3/GCS,    |        | (parse HTML,|
+   |  keyed by   |        |  find links,|
+   |  content    |        |  clean them |
+   |  hash)      |        |  up)        |
+   +-------------+        +------+------+
+                                 | candidate URLs
+                                 v
+                          +-------------+
+                          | Dedup Index |  Bloom filter first,
+                          | (seen URLs) |  then sharded KV store
+                          +------+------+
+                                 | truly new URLs
+                                 v
+                         (back to URL Frontier)
+
+  Side flows:
+    - robots.txt cache: refreshed every 24 hours per host.
+    - DNS cache: refreshed on TTL.
+    - Recrawl scheduler: re-injects URLs that are due for a refresh.
+    - Trap detector: scans for suspicious patterns, downgrades them.
+```
+
+What each piece does, in one line:
+
+- **URL Frontier.** The brain. Priority queue of URLs, split across many shards so politeness for each host is a single-shard decision.
+- **Fetcher Pool.** The dumb hands. Stateless workers that download pages. DNS and robots.txt are cached locally on each fetcher.
+- **Content Store.** Where raw HTML lives. Object storage (S3, GCS) keyed by the hash of the page content. Two URLs serving the same page share one blob.
+- **Link Extractor.** Reads the HTML, finds `<a href>` links, cleans them up, sends candidates to dedup.
+- **Dedup Index.** Bloom filter says "probably new" or "probably seen". KV store confirms.
+
+> Why is Link Extractor separate from Fetcher? Two reasons. First, fetching is mostly waiting on network (IO-bound), parsing is CPU-heavy work. Mixing them wastes both kinds of capacity. Second, if the parser dies, we still have the raw HTML safely saved. We can reparse later.
 
 </details>
 
-## Step 5: politeness
+---
 
-The single feature most candidates skip and most interviewers grade on. The open web is run by people you have never met. If your crawler hammers their site, three things happen: their site goes down, your IP gets blocked, and they file a complaint with your abuse desk. Politeness is non-negotiable, and it is the constraint that shapes coordination.
+## Step 5: Politeness (the rule most candidates skip)
 
-Before reading: what are the politeness rules and where in the architecture do they live?
+If your crawler hits cnn.com with 1000 requests per second, three things happen:
 
-<details>
-<summary><b>Reveal: politeness mechanisms</b></summary>
+1. CNN's site slows down or crashes.
+2. CNN's ops team blocks your IPs.
+3. CNN files a complaint with your abuse desk.
 
-robots.txt.
+Politeness is not a nice-to-have. It is the single biggest constraint that shapes the whole design.
 
-- Before fetching any URL on a host, GET `https://host/robots.txt`. Cache the result for 24 hours per host.
-- Parse the directives: `User-agent`, `Disallow`, `Allow`, `Crawl-delay`, `Sitemap`. Match against your crawler's user agent string.
-- If robots.txt cannot be fetched (5xx, timeout) treat the host as "crawl with caution". Some crawlers default to allowed, some default to disallowed. The safe default is to skip until robots.txt is readable, which is what major crawlers do.
-- A 404 on robots.txt means "no rules, fetch freely" by RFC 9309.
-- The robots.txt cache lives next to the fetcher, not in the frontier. The frontier knows nothing about robots.txt; the fetcher refuses to fetch URLs that violate it and feeds back a "skipped: disallowed" event.
+Try to guess the rules before peeking. What should the crawler do before fetching a page? How does it stay under the per-site rate limit?
 
-Per-host rate limit.
+<details markdown="1">
+<summary><b>Show: the politeness rules</b></summary>
 
-- Default: 1 request per second per host. Honor `Crawl-delay` if specified.
-- Implemented with a token bucket per host. The bucket holds N tokens with refill rate R. To fetch a URL on host H, the fetcher consumes a token from H's bucket. If empty, the URL is requeued with a delay.
-- Aggressive hosts (large news sites with explicit agreements) may be opted into higher rates. Configurable per host.
-- The bucket lives on the frontier shard that owns the host, not on every fetcher. That is why we shard the frontier by host hash: it makes the bucket a single-node decision.
+**robots.txt.**
 
-HTTP status backoff.
+Before fetching any URL on a site, GET `https://site.com/robots.txt`. Cache the result for 24 hours per host.
 
-- `200`, `301`, `302`: success, follow normally.
-- `404`: record, do not retry.
-- `403`: record as disallowed, do not retry for 7 days.
-- `429 Too Many Requests`: honor `Retry-After`, double the per-host crawl-delay, exponential backoff on repeat.
-- `503 Service Unavailable`: same as 429.
-- `5xx` repeated: exponential backoff with jitter; after N failures (say 5 over 24h) treat the host as down and recrawl much less frequently.
-- Connection timeouts: penalize the host's "health score". If health drops below threshold, the host is parked in a slow-lane queue.
+```
+User-agent: MyCrawler
+Disallow: /private/
+Crawl-delay: 2
+Sitemap: https://site.com/sitemap.xml
+```
 
-User agent.
+- `Disallow` means do not fetch this path.
+- `Crawl-delay: 2` means wait 2 seconds between requests to this site.
+- If robots.txt returns 404, RFC 9309 says "no rules, fetch freely."
+- If robots.txt times out or returns 5xx, skip the site until it is readable again. Safe default.
 
-- Identify yourself: `Mozilla/5.0 (compatible; MyCrawler/2.0; +https://example.com/crawler-info)`.
-- The URL in the user agent leads to a page explaining your crawler and how to block it. This is a baseline expectation by webmasters; missing it is rude.
+**Per-host rate limit.**
 
-Bandwidth caps.
+Default: 1 request per second per host. If the site's robots.txt sets `Crawl-delay`, honor that instead.
 
-- Per-host: do not pull more than X MB per day from one host without explicit allowance. Stops you from accidentally pulling a multi-GB site mirror.
-- Per-network: respect bandwidth limits across your own datacenter egress.
+Implemented as a **token bucket** per host:
 
-Why this matters for design. Politeness, taken seriously, means each host has state (rate-limit tokens, last-fetched timestamp, health score, robots.txt cache, crawl-delay). That state must be consistent across the crawler. If two fetchers think they can each fetch from `example.com` at the same instant, you have failed politeness. This is why the frontier shards by host: all decisions about a host happen on one node.
+- The bucket holds 1 token.
+- The bucket refills at the configured rate (e.g. 1 token/sec).
+- To fetch a URL on host H, the fetcher consumes a token from H's bucket. If empty, the URL waits.
+
+> Why one fetcher per host? Because if you hit cnn.com with 1000 requests/sec from 100 different fetchers, CNN will block you. Politeness means staying under the per-site rate limit. The simplest way to enforce that is: all decisions about CNN live on one machine. We achieve this by sharding the frontier by hostname (Step 6).
+
+**HTTP status backoff.**
+
+| Status | What to do |
+|--------|------------|
+| 200, 301, 302 | Success. Follow normally. |
+| 404 | Record. Do not retry. |
+| 403 | Disallowed. Do not retry for 7 days. |
+| 429 (Too Many Requests) | Honor `Retry-After`. Double the per-host delay. |
+| 503 (Service Unavailable) | Same as 429. |
+| Repeated 5xx | Exponential backoff. After 5 failures in 24h, treat the host as down. |
+| Connection timeout | Lower the host's "health score". If it drops too low, slow down further. |
+
+**User agent.**
+
+Identify yourself:
+
+```
+Mozilla/5.0 (compatible; MyCrawler/2.0; +https://example.com/crawler-info)
+```
+
+The URL leads to a page explaining what your crawler does and how to block it. Webmasters expect this. Missing it is rude and gets you blocked.
+
+**Bandwidth caps.**
+
+Per-host: do not pull more than X MB per day from one host without permission. Stops you from accidentally mirroring someone's entire site.
 
 </details>
 
-## Step 6: distributed coordination
+---
 
-You have ~450 fetcher nodes. They share a 50-billion-URL frontier. They must collectively crawl 5B pages/day without duplicating work and without violating per-host rates. How is the work divided?
+## Step 6: How do 450 machines share the work?
 
-Three serious options. For each, ask: what happens when a node dies? What happens when a host has an outsized fraction of URLs? How is per-host politeness enforced?
+You have 450 fetcher nodes. They share a 50-billion-URL frontier. They must collectively crawl 5 billion pages per day **without duplicating work** and **without violating per-host rate limits**.
 
-<details>
-<summary><b>Reveal: hash-partition by host</b></summary>
+How is the work divided? Three options. For each, ask: what happens if a node dies? What if one host has 50M URLs in the frontier? How is per-host politeness enforced?
 
-Option A: every fetcher pulls from a single shared queue.
+<details markdown="1">
+<summary><b>Show: why hash-by-host wins</b></summary>
 
-Pros: simple. Cons: every fetcher coordinates with every other fetcher about politeness ("are you about to fetch from example.com? then I won't"). At 450 nodes, this is N² gossip and it does not scale.
+**Option A: one shared queue, all 450 fetchers pull from it.**
 
-Option B: hash by URL.
+Pros: simple. Cons: politeness is broken. Two fetchers can grab two URLs from cnn.com at the same instant. You would need every fetcher to coordinate with every other fetcher ("are you about to fetch CNN? then I won't"). 450 nodes * 449 others = thousands of conversations. Does not scale.
 
-Pros: even load. Cons: URLs from the same host land on different shards. Politeness now requires cross-shard coordination on every fetch. Same N² problem.
+**Option B: hash by URL.**
 
-Option C: hash by host.
+Each URL goes to a shard based on `hash(url) mod num_shards`. Pros: even spread. Cons: URLs from cnn.com land on different shards. Same problem as A. The politeness state for cnn.com is split across many shards. Coordination nightmare.
+
+**Option C: hash by host. This is the answer.**
 
 ```
-shard_id = hash(host) mod num_shards
+shard_id = hash(hostname) mod num_shards
 ```
 
-Each frontier shard owns a slice of hosts. All URLs for `example.com` live on one shard. That shard:
+All URLs for `cnn.com` live on **one** shard. That shard owns:
 
-- Holds the priority queue for those hosts' URLs.
-- Holds the per-host token bucket and rate-limit state.
-- Holds the robots.txt cache for those hosts.
-- Holds the per-host health score.
+- The priority queue for CNN's URLs.
+- CNN's token bucket and rate-limit state.
+- CNN's robots.txt cache.
+- CNN's health score.
 
-When a fetcher needs work, it asks a specific shard for a batch of URLs that are safe to fetch right now (politeness satisfied). The shard picks N URLs across N different hosts that have available tokens, and hands them to the fetcher. The fetcher does the IO, returns the results, and the shard updates state.
+When a fetcher needs work, it asks a shard for a batch of URLs that are **safe to fetch right now** (politeness satisfied). The shard picks N URLs across N different hosts that all have free tokens. Hands them to the fetcher. Fetcher does the IO. Returns results. Shard updates state.
 
 This is the standard pattern. Almost every large crawler is structured this way.
 
-Failure handling.
+**What if a shard dies?**
 
-- If a frontier shard dies, all hosts on that shard are temporarily unavailable. Replicate the shard (Raft, or primary + warm standby). Cassandra/DynamoDB-style replication works; the consistency needs are not strict (we already tolerate a few duplicate fetches).
-- If a fetcher dies mid-batch, the URLs it had reserved time-out and become available again. Use a lease pattern: fetcher gets URLs with a 60-second lease; if not acknowledged within the lease, they go back into the queue.
+Replicate each shard (Raft, or primary + warm standby). On failover, rebuild the in-memory queue from disk. Hosts on that shard pause for a minute, then resume.
 
-Hot host.
+**What if a fetcher dies mid-batch?**
 
-- One host has 50M URLs in the frontier. The shard owning that host is hot. Mitigation:
- - Cap the per-host pop rate: even if the bucket is full, never hand out more than K URLs per second for one host, regardless of how starved the queue is for that host.
- - Spill the host's URLs to secondary storage; only keep the top-priority subset hot in the queue.
- - For truly huge hosts (Wikipedia, GitHub), split by sub-host or by URL hash within the host onto multiple shards, but coordinate the token bucket separately. The rare exception.
+Use a **lease**. Fetcher gets URLs with a 60-second lease. If not acknowledged within 60 seconds, URLs go back to the queue.
 
-Fetcher-to-shard assignment.
+**What about a hot host (50M URLs from one site)?**
 
-- Fetchers are not assigned to shards. Any fetcher can pull from any shard. The fetcher chooses which shard to pull from based on consumer-fairness (round-robin) or based on which shards have available work (push from shards).
-- Keeps fetchers stateless and lets them auto-scale on CPU/network.
+- Cap the per-host pop rate. Even if the bucket is full, never hand out more than 10 URLs/sec for one host.
+- Spill the host's URLs to secondary storage. Only the top-priority ones stay hot in memory.
+- For truly huge hosts (Wikipedia, GitHub), coordinate with the site owners and use their sitemaps.
 
 </details>
 
-## Step 7: read the full solution
+Here is the journey of one URL drawn as a sequence diagram.
 
-You have covered the four hard parts: priority frontier, content and URL dedup, politeness, and host-sharded coordination. The solution covers data models, recrawl scheduling, JavaScript rendering, trap detection, multi-region distribution, and the day-2 reliability problems.
+```mermaid
+sequenceDiagram
+    participant Frontier
+    participant Fetcher
+    participant Robots as robots.txt cache
+    participant Web as The website
+    participant Parser as Link Extractor
+    participant Dedup as Dedup Index
+
+    Frontier->>Fetcher: lease batch of 100 URLs (different hosts)
+    Fetcher->>Robots: is /post-2 allowed on blog.example.com?
+    Robots-->>Fetcher: yes, allowed
+    Fetcher->>Web: HTTP GET /post-2
+    Web-->>Fetcher: 200 OK + HTML body
+    Fetcher->>Frontier: ack: status 200, content_hash=abc...
+    Fetcher->>Parser: send raw HTML
+    Parser->>Parser: find all <a href> links
+    Parser->>Parser: canonicalize each link
+    Parser->>Dedup: are these URLs new?
+    Dedup-->>Parser: 18 new, 7 already seen
+    Parser->>Frontier: insert 18 new URLs
+```
+
+---
+
+## Step 7: Read the full solution
+
+You have walked through the four hard parts:
+
+1. **Priority frontier.** Not plain BFS. URLs are scored by importance, freshness, and trap penalties.
+2. **Two-layer dedup.** URL dedup with Bloom + KV. Content dedup by hashing the body.
+3. **Politeness.** robots.txt, per-host token buckets, status code backoff, user agent.
+4. **Host-sharded coordination.** Hash by hostname so each host's politeness state is on one machine.
+
+The solution covers the rest: data models, recrawl scheduling, JavaScript rendering, trap detection, multi-region crawling, and what breaks on day two.
+
+---
 
 ## Follow-up questions
 
-Try answering each in 3 to 4 sentences before reading the solution.
+Try to answer each in 3 or 4 sentences before opening the solution.
 
-1. Crawler trap. A site has a calendar widget that links to `?date=2026-05-23`, `?date=2026-05-24`, and so on for the next 10,000 years. Your crawler dutifully follows every link. How do you detect and stop this without hardcoding a list of trap sites?
-2. Soft 404. A site returns HTTP 200 with a body that says "Page not found, sorry". You add it to your index. Later you discover the entire site is identical "not found" pages with different URLs. How do you detect this in the pipeline?
-3. JavaScript-rendered content. A modern SPA returns an empty `<div id="root">` and loads everything via JS. The link extractor finds zero outlinks. What is the pipeline change to handle these pages?
-4. Recrawl scheduling. A news site posts 100 articles per day. A dormant blog posts once a year. You want news pages refreshed within an hour and the blog refreshed monthly. How do you decide each URL's recrawl interval without hand-tuning per site?
-5. Frontier persistence. A frontier shard's machine reboots. You have 5 billion URLs queued in that shard. How is the queue persisted across restarts without making every push a synchronous disk write?
-6. Distributed Bloom filter coordination. The Bloom filter for "have we seen this URL" is 60GB. You shard it across 8 nodes. Two fetchers in different regions encounter the same new URL at the same time and both try to add it. How do you avoid double-adding to the frontier?
-7. Two URLs serve identical content. `example.com/article/123` and `example.com/article/123?utm=email` are the same page. Both got fetched. How does the storage layer recognize and consolidate them, and what does the index see?
-8. A new important domain is launched. It has 1 million internal pages and the world starts linking to it heavily. Your default per-host rate of 1 req/sec means you need ~12 days to crawl it. How do you accelerate ethically?
-9. Spam farm. An adversary generates 10 million auto-generated low-value pages on cheap domains that interlink and link to a target site to manipulate ranking. How does the crawler avoid wasting capacity on them?
-10. Geo-distributed targets. A French news site is hosted in France. Your fetchers are in us-east. Each fetch takes 200ms of round-trip. How do you cut the latency without spinning up a full crawler in every region?
+1. **Crawler trap.** A site has a calendar widget that links to `?date=2026-05-25`, `?date=2026-05-26`, and so on for 10,000 years. Your crawler dutifully follows every link and the frontier fills with junk. How do you detect and stop this without hardcoding a list of trap sites?
+
+2. **Soft 404.** A site returns HTTP 200 with a body that says "Page not found." You add it to your index. Later you find every URL on that site returns the same "not found" page. How do you catch this?
+
+3. **JavaScript-rendered pages.** A modern single-page app returns an almost-empty `<div id="root">` and loads everything via JS. The link extractor finds zero links. How does the pipeline handle these?
+
+4. **Recrawl scheduling.** A news site posts 100 articles per day. A dormant blog posts once a year. You want news refreshed within an hour and the blog refreshed monthly. How do you decide each URL's refresh rate without tuning per site?
+
+5. **Frontier persistence.** A frontier shard's machine reboots. There are 5 billion URLs queued in that shard. How do you persist the queue without making every push a synchronous disk write?
+
+6. **Bloom filter race.** Two fetchers in different regions discover the same new URL at the same instant. Both query the dedup service. How do you make sure only one of them adds it to the frontier?
+
+7. **Two URLs, same content.** `example.com/article/123` and `example.com/article/123?utm=email` are the same page. Both got fetched. How does the storage layer notice, and what does the search index see?
+
+8. **A new important domain.** A major news site launches with 1 million pages. At 1 req/sec, it would take 12 days to crawl. How do you go faster without being rude?
+
+9. **Spam farm.** Someone generates 10 million auto-generated low-value pages on cheap domains that interlink. How does the crawler avoid wasting capacity on them?
+
+10. **Geo-distributed targets.** A French news site is hosted in France. Your fetchers are in us-east. Each fetch costs 200ms of round-trip latency. How do you cut the latency without running a full crawler in every region?
+
+---
 
 ## Related problems
 
-- [Rate Limiter (004)](../004-rate-limiter/question.md). Per-host politeness is exactly a token-bucket rate limiter at huge cardinality. The data structures and edge cases transfer directly.
-- [Distributed Cache (009)](../009-distributed-cache/question.md). The dedup index, robots.txt cache, and DNS cache all share the same sharded-cache patterns. The eviction and consistency trade-offs there are foundational here.
-- [Typeahead Autocomplete (005)](../005-typeahead-autocomplete/question.md). Both this and typeahead have a batch pipeline that transforms raw input into a serving-side index. The pipeline shape (Kafka spine, stateless workers, periodic compaction) is the same.
+- **[Rate Limiter (004)](../004-rate-limiter/question.md).** Per-host politeness is a token bucket at huge cardinality. Same patterns, same edge cases.
+- **[Distributed Cache (009)](../009-distributed-cache/question.md).** The dedup index, robots.txt cache, and DNS cache all use sharded cache patterns from there.
+- **[Typeahead Autocomplete (005)](../005-typeahead-autocomplete/question.md).** Both have a batch pipeline that turns raw input into a serving-side index. Same shape: Kafka spine, stateless workers, periodic compaction.

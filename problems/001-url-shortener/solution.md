@@ -1,281 +1,359 @@
-## Solution: Design a URL Shortener
+## Solution: URL Shortener
 
-### TL;DR
+### The short version
 
-A URL shortener is a read-skewed key-value lookup. Three things make it interesting: minting unique short codes without a global coordinator on the hot path, surviving a 100k req/s viral link without a hot-key meltdown, and handling phishing without slowing the write path.
+A URL shortener is a key-value lookup with one twist: reads beat writes by 10 to 1, and one specific key can suddenly take 100,000 requests per second when it goes viral.
 
-The shape is a stateless service in front of a sharded database with an aggressive cache. Shortcodes come from a sharded counter (each service grabs a range), get XOR-scrambled to look random, and are base62 encoded. Reads almost always hit cache; the database is a fallback. Click analytics are async so the redirect stays under 50ms.
+The runtime is small. A stateless service in front of a cache in front of a sharded database. Short codes come from a counter that hands out ranges (no coordination on the write path), then get XOR-scrambled so they look random. Reads almost always hit cache. The database is a backstop.
 
-The interesting engineering lives at the edges. Surviving a single popular code (replication and request coalescing). Keeping the create path fast despite a safe-browsing check (async with a pre-flight allowlist). Recovering when the counter coordinator misbehaves (range ledger and idempotency).
+The data model fits on a napkin: one table with shortcode as the primary key. Scale is not the hard part. At bit.ly numbers the whole system handles 38 writes per second steady. The hard part is the edges: surviving a viral link, handling phishing, recovering when the counter coordinator misbehaves.
 
-### 1. Clarifying questions and why each matters
+---
 
-Covered in `question.md`. The seven you must ask: traffic shape, shortcode length, retention, latency target, analytics, auth/abuse, dedup on conflicts. Walking in without asking traffic shape leaves you with no way to size anything. It's the single most common mistake.
+### 1. The clarifying questions, in one paragraph
 
-### 2. Capacity estimates (full working)
+The single most important question is *how much traffic?* Without numbers you cannot pick a cache size, a sharding scheme, or even a database. Second is *custom aliases yes or no?* Because aliases change the write path from "mint a fresh code" to "atomically reserve this exact string." Third is *who can shorten?* Because anonymous shortening forces rate limits, abuse handling, and a phishing pipeline that logged-in services often skip.
 
-- 100M new URLs / month → 100M / (30 × 86400) = **~38 writes/sec sustained, ~150/sec peak** (3-5x multiplier).
-- 10x reads → **~380 reads/sec sustained, ~1500/sec peak**.
-- 6B URLs after 5 years at ~150 bytes/record = **~900GB**. Fits on one machine; you shard for blast radius and tail latency, not capacity.
-- Top 1M URLs serve ~80% of redirects (Zipf). 1M × 150B = **150MB hot set**, trivially cacheable.
-- Bandwidth is negligible. The redirect is a 302 with a Location header and zero body.
+Everything else (latency target, analytics shape, retention) follows from those three.
 
-The math says the system is small. Most of the architecture exists for **availability, latency, and abuse-resistance**, not capacity.
+---
 
-### 3. API design
+### 2. The math, in plain numbers
 
-In `question.md`. The non-obvious calls:
+| Number | Value |
+|--------|-------|
+| New URLs per month | 100M |
+| Writes per second, steady | ~38 |
+| Writes per second, peak | ~150 |
+| Reads per second, steady | ~380 |
+| Reads per second, peak | ~1,500 |
+| Total URLs after 5 years | 6 billion |
+| Total storage | ~900GB |
+| Hot working set (top 1M URLs) | ~150MB |
 
-- 302 over 301. A 301 is browser-cached permanently; you lose the ability to change the target, kill phishing, or track clicks.
-- `Cache-Control: private, max-age=0` on the redirect response, so intermediate proxies don't cache it.
-- Idempotency on POST. When the same `long_url` is submitted by the same authenticated user, return 200 with the existing shortcode instead of 201. Anonymous users always get a fresh shortcode for privacy; otherwise two devices submitting the same URL would leak that they're the same person.
+What the numbers tell you:
 
-### 4. Data model
+- **The system is small.** A single Postgres could handle the writes. You shard for failure blast radius and regional latency, not for capacity.
+- **Cache wins everything.** 150MB hot set on one Redis node serves ~80% of traffic. Get the cache right and the database is almost an afterthought.
+- **The redirect bandwidth is zero.** A 302 with a `Location` header has no body. The user goes away to the target. You serve nothing.
+
+---
+
+### 3. The API
+
+Two endpoints. Create a link. Follow a link. Full schemas are in `question.md`. The non-obvious choices:
+
+- **302, not 301.** A 301 says "permanent." Browsers cache it for life. If you ever need to block the link (phishing, copyright, etc.), the user's browser will not even ask you. With 302, every click goes through you, so you keep control.
+
+- **`Idempotency-Key` is required on create.** Mobile drops connections. The client retries. Without the key, one tap becomes two short codes.
+
+- **`Cache-Control: private, max-age=0` on the redirect response.** Tells the browser and middlebox proxies not to cache. Your CDN can still cache it because you control the CDN explicitly.
+
+Status codes worth knowing: **410 Gone** for expired or deleted links (different from 404 because it tells the browser not to retry), **451 Unavailable for Legal Reasons** for blocked URLs.
+
+---
+
+### 4. The data model
+
+One main table. That's it.
 
 ```sql
 CREATE TABLE short_links (
-    shortcode    VARCHAR(16) PRIMARY KEY,        -- base62, typically 7 chars
-    long_url     TEXT NOT NULL,
-    creator_id   BIGINT,                         -- NULL for anonymous
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at   TIMESTAMPTZ,                    -- NULL = no expiry
-    status       SMALLINT NOT NULL DEFAULT 1,    -- 1=active, 2=expired, 3=blocked
-    custom_alias BOOLEAN NOT NULL DEFAULT FALSE,
-    long_url_hash BYTEA                          -- SHA-256 of long_url for dedup lookups
+    shortcode      VARCHAR(16) PRIMARY KEY,         -- base62, usually 7 chars
+    long_url       TEXT NOT NULL,
+    creator_id     BIGINT,                          -- NULL for anonymous
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at     TIMESTAMPTZ,                     -- NULL = no expiry
+    status         SMALLINT NOT NULL DEFAULT 1,     -- 1=active, 2=expired, 3=blocked
+    custom_alias   BOOLEAN NOT NULL DEFAULT FALSE,
+    long_url_hash  BYTEA                            -- SHA-256 for dedup lookups
 );
 
 CREATE INDEX idx_creator_created ON short_links (creator_id, created_at DESC);
-CREATE INDEX idx_long_url_hash ON short_links (creator_id, long_url_hash);  -- for dedup
+CREATE UNIQUE INDEX idx_dedup ON short_links (creator_id, long_url_hash)
+    WHERE creator_id IS NOT NULL;
 CREATE INDEX idx_expires ON short_links (expires_at) WHERE expires_at IS NOT NULL;
 ```
 
-Choices worth defending:
+Four small choices doing real work:
 
-- `shortcode` as PK, not a synthetic ID. Reads are by shortcode. Having the PK match the lookup key avoids an index hop on every redirect.
-- `long_url` as `TEXT`, not `VARCHAR(2048)`. Real URLs do exceed 2048 chars (Google Maps share links, deep OAuth callbacks). Trust the use case.
-- `status` as smallint, not enum. Easier to add new states (4=pending_review, 5=quarantined) without schema migrations.
-- `long_url_hash` lets you dedup without a full-text comparison or a giant secondary index on TEXT.
+**`shortcode` as the primary key.** Reads are by shortcode. Matching the PK to the lookup key skips an index hop on every single redirect. Sounds tiny. At 1,500 reads per second across 6 billion rows, it matters.
 
-### 5. Core algorithm: shortcode generation
+**`long_url` is `TEXT`, not `VARCHAR(2048)`.** Real URLs exceed 2048 characters. Google Maps share links. Deep OAuth callbacks. Trust the use case.
 
-#### The three approaches in detail
+**`status` is `SMALLINT`, not an enum.** When you want to add `4 = pending_review` or `5 = quarantined`, no schema migration. Just write the new number.
 
-**a. Hash and truncate.**
+**Unique index on `(creator_id, long_url_hash)`.** This is what makes dedup safe under concurrent writes. Two simultaneous INSERTs of the same URL by the same user: one wins, the other gets a conflict, returns the existing shortcode. No app-level locks.
 
-```
-shortcode = base62(truncate(SHA256(long_url), 42 bits))
-```
+> Why Postgres and not Cassandra? Because you want ACID for the counter-range allocation and the dedup unique index. Postgres gives you both for free. At 38 writes per second steady, you are nowhere near needing a NoSQL store. Save the complexity for a real reason.
 
-42 bits in base62 ≈ 7 characters. Birthday paradox: probability of any collision passes 50% at √(2^42) ≈ 2M URLs. At 6B URLs you'll have lots. You handle them by appending a counter or salt and rehashing until unique. Works, but the "until unique" loop has unpredictable latency at the long tail.
+---
 
-**b. Counter, base62 encoded.**
+### 5. How short codes get made
 
-```
-id = next_counter_value()           # globally unique 64-bit integer
-shortcode = base62(id ^ secret)     # XOR before encoding so codes look random
-```
+The engine of the write path. Three approaches, the recommendation, and why.
 
-The XOR step matters. Without it, shortcodes are sequential: `abc1230`, `abc1231`, `abc1232`. An attacker iterates the namespace and harvests every link. With XOR (or any bijective scrambling like a Feistel network), consecutive IDs map to scattered shortcodes. The XOR secret is a 64-bit constant baked into the service.
-
-**c. Random + check.**
-
-```
-while True:
-    code = random_base62(7)
-    if not db.exists(code):
-        return code
+```mermaid
+flowchart LR
+  A[Counter coordinator] -->|gives range of 10000 IDs| B[URL Service Pod 1]
+  A -->|gives different range| C[URL Service Pod 2]
+  B -->|next ID| D[XOR with secret]
+  D -->|base62 encode| E[shortcode]
 ```
 
-At 7 chars (62^7 = 3.5T codes), collision rate stays below 0.1% for the first few hundred million URLs. Beyond that, retry latency climbs. Add a "code length" knob and bump to 8 chars at that scale.
+**The chosen approach: sharded counter, scrambled.**
 
-#### Recommendation
+```python
+def mint_shortcode():
+    # Local range, no network call most of the time
+    if local_range.exhausted():
+        local_range = coordinator.allocate_range(size=10000)
 
-**Counter with sharded range allocation, then XOR-scrambled.**
-
-Why:
-- No collisions, no retry latency.
-- Sharded range allocation removes the per-write coordination round-trip. Each URL Service instance grabs a range of (say) 10,000 IDs from a coordinator (Redis with a Lua script, or a small dedicated service backed by Postgres). When the local range is exhausted, it fetches another.
-- Counter state has to be durable. The coordinator is the single point of contention, but it's contacted only every 10,000 writes per instance, so load is trivial.
-
-The risk: if the coordinator hands out the same range twice (failover bug, misconfigured replica), two URL Service instances mint the same shortcode. Mitigation: log every range allocation with a unique ledger ID, and on coordinator startup replay the ledger to refuse already-allocated ranges. More on this in follow-up 10.
-
-### 6. High-level architecture (detailed)
-
-```
-                                    ┌────────────────┐
-   Browser ───────────────────────► │   CDN / Edge   │  cache 302s for popular shortcodes
-                                    │   (CloudFront, │  TTL: short, e.g. 60s
-                                    │    Fastly)     │
-                                    └───────┬────────┘
-                                            │
-                                    ┌───────▼────────┐
-                                    │ Global Load    │  Anycast IP
-                                    │ Balancer       │  Routes to nearest healthy region
-                                    └───────┬────────┘
-                                            │
-                  ┌─────────────────────────┼─────────────────────────┐
-                  │                         │                         │
-            ┌─────▼──────┐            ┌─────▼──────┐           ┌─────▼──────┐
-            │  Region    │            │  Region    │           │  Region    │
-            │  us-east   │            │  eu-west   │           │  ap-south  │
-            │            │            │            │           │            │
-            │ ┌────────┐ │            │ ┌────────┐ │           │ ┌────────┐ │
-            │ │  WAF + │ │            │ │  WAF + │ │           │ │  WAF + │ │
-            │ │  Rate  │ │            │ │  Rate  │ │           │ │  Rate  │ │
-            │ │ Limiter│ │            │ │ Limiter│ │           │ │ Limiter│ │
-            │ └───┬────┘ │            │ └───┬────┘ │           │ └───┬────┘ │
-            │     │      │            │     │      │           │     │      │
-            │ ┌───▼────┐ │            │ ┌───▼────┐ │           │ ┌───▼────┐ │
-            │ │  URL   │ │            │ │  URL   │ │           │ │  URL   │ │
-            │ │Service │ │            │ │Service │ │           │ │Service │ │
-            │ │(N pods)│ │            │ │(N pods)│ │           │ │(N pods)│ │
-            │ └─┬───┬──┘ │            │ └─┬───┬──┘ │           │ └─┬───┬──┘ │
-            │   │   │    │            │   │   │    │           │   │   │    │
-            │ ┌─▼─┐ │    │            │ ┌─▼─┐ │    │           │ ┌─▼─┐ │    │
-            │ │Red│ │    │            │ │Red│ │    │           │ │Red│ │    │
-            │ │is │ │    │            │ │is │ │    │           │ │is │ │    │
-            │ │ cl│ │    │            │ │ cl│ │    │           │ │ cl│ │    │
-            │ └───┘ │    │            │ └───┘ │    │           │ └───┘ │    │
-            │       │    │            │       │    │           │       │    │
-            └───────┼────┘            └───────┼────┘           └───────┼────┘
-                    │                         │                         │
-                    │     ┌───────────────────┴─────────────────────────┘
-                    │     │
-                    ▼     ▼
-            ┌──────────────────────────┐
-            │  Primary Database (DB)   │  Sharded by shortcode hash.
-            │  (Postgres or DynamoDB)  │  Multi-region: regional writes
-            │                          │  go to a primary in one region,
-            │                          │  read replicas in every region.
-            └────────────┬─────────────┘
-                         │  CDC / outbox
-                         ▼
-            ┌──────────────────────────┐
-            │  Click Stream Pipeline   │  Kafka → ClickHouse / BigQuery
-            │  (async, off hot path)   │  Aggregated click counts per
-            │                          │  shortcode, 1-minute rollup.
-            └──────────────────────────┘
+    counter_id = local_range.next()                    # e.g. 8472913
+    scrambled = counter_id ^ XOR_SECRET                # bijective scramble
+    return base62_encode(scrambled)                    # 7 chars
 ```
 
-Component responsibilities:
+Three things make this work:
 
-- CDN / edge cache. Caches the 302 for popular shortcodes. TTL is short (60s) so we can revoke phishing links. Most redirects never touch origin.
-- Global LB + Anycast. One IP, routed to the nearest healthy region. Removes a DNS round-trip and gives failover for free.
-- WAF + Rate Limiter. WAF for obvious abuse (SQL injection in custom alias, etc.). Rate limiter caps `POST /links` per IP and per account.
-- URL Service. Stateless. Owns the counter range, talks to local cache, falls back to DB on miss. Fires click events to Kafka asynchronously.
-- Regional Redis. Caches reads. Replicated within the region for HA. Inter-region cache is not shared; a miss in eu-west goes to the database, not to us-east's Redis.
-- Sharded DB. One primary region for writes (multi-master sharded DBs are a lot more complex than this problem needs). Read replicas everywhere.
-- Click pipeline. Kafka with 7-day retention, ClickHouse or BigQuery for aggregation. A streaming job emits per-shortcode click counts every minute. The result is written to a counter store (separate from the primary DB) that the UI reads.
+**1. Range allocation removes the per-write coordination call.** A pod grabs 10,000 IDs from the coordinator. Then it serves 10,000 writes from local memory before talking to the coordinator again. At 38 writes per second per pod, that is one coordinator call every 4 minutes per pod. Trivial.
 
-### 7. Read path vs write path
+**2. The XOR scramble kills sequential guessability.** Without it, codes look like `Aaa0001, Aaa0002, Aaa0003`. A scraper iterates the namespace and harvests every link. With XOR, consecutive counters give scattered codes. Same uniqueness (XOR is bijective). No scraping risk.
 
-**Write path (`POST /links`)**
+**3. The coordinator's state has to survive a failover.** This is the trap. If the coordinator is plain Redis and the replica is stale, the same range gets handed out twice and two pods mint colliding codes. The fix is to back the coordinator with a strongly-consistent store (a Postgres sequence, or ZooKeeper).
 
-1. Client → CDN → LB → Regional API Gateway → URL Service.
-2. WAF and rate limiter. Rate limit: 100 links/hour for anonymous, 10,000/hour for authenticated, scoped by IP and account.
-3. Pre-flight URL validity check (DNS resolvable, not on local blocklist).
-4. If `custom_alias` is given: atomic `INSERT... ON CONFLICT DO NOTHING` on the shortcode. If it returns 0 rows, 409.
-5. Otherwise: pop the next ID from the local counter range. If empty, fetch a new range from the coordinator (the only call to a global service in the write path).
-6. Scramble (XOR with secret), base62 encode.
-7. `INSERT` into DB sharded by hash(shortcode). If insert fails on duplicate shortcode (range allocation bug), bump ID and retry.
-8. Write to local Redis with a short TTL (60s). Let the read path populate longer-lived entries.
-9. Fire-and-forget event to Kafka `link_created` topic.
-10. Async safe-browsing API call. If flagged, set status to `blocked` (3) and invalidate cache.
-11. Return 201 with the shortcode.
+> Why not just hash the URL? Birthday collisions. At 2 million URLs you have a 50% chance of one collision. At 6 billion, lots. You can handle collisions with a retry loop and a salt, but the loop's latency is unpredictable at the tail. Counters are cleaner.
 
-P99 target: 200ms. Bottleneck is the synchronous DB insert; counter range fetches are too rare to matter.
+---
 
-**Read path (`GET /<shortcode>`)**
+### 6. The architecture, drawn out
 
-1. Browser → CDN. If cached and not expired, return 302 directly. **80%+ of hot URL traffic should never reach origin.**
-2. CDN miss → LB → Regional URL Service.
-3. URL Service checks Redis. If hit and `status=active`, return 302. **~5ms.**
-4. Redis miss → DB read (regional read replica). If found and active, write to Redis with a 1-hour TTL for hot keys (with random jitter to avoid synchronized expiry), then return 302. **~30-50ms.**
-5. DB miss → 404.
-6. Status `expired` (2) → 410.
-7. Status `blocked` (3) → 451.
+```
+                 +--------------------------------------+
+                 |  Clients: web, mobile, anywhere      |
+                 +-------------------+------------------+
+                                     |
+                                     v
+                          +-----------------+
+                          |   CDN / Edge    |  caches 302s, 60s TTL,
+                          |  (CloudFront,   |  most viral traffic
+                          |   Fastly)       |  never reaches origin
+                          +--------+--------+
+                                   |
+                                   v
+                          +-----------------+
+                          |  Global LB +    |  anycast IP, routes
+                          |  WAF + Rate     |  to nearest region,
+                          |  Limiter        |  TLS termination
+                          +--------+--------+
+                                   |
+            +----------------------+----------------------+
+            |                      |                      |
+            v                      v                      v
+    +-------------+        +-------------+        +-------------+
+    |  Region:    |        |  Region:    |        |  Region:    |
+    |  us-east    |        |  eu-west    |        |  ap-south   |
+    |             |        |             |        |             |
+    | URL Service |        | URL Service |        | URL Service |
+    |    + Redis  |        |    + Redis  |        |    + Redis  |
+    |    + DB     |        |    + DB     |        |    + DB     |
+    |  read repl  |        |  read repl  |        |  read repl  |
+    +------+------+        +------+------+        +------+------+
+           |                      |                      |
+           +----------+-----------+-----------+----------+
+                      |                       |
+                      v                       v
+            +-------------------+    +------------------+
+            | Primary DB        |    | Counter          |
+            | (one region for   |    | Coordinator      |
+            | writes, sharded   |    | (Postgres        |
+            | by shortcode hash)|    | sequence or ZK)  |
+            +---------+---------+    +------------------+
+                      |
+                      |  CDC / outbox
+                      v
+            +-------------------+
+            | Kafka topics      |
+            | link.created      |
+            | click.event       |
+            | link.blocked      |
+            +---+---------+-----+
+                |         |
+                v         v
+        +------------+ +--------------+
+        | ClickHouse | | Safe Browse  |
+        | (analytics)| | Worker       |
+        |            | | (async check)|
+        +------------+ +--------------+
+```
 
-In parallel, fire a click event to Kafka. **Never block the redirect on analytics.**
+Five things to notice while reading this:
 
-P99 target: 50ms regional, 100ms cross-region. With CDN, most users see <20ms.
+- **The CDN is in front of everything.** A viral link's 302 is cached at the edge. Most clicks never reach your origin. This is the single biggest performance lever in the design.
+- **Each region is mostly self-sufficient.** Local URL Service, local Redis, local DB read replica. Reads stay regional. Only writes go to the primary region.
+- **The write path has exactly one external dependency.** The counter coordinator. Called once per 10,000 writes per pod. Everything else is a local DB transaction.
+- **Click analytics is downstream of Kafka.** Never in the redirect path. If ClickHouse falls over, redirects keep working. Click counts just lag.
+- **Safe Browsing is downstream of Kafka.** Same idea. The create call doesn't wait for the safe-browsing check. A bad URL might be live for a minute before being blocked. That trade-off is worth the latency win.
 
-### 8. Scaling
+---
 
-#### a. Caching strategy
+### 7. A redirect, drawn end to end
 
-- Cache key: the shortcode.
-- Cache value: long URL + status + expires_at (so 410 is returnable without touching the DB).
-- TTL: 1 hour with ±10% jitter. Jitter prevents synchronized expiry from stampeding the DB.
-- Eviction: LRU. The hot set is small enough that the working set fits.
-- Write-through, not write-back. On `POST`, write the DB first, then populate cache. Write-back risks losing brand-new links if the cache node dies.
-- Cache invalidation. Two reasons: link is blocked (phishing) or link is deleted. On state change, publish to a Redis pub/sub channel that all URL Service instances subscribe to; each instance evicts the affected key from its local cache.
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant CDN
+  participant LB as Load Balancer
+  participant SVC as URL Service
+  participant R as Redis
+  participant DB as Postgres
+  participant K as Kafka
 
-#### b. Database sharding
+  U->>CDN: GET /abc1234
+  alt CDN hit (most common)
+    CDN-->>U: 302 Location: long_url
+  else CDN miss
+    CDN->>LB: forward
+    LB->>SVC: route to nearest region
+    SVC->>R: GET abc1234
+    alt Redis hit (~90 percent)
+      R-->>SVC: long_url, status=active
+    else Redis miss
+      SVC->>DB: SELECT * WHERE shortcode=abc1234
+      DB-->>SVC: row
+      SVC->>R: SET abc1234 with 1hr TTL + jitter
+    end
+    SVC-->>U: 302 Location: long_url
+    SVC->>K: fire click event (async, never blocks)
+  end
+```
 
-- Shard key: hash(shortcode). Spreads writes and reads evenly. A sequential ID shard key would hotspot.
-- 64 shards to start. Easy to add more with consistent hashing; harder to remove. Start over-provisioned.
-- Indexes per shard. PK on shortcode; secondary on `(creator_id, created_at)` for the "my links" page; secondary on `(creator_id, long_url_hash)` for dedup.
+Target latencies in the common path:
 
-#### c. Read replicas
+- CDN hit: **~10ms** (depends on user's distance to the edge).
+- Redis hit, no CDN: **~30ms** regional, ~80ms cross-region.
+- DB hit (cache miss): **~50ms** regional.
 
-- One primary per shard in the home region. Read replicas in every other region. Replication lag SLO: 1 second P99.
-- Reads go to the closest replica; writes always to the primary. Eventually consistent is fine; a redirect lagging by 1 second is invisible to users.
+The create path is similar but writes happen instead of reads. Counter allocation (cached locally), DB INSERT, write-through to Redis, fire `link.created` event to Kafka, return 201. P99 around 200ms. The bottleneck is the synchronous DB insert.
 
-#### d. CDN
+---
 
-- Cache 302 responses by shortcode. TTL 60 seconds.
-- Trade-off: longer TTL means more cache hits but slower phishing revocation. 60 seconds is the sweet spot. If a link is flagged, it can still serve from CDN for up to 60s.
-- For known-suspicious links: set `Cache-Control: no-store` so the CDN never caches them. They become hot for the origin, but they're a tiny slice of traffic.
+### 8. The scaling journey: from one server to billions of links
 
-#### e. Geographic distribution
+This is the part interviewers care about most. At every stage, name what just broke and what fixes it. Build nothing preemptively.
 
-- Three regions (us, eu, ap). Each has its own URL Service, Redis, and DB read replicas.
-- Writes route to the home region. If that region goes offline, writes fail but reads keep working. For a URL shortener this trade-off is fine (writes are rare; reads have to work).
-- For higher write availability you'd adopt a leaderless multi-region DB (DynamoDB Global Tables, Spanner). That's a more complex answer and only justified at YouTube/TikTok scale.
+#### Stage 1: 1,000 users
 
-### 9. Reliability
+One server. Single Postgres. Cache in memory. No CDN, no Kafka, no sharding. Counter is a Postgres sequence. About $50/month. Ships in a weekend.
 
-- Cache failure. If Redis is down, reads fall through to the DB. The DB can't sustain 15k req/s for long. Mitigation: shed traffic (503 with `Retry-After`), and have the URL Service detect Redis health and switch to a self-protective slow path with stricter rate limits.
-- DB primary failure. Promote a replica. Writes are unavailable for 30 to 60 seconds (typical Postgres failover). Reads keep working from other replicas. The counter coordinator must not lose state here; back it with Postgres or use ZooKeeper.
-- Counter coordinator failure. The scariest one. If the coordinator hands the same range to two instances, you get duplicate shortcodes. Mitigation: range allocations are logged to a durable ledger; on coordinator startup it reads the ledger and refuses to re-allocate any range it has already given out. Each URL Service also writes its own "I am using range X" record, so on misbehavior the ranges can be reconciled.
-- Multi-region failure. Detected by the global LB; traffic shifts to healthy regions. Cache in the failed region is cold elsewhere; expect a 5-minute degraded latency window after the swap.
+Enough because you see 10 links a day. Anything more is over-engineering.
 
-### 10. Observability
+#### Stage 2: 100,000 users
+
+Something breaks: read latency spikes during the day, and Postgres CPU hits 60%.
+
+Add Redis in front. The hot working set (a few hundred MB) fits in one Redis node easily. Cache hit rate goes from 0% to ~85%, Postgres CPU drops to 10%. Add one read replica for durability. Move click counting to a Kafka pipeline so the redirect path stops bumping a row on every hit.
+
+Still one region. Still no sharding. Counter is still a Postgres sequence. About $400/month.
+
+#### Stage 3: 10 million users, multi-region
+
+New problems pile up:
+
+- European users see 200ms latency because the server is in us-east.
+- One viral link starts getting 30K req/s and pegs one Redis CPU.
+- Phishing complaints arrive weekly. You need a process.
+
+Fixes, in order:
+
+- **Add a CDN.** Caches the 302 at the edge. Drops origin traffic by 80% for popular links.
+- **Add regional read paths.** URL Service + Redis + read replica in each region. Writes still go to one primary region.
+- **Shard the database.** 64 shards by hash of shortcode. Spreads load evenly. Now no single DB node feels the write pressure.
+- **Move the counter to a dedicated coordinator.** Range allocation, durable state in Postgres or ZooKeeper.
+- **Build a phishing pipeline.** Safe Browsing API consumed via Kafka. Async. Cache invalidation via pub/sub when a link is flagged.
+
+Cost climbs to $5-10k/month. Latency is good worldwide.
+
+#### Stage 4: 1 billion users (bit.ly scale)
+
+What changes:
+
+- The CDN is now critical infrastructure, not a nice-to-have. 95% of viral traffic served from the edge.
+- Hot key problem becomes routine. Layered defenses (CDN, in-process cache, Redis replicas, request coalescing) all in place.
+- Storage is multi-TB. Cold tier in S3 for links older than 1 year.
+- Multi-region writes become tempting. Probably still not worth it. A single primary region for writes is simpler and the write rate is small.
+
+The architecture has not fundamentally changed since Stage 3. You added more shards, more replicas, more CDN coverage, more careful abuse handling. The core data model is the same one you wrote in Stage 1.
+
+#### What you would do at 10x of bit.ly
+
+Move counter allocation client-side with a Snowflake-style ID: machine ID + timestamp + sequence. No coordinator at all. Each pod can mint codes forever without ever talking to a central service. Trade: you lose a tiny bit of compactness (codes get one character longer).
+
+---
+
+### 9. The four hard problems, fast
+
+Same engine, four hard cases. Each one stresses a different feature.
+
+- **Viral link (hot key)** uses layered caching. CDN at the edge, in-process cache on each pod, Redis read replicas, request coalescing on miss. The cheapest layer (CDN) buys the most.
+- **Dedup race** uses a unique index on `(creator_id, long_url_hash)`. The DB serializes the writes. The second INSERT gets a conflict, returns the first's shortcode. No app-level locks.
+- **Phishing detection** is async via Kafka. The create call returns fast. A worker calls Safe Browsing later. If flagged, status flips to blocked and pub/sub evicts the cache everywhere. The trade-off: the link is live for a minute before being killed.
+- **Counter coordinator failure** uses a ledger. Every range allocation writes a row. A periodic job scans for overlapping ranges and alerts. Prevention: never run the coordinator on plain Redis. Use Postgres sequences or ZooKeeper.
+
+One engine, four hard problems, all solved with small targeted patterns. That is the design victory.
+
+---
+
+### 10. Reliability
+
+The engine has only one shared write dependency (the counter coordinator) and one shared read dependency (the cache). Each failure mode has a known fallback.
+
+**Cache failure.** Redis is down. All reads fall through to the DB. The DB can hold 1,500 req/s for a while, but not forever. The URL Service detects Redis health and switches to a self-protective mode: stricter rate limits, smaller payloads, shed any non-essential traffic with 503 + `Retry-After`.
+
+**DB primary failure.** Promote a read replica. Writes are unavailable for 30 to 60 seconds (typical Postgres failover). Reads keep working everywhere else. The counter coordinator must not lose state during this window, which is why it lives on its own store.
+
+**Counter coordinator failure.** The worst case. If the coordinator hands the same range to two pods, two pods mint colliding codes. The DB unique constraint catches the collision (one INSERT wins, the other 500s), so the user-visible effect is some failed creates. The ledger detects the overlap within minutes and alerts. Recovery: scan the conflicting range, find any collisions that happened, reissue the duplicates manually.
+
+**Region failure.** The global LB detects it and shifts traffic to healthy regions. The failed region's cache is cold elsewhere. Expect ~5 minutes of degraded latency as the new region's cache warms up.
+
+**CDN failure.** Rare but happens (provider outage). Traffic falls back to origin. Origin sees 5x normal load. Auto-scaling buys time. If the load is too high, shed with 503s and pray.
+
+---
+
+### 11. Observability
 
 What must be instrumented from day one:
 
-| Metric | Why |
-|--------|-----|
-| `redirect.latency` by region, p50/p95/p99 | The headline SLO |
-| `redirect.cache_hit_rate` | If this drops below 80% something is wrong |
-| `redirect.404_rate` | Spikes indicate scrapers; can become a signal for new rate limit rules |
-| `create.latency` p50/p99 | Slow creates indicate counter coordinator or DB problems |
-| `create.dedup_rate` | If 30%+ of POSTs are dedups, your clients are buggy |
-| `counter.range_fetches_per_sec` | Should be roughly QPS / 10000 |
-| `counter.range_age_max` | Alerts on coordinators stuck |
-| `safe_browsing.flagged_rate` | Sudden spike = abuse campaign |
-| `kafka.click_event_lag` | If clicks lag by >5 min, analytics is stale |
-| `db.replication_lag_p99` | Should be under 1s |
+| Metric | Why it matters |
+|--------|----------------|
+| `redirect.latency` p50/p95/p99 by region | The headline SLO. The whole product is "the redirect is fast." |
+| `redirect.cache_hit_rate` | If this drops below 80%, something is wrong (TTL too short, cache box died, Zipf assumption broken). |
+| `redirect.404_rate` | Spikes mean someone is scraping the namespace. New rate limit rule needed. |
+| `create.latency` p50/p99 | Slow creates point to the counter coordinator or DB. |
+| `create.dedup_rate` | If 30% of POSTs are dedups, your clients are buggy or not respecting the idempotency key. |
+| `counter.range_fetches_per_sec` | Should be roughly write QPS divided by range size. |
+| `counter.range_overlap_detected` | Should be 0. Page on any non-zero value. |
+| `safe_browsing.flagged_rate` | Sudden spike means an abuse campaign. |
+| `kafka.click_event_lag` | If clicks lag by more than 5 minutes, analytics is stale. |
+| `db.replication_lag_p99` | Should stay under 1 second. |
 
-Alerting:
-- Page on: redirect P99 > 200ms for 5min, cache hit rate < 70% for 5min, create error rate > 5%.
-- Ticket on: dedup rate spike, 404 rate spike (could be scraping, or someone deleted a popular link).
+Page on: redirect P99 > 200ms for 5 minutes. Cache hit rate < 70% for 5 minutes. Counter range overlap detected (any).
 
-### 11. Follow-up answers
+Ticket on: dedup rate spike. 404 rate spike (could be scraping, could be someone deleted a popular link).
+
+---
+
+### 12. Follow-up answers
+
+These are the questions a senior interviewer is listening for. Each answer is short on purpose. The depth is in the *why*.
 
 **1. Two users submit the same long URL within milliseconds.**
 
-If both are anonymous: different shortcodes. Privacy-preserving and avoids accidentally linking two devices.
+If both are anonymous, give them different shortcodes. Same URL going to two codes is fine, and it preserves privacy. Two devices submitting the same URL should not be linkable as the same person.
 
-If both are the same authenticated user: dedup. Flow:
-- Compute `sha256(long_url)`.
-- `SELECT shortcode FROM short_links WHERE creator_id = ? AND long_url_hash = ? LIMIT 1`.
-- Hit: return existing.
-- Miss: INSERT with the hash.
+If both are logged in as the same user, dedup. Compute `sha256(long_url)`. Do an upsert: `INSERT ... ON CONFLICT (creator_id, long_url_hash) DO UPDATE ... RETURNING shortcode`. The unique index makes the race safe. The second INSERT sees the conflict and returns the first one's shortcode.
 
-The race: both requests miss the SELECT and both proceed to INSERT. Fix it with a unique index on `(creator_id, long_url_hash)` and `INSERT... ON CONFLICT (creator_id, long_url_hash) DO UPDATE SET... RETURNING shortcode`. The second INSERT gets the first's shortcode back. Idempotent under concurrency.
-
-If they want different shortcodes despite the same URL: add a `force_new=true` query parameter that skips the dedup lookup.
+If they want different codes for the same URL, add `?force_new=true` to skip dedup. Real-world example: a marketing team running an A/B test wants separate codes so they can track each campaign's clicks separately.
 
 **2. Custom aliases (atomic reservation).**
 
@@ -286,119 +364,153 @@ ON CONFLICT (shortcode) DO NOTHING
 RETURNING shortcode;
 ```
 
-If `RETURNING` is empty, the alias was taken. Return 409. Atomic at the DB level. No extra locking.
+If `RETURNING` is empty, the alias was taken. Return 409. Atomic at the DB level. No locks needed.
 
-The annoying case: aliases that look like generated shortcodes (`abc1234`). Reserve a namespace: custom aliases must be at least 4 chars and contain at least one non-base62 character (hyphen or underscore), or be at least 8 chars. Kills the conflict between the two pools without runtime checks.
+One annoying case: a custom alias that looks like a generated code (`abc1234`). Reserve a namespace. Custom aliases must be at least 4 chars and contain at least one non-base62 character (hyphen or underscore), or at least 8 chars. Now generated codes and custom aliases live in disjoint pools. No conflict possible.
 
 **3. Hot key problem (one shortcode getting 100K req/s).**
 
-Symptoms: that one Redis key absorbs all the load. CPU on the Redis shard owning the key pegs at 100%, P99 latency for everyone else on that shard degrades, and you start dropping traffic.
+Layer four defenses, cheapest first:
 
-Mitigations in order of complexity:
+- **CDN.** 99% of the load served from the edge. Origin sees 1,000 req/s.
+- **In-process LRU cache on each pod.** Top 1,000 keys held in pod memory with a 60s TTL. Zero network cost.
+- **Redis read replicas.** Read from N replicas, round-robin. Multiplies hot-key throughput by N.
+- **Request coalescing on cache miss.** When the entry expires, only one goroutine refreshes. The rest wait on a per-key lock.
 
-1. CDN. First line of defense. If 99% of the 100K req/s hits the CDN, Redis sees 1000 req/s for that key, which it handles fine.
-2. Read-only replicas of the hot key. Redis has read replicas; the URL Service round-robins across them. Multiplies hot-key throughput by N.
-3. In-process LRU cache on the URL Service. A 1000-entry in-process cache with 60s TTL turns 100K Redis reads into a few dozen. Cheapest, biggest win.
-4. Probabilistic refresh (request coalescing). If the cache entry is about to expire, only one goroutine refreshes it; the rest get the stale value. Prevents thundering herd on expiry.
+The cheapest layer (CDN) does the most work. The expensive layer (replicas) is a backstop.
 
-Tier all four. For YouTube-trailer-scale virality, also pre-warm: when a marketing team is about to announce something, push the entry to every region's cache in advance.
+For pre-known viral events: pre-warm the cache. If marketing announces something at noon, push the entry to every region's cache at 11:55. The storm hits a warm cache.
 
 **4. Phishing detection.**
 
-The write path can't wait for Google Safe Browsing (200-500ms call). The approach:
+Google Safe Browsing takes 200 to 500ms. You cannot block create on that.
 
-- At create time: synchronous check against a small in-memory bloom filter of known-bad domains. Misses rarely; catches the worst.
-- Asynchronously: queue the new URL for safe-browsing verification via Kafka. A separate worker calls the external API. If flagged, set `status=3 (blocked)` and broadcast cache invalidation.
-- Continuously: a nightly job re-scans URLs created in the last 30 days. New phishing campaigns sometimes weaponize previously-clean URLs.
+The approach:
 
-The trade-off: a phishing URL can be live for a few minutes before being blocked. To shrink the window, send the URL to safe-browsing **before** returning from create, but only block on the response if it lands within 50ms. After that, return success and let the async pipeline catch late detection. Tail-latency vs accuracy.
+- At create time: synchronous check against a small in-memory bloom filter of known-bad domains. Cheap. Catches the worst offenders.
+- Asynchronously via Kafka: a worker calls the Safe Browsing API. If flagged, `status = blocked` and a pub/sub event evicts the cache everywhere.
+- Continuously: a nightly job rescans URLs created in the last 30 days. Phishing campaigns sometimes weaponize URLs that were clean at creation.
+
+Trade-off: a phishing URL can be live for 1 to 2 minutes before being blocked. To shrink the window, fire the Safe Browsing call before returning from create, but only block on the response if it lands within 50ms. After that, return success and let the async pipeline catch late detection.
 
 **5. Click count analytics.**
 
-Each redirect can't do a DB write. 1500 req/s of `UPDATE short_links SET clicks = clicks + 1` would melt the DB and serialize writes on hot rows.
+`UPDATE short_links SET clicks = clicks + 1` on every redirect would melt the DB. 1,500 writes per second serialized on hot rows. Lock contention on viral links.
 
 Pipeline:
-- Redirect emits an event to Kafka (`{shortcode, ts, ip_hash, ua_hash}`).
-- A streaming job (Flink or KSQL) aggregates per shortcode in 1-minute windows.
-- Aggregate writes to a counter store (Redis INCR is fine for the rolling count; ClickHouse for the time series).
+
+- Redirect emits an event to Kafka: `{shortcode, ts, ip_hash, ua_hash}`.
+- A streaming job (Flink, ksqlDB) aggregates per shortcode in 1-minute windows.
+- Aggregates written to a counter store (Redis `INCR` for the rolling total, ClickHouse for the time series).
 - UI queries the counter store, not the primary DB.
 
-Consistency: eventually consistent, 1-2 minutes behind. Fine for 99% of cases. If someone wants real-time-exact, point them at the raw Kafka stream and explain the cost.
+Consistency: eventually consistent, 1 to 2 minutes behind real time. Fine for almost every use case. If a customer needs real-time-exact counts, point them at the Kafka stream directly and explain the cost.
 
 **6. Custom domains.**
 
-`shrt.acme.com/abc1234` instead of `shrt.ly/abc1234`. Changes:
+`shrt.acme.com/abc1234` instead of `shrt.ly/abc1234`. What changes:
 
-- TLS. Need a wildcard or per-customer cert. Either provision via Let's Encrypt automation per domain, or use a wildcard cert across a domain you own.
-- Routing. Load balancer SNI-routes incoming TLS to the URL Service. The service reads the Host header and looks up which tenant owns it.
-- Database. Add a `tenant_id` column to `short_links`, and a `custom_domains` table mapping domain to tenant. Shortcodes are now scoped per tenant; the same `abc1234` can exist for two tenants.
-- Migration. Existing shortcodes get an implicit `tenant_id = 0` (the default shrt.ly tenant). All new schema queries scope by tenant.
-- DNS. Customer CNAMEs their domain to your LB. You handle the rest.
+- **TLS.** Per-customer or wildcard cert. Let's Encrypt automation per domain works for most.
+- **Routing.** Load balancer SNI-routes the TLS connection to the URL Service. The service reads the `Host` header and looks up which tenant owns it.
+- **Database.** Add `tenant_id` to `short_links`, and a `custom_domains` table mapping domain to tenant. Shortcodes are now scoped per tenant. The same `abc1234` can exist for two tenants.
+- **DNS.** Customer adds a CNAME from their domain to your load balancer.
+
+Real-world: this is how every URL shortener supports paid plans. The base shortener is the loss leader; custom domains are the upsell.
 
 **7. Link expiration with retention.**
 
-Three states: `active`, `expired`, `deleted`. Distinct because:
-- Expired links return 410, but the row stays for analytics ("how many clicks before it expired?").
-- Deleted links are gone. You may even hash-blank the long_url for GDPR.
+Three states: `active`, `expired`, `deleted`.
 
-Cache TTL is independent of the link's `expires_at`. A nightly batch job sets `status=2 (expired)` on rows where `expires_at < now()`. Cache entries expire naturally and the re-fetch picks up the new status.
+- Expired links return 410. The row stays for analytics ("how many clicks did this campaign get before it expired?").
+- Deleted links are gone. For GDPR you may even null out `long_url`.
 
-For storage: keep expired rows in cold storage tables. Move to S3 after 6 months. Analytics retains references.
+A nightly job sets `status = expired` on rows where `expires_at < now()`. Cache entries naturally expire and the next fetch picks up the new status. No special invalidation needed.
+
+For old data: keep expired rows in cold storage tables. Move to S3 after 6 months. Click analytics retains shortcode references but not the full row.
 
 **8. Thundering herd on cache miss.**
 
-A popular URL's cache entry expires. Suddenly 10k req/s hit the DB for that one row. The DB CPU spikes.
+A popular URL's cache entry expires. 10K concurrent requests all hit the DB for the same row. CPU spikes.
 
-Mitigations:
-- Jittered TTLs. Top 1% of keys should not expire in the same second.
-- Request coalescing. On a cache miss, the URL Service grabs a per-key in-process lock. The first request fetches from DB and populates cache; the rest wait on the lock and read the populated value. 10k concurrent misses become 1 DB read.
-- Stale-while-revalidate. Serve the stale value while one goroutine refreshes. The same idea as HTTP `stale-while-revalidate`, implemented at the cache layer.
+Three fixes, all needed:
+
+- **Jittered TTL.** Don't let all the top 1% of keys expire in the same second. Add ±10% random jitter to every TTL.
+- **Request coalescing.** First request fetches from DB and populates the cache. Others wait on a per-key lock and read the populated value. 10K misses become 1 DB read.
+- **Stale-while-revalidate.** Serve the stale value while one background request refreshes. Same trick HTTP's `stale-while-revalidate` directive uses.
+
+> Real example: every CDN does this internally. Cloudflare's tiered caching coalesces concurrent origin fetches for the same key.
 
 **9. GDPR delete.**
 
 User asks for all their data deleted.
 
-- Find: scatter-gather across all 64 shards. `WHERE creator_id = ?` runs in parallel; results are unioned.
-- Delete or anonymize: either DELETE the rows, or NULL out `long_url`, `creator_id`, and set `status=4 (gdpr_deleted)`. Keep the shortcode reservation so the code isn't reissued to someone else.
-- Click history: anonymize the analytics records too. Hash the user identifier; drop any PII (IP).
-- Cache: publish a pub/sub event to evict all of this user's keys from all caches.
-- Confirm completion to the user within the regulatory window (30 days in most jurisdictions).
+- **Find.** Scatter-gather across all 64 shards. `WHERE creator_id = ?` runs in parallel. Union the results.
+- **Delete or anonymize.** Either DELETE the rows, or NULL out `long_url`, `creator_id` and set `status = gdpr_deleted`. Keep the shortcode reservation so the code is not reissued.
+- **Click history.** Anonymize the analytics records. Hash or drop the user identifier and IP.
+- **Cache.** Publish a pub/sub event to evict all of this user's keys from every cache.
+- **Confirm.** Tell the user within the regulatory window (30 days under GDPR).
 
-The scatter-gather is the expensive part. If you expect many GDPR requests, maintain a secondary index from `creator_id` to all their shortcodes in a dedicated index table.
+If you expect many GDPR requests, maintain a `creator_id -> shortcode[]` secondary index in a dedicated table. Avoids the scatter-gather for the common case.
 
-**10. Counter coordinator misbehavior.**
+**10. Counter coordinator handed the same range twice.**
 
-Scenario: Redis (the coordinator) failed over, the replica had stale state, and it handed the range [10000, 20000] to instance A while instance B already had that range.
+The scariest 3am page. Two pods are minting the same codes. Some creates will collide on the DB unique constraint and 500.
 
-Detection:
-- Each URL Service writes a row to a `range_allocations` table at allocation time: `(range_start, range_end, instance_id, allocated_at)`.
-- A periodic job checks for overlapping ranges and alerts immediately.
+**Detection.** Every range allocation writes a row to a `range_allocations` ledger: `(range_start, range_end, instance_id, allocated_at)`. A periodic job (every minute) scans for overlapping ranges:
 
-Recovery:
-- For all overlapping IDs, scan the DB to find which (if any) actually got used. Mark the conflicts (at most a few hundred duplicates).
-- For each duplicate shortcode that ended up with two different `long_url` values: this is the disaster case. Decide whose long_url to honor. In practice, keep the earlier one and contact the second user to apologize and reissue.
-- Tighten the coordinator: never run a single coordinator without a strongly-consistent backing store. Use Postgres with a sequence, or ZooKeeper, instead of Redis.
+```sql
+SELECT a.*, b.*
+  FROM range_allocations a, range_allocations b
+ WHERE a.range_start < b.range_end
+   AND b.range_start < a.range_end
+   AND a.instance_id != b.instance_id;
+```
 
-A real "what would you do at 3am" scenario. The senior answer covers detection, recovery, and prevention in one breath. The mid-level answer only covers prevention.
+Non-empty result, page immediately.
 
-### 12. Trade-offs worth saying out loud
+**Recovery.** Scan the conflicting range against the actual short_links table. Find which IDs got minted by both pods. For each duplicate that ended up with a different `long_url` (the disaster case): keep the earlier one, contact the second user, reissue with a new shortcode.
 
-- Why no multi-master DB. You could use DynamoDB Global Tables or Spanner. The write-latency cost and operational complexity are rarely worth it at URL-shortener traffic. Single-primary with read replicas is the right answer at this scale.
-- Why not blockchain or content-addressed storage. Sometimes asked as a curveball. Answer: deterministic hash-addressed URLs lose the ability to change targets (for moderation). Mutability is a feature here.
-- Why no analytics database optimization upfront. Premature. Ship the basic Kafka to ClickHouse pipeline. Optimize after you see real query patterns.
-- What I'd revisit at 10x scale:
- - Move counter allocation entirely client-side with a Snowflake-style ID (machine ID + timestamp + sequence). Coordinator gone.
- - Adopt a tiered cache (in-process LRU, regional Redis, DB) explicitly, not as an emergent property.
- - Re-evaluate the DB. Postgres at 64 shards is workable but Cassandra or DynamoDB starts winning on operations.
+**Prevention.** Never run the coordinator on plain Redis. Back it with Postgres (a real sequence) or ZooKeeper (designed for this). The cost of Redis failover during a primary swap is sometimes "the replica is stale by N seconds." For a counter, that means handing out the same N seconds worth of IDs twice.
 
-### 13. Common interview mistakes
+The mid-level answer covers only prevention. The senior answer covers detection, recovery, and prevention in one breath.
 
-- Diving straight into "use Redis and a database." No clarification, no math, no API. Loses the candidate immediately.
-- Hashing the long URL with MD5 and assuming no collisions. Birthday paradox: at 6B URLs you'll have lots. Either acknowledge the collision handling or use a counter.
-- Ignoring analytics. Click counts are part of every URL shortener. A senior candidate mentions the async pipeline even if not asked.
-- Cache invalidation hand-wave. "We'll just use TTLs" is fine for routine eviction but doesn't cover blocked links needing immediate revocation. Mention the pub/sub eviction.
-- No mention of phishing. It's a real operational issue. Acknowledge it.
-- Over-engineering. Don't propose a globally distributed multi-master CRDT-backed KV store unless asked. Match the design to the stated scale.
-- Ignoring the hot-key problem. You'll be asked. Read replicas and in-process caches are the answers.
+---
 
-If you hit 8 of those 13, you're interviewing well.
+### 13. Trade-offs worth saying out loud
+
+**Why not a multi-master database.** DynamoDB Global Tables or Spanner would let writes happen in every region. The write-latency tax and operational complexity are rarely worth it at URL-shortener traffic (38 writes per second). Single-primary with read replicas is the right answer at this scale.
+
+**Why not content-addressed (hash) URLs.** Sometimes asked as a curveball. If shortcodes are hashes of the long URL, you cannot ever change the target. Mutability is a feature here. You need it for moderation, for phishing, for legal takedowns.
+
+**Why YAML/config for nothing.** Unlike workflow engines, a URL shortener doesn't need user-defined logic. The whole product fits in one schema. Don't invent a DSL.
+
+**What you would revisit at 10x scale.**
+- Snowflake-style IDs to remove the counter coordinator entirely.
+- Tiered cache (in-process LRU, regional Redis, DB) as an explicit design, not emergent.
+- Reevaluate Postgres at 64 shards. Cassandra or DynamoDB starts winning on operational cost at that point.
+
+---
+
+### 14. Common mistakes
+
+Most weak answers fall into one of these:
+
+**Diving straight into "use Redis and a database."** No clarification, no math, no API. Loses the interviewer immediately.
+
+**Hashing the long URL with MD5 and assuming no collisions.** Birthday paradox. At 6 billion URLs you will have many. Either acknowledge the collision-handling cost or use a counter.
+
+**Using 301 instead of 302.** Browsers cache 301s forever. You lose the ability to block phishing, change targets, or count clicks at the service. 302 is correct.
+
+**Ignoring click analytics.** Every URL shortener has them. A senior candidate mentions the async pipeline even if not asked.
+
+**Hand-waving cache invalidation.** "We'll use TTLs" is fine for routine eviction but does not cover blocked links that need immediate revocation. Mention pub/sub eviction.
+
+**No mention of phishing.** It is a real operational issue. Acknowledge it.
+
+**Over-engineering.** Don't propose a globally distributed multi-master CRDT-backed KV store unless the numbers demand it. They don't.
+
+**Ignoring the hot key problem.** You will be asked. Layered caching is the answer.
+
+**No story for the counter coordinator failure.** This is where senior candidates separate from mid-level ones.
+
+If you hit 7 of these 9 cleanly, you are interviewing at staff level. The three that matter most: 302 vs 301, the layered hot-key defense, and the counter coordinator failure recovery. Those are the answers a senior architect listens for.

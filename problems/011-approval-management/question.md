@@ -9,307 +9,289 @@ solution: solution.md
 
 ## The scene
 
-You sit down. The interviewer slides a sheet of paper across the table.
+You sit down. The interviewer smiles and says:
 
-> *"Every company has approval flows. A purchase order needs your manager and finance to sign off. A leave request goes to your boss. An expense report goes to your boss, then to finance, then back to your boss if finance pushes back. Design one service that handles all of these."*
+> *"Think of the last time you asked your boss for time off. You filled in a form, your boss clicked Approve, you got the days. Easy."*
+>
+> *"Now imagine the same company also approves expenses, purchase orders, code reviews, and contract signatures. Different rules, different approvers, but the basic shape is the same: someone asks, someone decides. Design one service that handles all of them."*
 
-Then they smile and say: *"Start small. Build it for a 50-person startup first. Then we'll scale it up."*
+That is the question. It sounds tiny. It is not.
 
-It looks easy. It is not. The trap is the word "approval." It sounds like a single checkbox. The real problems are different: How do new teams add new workflow types without redeploying? What happens when an approver leaves the company while their task is sitting in the queue? How do you stop someone from approving their own request? And how do you keep a record an auditor can trust five years from now?
+Here is the trap. The word "approval" sounds like a single checkbox. The real questions are different:
 
-We will walk this from a 50-person startup to a 100,000-person enterprise. At every step we will name what breaks first, then add the smallest fix that solves it.
+- What happens when the approver is on vacation?
+- What if they never respond?
+- What if they quit the company while your request is still pending?
+- How do you stop a person from approving their own request?
+- And five years from now, when an auditor knocks, how do you prove who approved what?
 
----
-
-## Step 1: Ask the right questions
-
-Before you draw anything, sit for five minutes. Write down questions you would ask the interviewer.
-
-A good answer here is not "10 questions about every edge case." It is the small handful of questions that change the design if answered differently.
-
-<details markdown="1">
-<summary><b>Show: 8 questions that matter</b></summary>
-
-1. **One workflow type, or many?** Just leave requests? Or also expenses, POs, code reviews? *(Almost always "many." This is the biggest decision in the design.)*
-2. **Who writes the workflows?** Engineers in code? Or HR admins in a UI? *(Determines if you need a workflow definition store + UI + versioning.)*
-3. **Can a step do anything besides "wait for human"?** Auto-approve under $100? Call an external API? Wait 24 hours? *(Tells you if you're building a state machine or a real workflow engine.)*
-4. **Parallel or serial only?** Can a step wait for three managers in parallel and need all three? Or any two of three? *(Hard to retrofit if you build serial-only.)*
-5. **What about vacation?** If Alice is out, does her approval auto-route to Bob? *(Delegation is the single biggest source of production bugs.)*
-6. **What if nobody acts?** If the approver is silent for 48 hours, do we auto-approve? Escalate to their boss? Page someone? *(This is the SLA layer.)*
-7. **Audit retention?** How long do we keep the records? SOX needs 7 years. Healthcare needs longer.
-8. **What is NOT in scope?** Payment execution? Budget reservation? Contract signing? *(All downstream. The engine just emits "approved" and someone else acts.)*
-
-A strong candidate also asks the meta question: *"Is the notification system part of this design, or separate?"* The right answer is separate. The engine emits events. The notification service consumes them.
-
-</details>
+We will start with the simplest version that works for ten people. Then we will add one pressure at a time and watch the design grow.
 
 ---
 
-## Step 2: How big is this thing?
+## Step 1: What is an approval, really?
 
-Same problem, two scales. Do the math.
+Before any system design, picture the smallest possible approval. One person asks. One person decides. Three outcomes.
 
-**At a 50-person startup:**
-
-- 50 employees
-- ~5 approval requests per person per week
-- 1 to 3 approvers per request
-
-**At a 100,000-person enterprise:**
-
-- Same per-person rate
-
-Compute four numbers for each scale: requests per day, requests per second, decisions per day, active requests in flight at any moment.
-
-<details markdown="1">
-<summary><b>Show: the math</b></summary>
-
-**Startup (50 people):**
-
-- 50 × 5 = 250 requests/week ≈ **36 requests/day**. One every 40 minutes during business hours. Tiny.
-- Decisions: 36 × 2 approvers ≈ 72/day.
-- Active at any moment: ~50 to 70 in flight.
-
-You could literally run this on a Google Sheet and a cron job. But we're not going to, because we're scaling it up.
-
-**Enterprise (100,000 people):**
-
-- 100k × 5 = 500k/week ≈ **71,000 requests/day** ≈ **1 per second steady**, **3 per second at peak**.
-- Decisions: 71k × 3 approvers (enterprise flows are longer) ≈ 210k/day ≈ **3 per second**.
-- Active at any moment: 71k/day × ~3 day average lifecycle ≈ **200,000 in flight**.
-
-**What the math is telling you:**
-
-The numbers are small. Tiny, even, compared to Twitter or YouTube. A single Postgres can handle the writes.
-
-The real problem at enterprise scale is not throughput. It is **organizational complexity**: 5,000 different workflow types, 50,000 different approver roles, hundreds of downstream integrations. The architecture exists to handle that, not the QPS.
-
-Also: reads beat writes by 25 to 1. Every employee opens their dashboard ~10 times per day to check status. The read path matters more than the write path.
-
-</details>
-
----
-
-## Step 3: How do you describe a workflow?
-
-This is the central decision. Before you draw any boxes, decide how a workflow is described.
-
-Why does this matter? If you hardcode the leave-request workflow in Python, then expense reports need a new service. So does PO approval. So does code review. You end up with 20 services, each one a near-copy of the others.
-
-The fix: workflows are **data**, not code. The engine reads the data and runs it.
-
-Here is a workflow for leave requests, written in YAML. A few pieces are missing. See if you can guess what goes in the `[ ? ]` spots.
-
-```yaml
-workflow: leave_request
-version: 3
-
-inputs:
-  - employee_id: string
-  - start_date: date
-  - end_date: date
-  - days: int
-
-steps:
-
-  # Short leaves don't need anyone's approval.
-  - id: auto_approve_short
-    when: [ ? ]                       # condition: leaves under 3 days
-    action: approve
-
-  # Manager approves anything 3 days or longer.
-  - id: manager_approval
-    after: auto_approve_short
-    type: approval
-    approver: "{{ employee.manager }}"
-    timeout: [ ? ]                    # how long before we escalate?
-    on_timeout: [ ? ]                 # what happens then?
-    on_delegation: [ ? ]              # if manager is out, who acts?
-
-  # Long leaves also need HR + grandboss approval, in parallel.
-  - id: hr_and_grandboss
-    after: manager_approval
-    when: days > 14
-    type: [ ? ]                       # parallel or serial?
-    branches:
-      - approver: "{{ employee.manager.manager }}"
-      - approver: "hr-leave-admin"
-    quorum: [ ? ]                     # all? any one? two of three?
-
-  - id: finalize
-    after: hr_and_grandboss
-    type: terminal
-    state: approved
+```mermaid
+stateDiagram-v2
+    [*] --> Requested
+    Requested --> Pending: assigned to approver
+    Pending --> Approved: approver clicks Approve
+    Pending --> Rejected: approver clicks Reject
+    Approved --> [*]
+    Rejected --> [*]
 ```
 
+That is the whole product, in one picture. Everything we add later (multiple approvers, vacations, deadlines, audit) is a complication on top of this.
+
+If you remember nothing else from this problem, remember: **an approval service is a small state machine, asked to run a lot of times, by a lot of people, on a lot of different shapes of request.**
+
+---
+
+## Step 2: Ask the right questions
+
+In a real interview you should sit quietly for two minutes and write down what you want to ask. Not twenty questions. Five good ones.
+
 <details markdown="1">
-<summary><b>Show: the filled-in workflow</b></summary>
+<summary><b>Show: 5 questions that change the design</b></summary>
+
+1. **One workflow, or many?** Just leave requests? Or also expenses, POs, contracts? *Almost always many. This is the biggest decision in the whole design.*
+2. **Who writes the workflow rules?** Engineers in code, or HR admins in a UI? *If non-engineers write them, you need a definition store, a UI, and versioning.*
+3. **What about vacation?** If Alice is out, does her approval auto-route to Bob? *Delegation is the single biggest source of production bugs.*
+4. **What if nobody responds?** Auto-approve after 48 hours? Escalate? Page someone? *This is the SLA layer.*
+5. **How long do we keep the records?** SOX needs 7 years. Healthcare needs longer.
+
+A strong candidate also asks the meta question: *"Is sending the notifications part of this service, or a separate one?"* The right answer is separate. The engine emits events. A notification service consumes them.
+
+</details>
+
+---
+
+## Step 3: How big is this thing?
+
+Same problem, two scales.
+
+| Scale | Employees | Requests/day | Per second | Active in flight |
+|-------|-----------|--------------|------------|------------------|
+| Startup | 50 | ~36 | tiny | 50 to 70 |
+| Enterprise | 100,000 | ~71,000 | ~1 steady, ~3 peak | ~200,000 |
+
+<details markdown="1">
+<summary><b>Show: how the numbers come out</b></summary>
+
+Assume each person creates about 5 approval requests per week.
+
+**Startup (50 people).** 50 × 5 = 250 requests/week ≈ **36 per day**. One every 40 minutes. A Google Sheet could handle this.
+
+**Enterprise (100,000 people).** 100k × 5 = 500k/week ≈ **71,000 per day** ≈ **1 per second steady, 3 per second at peak**. Each request lives about 3 days on average, so ~200,000 are open at any moment.
+
+**What the math is telling you.** The throughput is small. A single Postgres handles it. The real problem at enterprise scale is not requests per second, it is **organizational complexity**: thousands of workflow types, tens of thousands of approver roles, hundreds of downstream integrations.
+
+Also: reads beat writes 25 to 1. Every employee opens their dashboard ~10 times a day to check status. The read path matters more than the write path.
+
+</details>
+
+---
+
+## Step 4: Build the simplest version that works
+
+Forget enterprise for a moment. We are a 10-person startup. One workflow: leave requests. Manager approves. Done.
+
+Picture the flow:
+
+```mermaid
+sequenceDiagram
+    participant Alice as Alice (employee)
+    participant App as Approval Service
+    participant DB as Database
+    participant Bob as Bob (manager)
+
+    Alice->>App: Submit leave request
+    App->>DB: Save request (state: pending)
+    App->>Bob: Email "please approve"
+    Bob->>App: Click Approve
+    App->>DB: Update state (approved)
+    App->>Alice: Email "approved"
+```
+
+That is it. A web form, a database table with five columns, and an email. You could build it in a weekend.
+
+<details markdown="1">
+<summary><b>Show: the database table</b></summary>
+
+```sql
+CREATE TABLE leave_requests (
+    id              UUID PRIMARY KEY,
+    employee_id     TEXT NOT NULL,
+    manager_id      TEXT NOT NULL,
+    start_date      DATE,
+    end_date        DATE,
+    state           TEXT NOT NULL,    -- 'pending', 'approved', 'rejected'
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    decided_at      TIMESTAMPTZ
+);
+```
+
+Five columns. Tiny. This is the right place to start. Everything we add from here is in response to a real problem.
+
+</details>
+
+This is the version most candidates would draw on the whiteboard. It is correct. The interesting part of the interview is what happens next.
+
+---
+
+## Step 5: Then what breaks?
+
+The next morning the CFO walks in: *"Can your team also handle purchase order approvals? Same idea, but anything over $5k also needs finance to sign off."*
+
+You look at your code. The word `leave_request` is everywhere. If you copy-paste a `purchase_orders` table, you are going to copy-paste another five tables this year. Each one a near-copy of the last. Each one slightly different.
+
+This is the trap. The fix is one idea: **stop hardcoding the workflow. Treat it as data.**
+
+A workflow becomes a small recipe the engine reads:
+
+```
+leave_request:
+   step 1: ask the employee's manager
+   step 2: done
+
+purchase_order:
+   step 1: ask the employee's manager
+   step 2: if amount > $5,000, also ask finance
+   step 3: done
+```
+
+Same engine. Different recipe. New workflows take five minutes, no deploy.
+
+<details markdown="1">
+<summary><b>Show: a workflow written as YAML</b></summary>
 
 ```yaml
 workflow: leave_request
 version: 3
 
-inputs:
-  - employee_id: string
-  - start_date: date
-  - end_date: date
-  - days: int
-
 steps:
-
   - id: auto_approve_short
     when: days < 3
     action: approve
 
   - id: manager_approval
-    after: auto_approve_short
     type: approval
     approver: "{{ employee.manager }}"
     timeout: 48h
-    on_timeout: escalate              # send to manager's manager
-    on_delegation: follow             # if Alice is OOO with delegate Bob, route to Bob
+    on_timeout: escalate
 
   - id: hr_and_grandboss
-    after: manager_approval
     when: days > 14
     type: parallel
     branches:
       - approver: "{{ employee.manager.manager }}"
       - approver: "hr-leave-admin"
-    quorum: all                       # both must approve
-
-  - id: finalize
-    after: hr_and_grandboss
-    type: terminal
-    state: approved
+    quorum: all
 ```
 
-The language has to support five things, and each one maps to a real-world problem:
+A workflow language needs to support five things, and each one maps to a real problem:
 
-1. **Conditional steps (`when:`).** Auto-approve short leaves. Skip finance for tiny POs. Every real workflow needs this.
-2. **Timeouts (`timeout:` + `on_timeout:`).** Humans miss things. Without timeouts, your queue grows forever.
-3. **Delegation (`on_delegation:`).** Vacation happens. The engine has to follow the chain (Alice → Bob → Carol if Bob is also out) without looping forever.
-4. **Parallel with quorum.** Code review needs 2 of 3 senior approvals. Some signoffs need *all* department heads. Cannot be retrofitted onto a serial-only engine.
-5. **Roles, not just users.** If you write `approver: "hr-leave-admin"` and that role's current member leaves the company, the workflow still works. The engine resolves the role to a real person at runtime.
+1. **Conditional steps (`when:`).** Auto-approve short leaves. Skip finance for tiny POs.
+2. **Timeouts (`timeout:` + `on_timeout:`).** Humans miss things. Without timeouts your queue grows forever.
+3. **Delegation.** Vacation happens. The engine has to follow the chain without looping.
+4. **Parallel with quorum.** Code review needs 2 of 3 senior approvals. Some signoffs need *all* department heads.
+5. **Roles, not just users.** If `hr-leave-admin` quits, the workflow still works. The engine resolves the role to a real person at runtime.
 
-**Why YAML and not Python.** Most workflow authors are HR admins, finance leads, ops people. Not engineers. They edit through a UI that produces YAML. The engine reads YAML and runs it. Adding a new workflow takes 5 minutes and zero deploys.
-
-**Why the `version` field is sacred.** When this request was created, the workflow was on v3. Even if v4 ships tomorrow, this request keeps running on v3. Forever. Otherwise running requests change shape mid-flight, and audit becomes impossible.
+The `version` field matters. When this request was created, the workflow was on v3. Even if v4 ships tomorrow, this request keeps running on v3, forever. Otherwise the shape of running requests changes mid-flight and audit becomes a nightmare.
 
 </details>
 
 ---
 
-## Step 4: Draw the system
+## Step 6: The system, drawn out
 
-You know how a workflow is described. Now draw the boxes that run it.
+Now we have an engine that reads workflow definitions and runs them. Here is the whole architecture.
 
-Try to fill in the missing pieces below. Eight boxes are missing. Think about: where do requests come in, where do workflow YAMLs live, what runs the workflow, where do decisions go, who knows the org chart, who feeds notifications, where does audit live, and what does the dashboard read from.
+```mermaid
+flowchart TB
+    Client["Client<br/>web, mobile, Slack bot"]
+    Gateway["API Gateway<br/>auth · rate limit · idempotency"]
+    Engine["Workflow Engine<br/>reads definitions, runs state machine"]
+    Read["Read Service<br/>fast 'my pending tasks' dashboard"]
+    Defs[("Workflow Definitions<br/>YAML, versioned, immutable")]
+    Org["Org Service<br/>manager-of, role members, OOO + delegation"]
+    DB[("Postgres<br/>requests · tasks · decisions · audit")]
+    Kafka{{"Kafka<br/>approval.* events"}}
+    Notify["Notification Service"]
+    Integ["Downstream Integrations<br/>NetSuite, Workday"]
+    Audit[("Audit Cold Tier<br/>S3 + Athena, 7-year retention")]
 
-```
-            Client (web, mobile, Slack bot)
-                       │
-                       ▼
-              ┌─────────────────┐
-              │   [ ? ]         │  auth, rate limit, idempotency
-              └────┬───────┬────┘
-                   │       │
-      create       │       │      read dashboard
-                   │       │
-                   ▼       ▼
-       ┌─────────────┐  ┌─────────────┐
-       │   [ ? ]     │  │   [ ? ]     │  fast reads for "my pending"
-       │  runs the   │  │             │
-       │  workflow   │  └─────────────┘
-       └─┬─┬─┬───────┘
-         │ │ │
-         │ │ └────► [ ? ]   resolves roles, handles vacation
-         │ │
-         │ └─────► [ ? ]    stores workflow YAML, versioned
-         │
-         ▼
-       ┌─────────────┐
-       │   [ ? ]     │  source of truth: requests, tasks, decisions
-       └──────┬──────┘
-              │
-              ▼
-       ┌─────────────┐
-       │   [ ? ]     │  append-only, queryable for years
-       └─────────────┘
-
-       Events stream out:
-       ┌─────────────┐
-       │   [ ? ]     │  feeds notifications, integrations, analytics
-       └─────────────┘
+    Client --> Gateway
+    Gateway -->|create| Engine
+    Gateway -->|read dashboard| Read
+    Engine --> Defs
+    Engine --> Org
+    Engine --> DB
+    Read --> DB
+    DB -->|CDC / outbox| Kafka
+    Kafka --> Notify
+    Kafka --> Integ
+    Kafka --> Audit
 ```
 
-<details markdown="1">
-<summary><b>Show: the full architecture</b></summary>
+What each box does, in one line:
 
-```
-            Client (web, mobile, Slack bot)
-                       │
-                       ▼
-              ┌─────────────────┐
-              │  API Gateway    │   auth, rate limit, idempotency
-              └────┬───────┬────┘
-                   │       │
-      create       │       │      read dashboard
-                   │       │
-                   ▼       ▼
-       ┌─────────────┐  ┌──────────────────┐
-       │  Workflow   │  │  Read Service    │   denormalized cache,
-       │  Engine     │  │  ("my pending"   │   serves dashboards
-       │             │  │   in <50ms)      │   in <50ms
-       └─┬─┬─┬───────┘  └────────┬─────────┘
-         │ │ │                    │
-         │ │ └─────► Org Service  │  manager-of, role members,
-         │ │        (HRIS proxy)  │  OOO + delegation
-         │ │
-         │ └────► Workflow Defs   │  YAML, versioned, immutable
-         │
-         ▼                        │
-       ┌──────────────────────────┘
-       │  Postgres
-       │   requests
-       │   tasks (one per pending action)
-       │   decisions (immutable)
-       │   audit_log (recent 90 days)
-       └──────────┬───────────────
-                  │
-                  │  CDC / outbox
-                  ▼
-       ┌──────────────────┐
-       │  Kafka topics    │   approval.request.created
-       │  approval.*      │   approval.task.assigned
-       │                  │   approval.decision.recorded
-       │                  │   approval.request.finalized
-       └──┬──────────┬────┘
-          │          │
-          ▼          ▼
-     Notification   Integrations    Audit cold tier
-     Service        (NetSuite,      (S3 + Athena,
-     (email, Slack) Workday)        7-year retention)
-```
+- **API Gateway.** Authenticates the caller, rate-limits bots, dedupes retries.
+- **Workflow Engine.** The brain. Reads the current state, decides what is next, assigns the next task. Stateless. State lives in Postgres.
+- **Workflow Definitions.** Where the YAML recipes live. Versioned. New versions never overwrite old ones.
+- **Org Service.** Knows Alice's manager is Bob, that Bob is on vacation, and that Carol is his delegate. Usually a thin layer over Workday or BambooHR.
+- **Postgres.** Source of truth. Small live state, plus an append-only audit log for the last 90 days.
+- **Read Service.** Optimized for the dashboard. Reads from a Redis cache populated by engine events. Lets the primary DB rest.
+- **Kafka.** Carries events out to the side-effect world: notifications, downstream syncs, analytics, audit archival.
+- **Audit cold tier.** Older audit rows in S3, queryable by Athena for years.
 
-What each piece does, in one line:
-
-- **API Gateway.** Auth (who is this), rate limit (no bots), idempotency (mobile retried submit).
-- **Workflow Engine.** The brain. Reads the current state, decides what's next, assigns the next task.
-- **Workflow Definition Store.** Where YAML lives. Versioned. New versions never overwrite old ones.
-- **Org Service.** Knows Alice's manager is Bob, who is on vacation, with Carol as delegate. Usually a thin layer over Workday or BambooHR.
-- **Postgres.** Source of truth. Three small tables for the live state, one append-only table for audit.
-- **Read Service.** Optimized for "show me my dashboard." Reads from Redis cache populated by engine events. Avoids hammering the primary DB.
-- **Audit Log.** Append-only. Recent 90 days in Postgres, older in S3. 7-year retention.
-- **Kafka.** Decouples the engine from the side-effect world (notifications, downstream syncs, analytics).
-
-</details>
+Notice what is *not* in the write path: notifications, downstream integrations, audit archival. They are all consumers of Kafka events. If the notification service dies at 3am, new approvals still flow. Emails just queue up.
 
 ---
 
-## Step 5: The vacation problem (delegation)
+## Step 7: One request, end to end
 
-The workflow YAML says `approver: "{{ employee.manager }}"`. That's a template. The engine has to turn it into a real person before it can assign a task.
+Picture Alice submitting a leave request, all the way through.
+
+```mermaid
+sequenceDiagram
+    participant Alice
+    participant API as API Gateway
+    participant Engine
+    participant Org as Org Service
+    participant DB as Postgres
+    participant Kafka
+
+    Alice->>API: POST /requests (leave, 5 days)
+    API->>Engine: forward (auth ok)
+    Engine->>Org: who is Alice's manager?
+    Org-->>Engine: Bob (and Bob is in office)
+    Engine->>DB: BEGIN TX
+    Engine->>DB: INSERT request
+    Engine->>DB: INSERT task (assignee=Bob)
+    Engine->>DB: INSERT audit_log
+    Engine->>DB: COMMIT
+    Engine->>Kafka: emit task.assigned
+    Engine-->>API: 201 Created
+    API-->>Alice: request id
+
+    Note over Kafka: ...later...
+    Kafka->>Alice: notification service emails Bob
+```
+
+Three details worth pointing at:
+
+1. The request, the task, and the audit row are all written in **one database transaction**. Either all three exist, or none do. Crashes mid-write roll back cleanly.
+2. The engine writes the event to Kafka *after* the transaction commits. Notifications, integrations, and audit archival fan out from there.
+3. The engine itself is stateless. Restart it in the middle of the day. The next request lands on a different pod and works fine.
+
+---
+
+## Step 8: The vacation problem (delegation)
+
+The workflow says `approver: "{{ employee.manager }}"`. The engine has to turn that template into a real person before it can assign a task.
 
 That sounds simple. Let's see why it isn't.
 
@@ -321,73 +303,98 @@ That sounds simple. Let's see why it isn't.
 
 Who gets the task?
 
-<details markdown="1">
-<summary><b>Show: how to resolve the approver safely</b></summary>
+```mermaid
+flowchart TD
+    Start([Start with Bob])
+    Bob{Bob OOO?}
+    Carol{Carol OOO?}
+    Dave{Dave OOO?}
+    Assign[Assign task to Dave]
+    Cycle[/Detect cycle, alert/]
 
-The answer is Dave. But getting there safely takes a small algorithm.
+    Start --> Bob
+    Bob -- no --> AssignBob[Assign task to Bob]
+    Bob -- yes, delegate is Carol --> Carol
+    Carol -- no --> AssignCarol[Assign task to Carol]
+    Carol -- yes, delegate is Dave --> Dave
+    Dave -- no --> Assign
+    Dave -- yes, delegate is Bob --> Cycle
+```
+
+The engine walks the chain. Three safety rails make it production-safe:
+
+1. **Cap the depth** (max 5 hops). Otherwise an HR mistake can recurse forever.
+2. **Track visited users**. If the chain loops back to someone already seen, stop and raise an alert.
+3. **Record the chain on the task.** Dave's dashboard then shows *"You are approving on behalf of Bob, via Carol."* Audit shows the same chain.
+
+<details markdown="1">
+<summary><b>Show: the resolver, written out</b></summary>
 
 ```python
 def resolve_approver(spec, requester, when):
-    # Step 1: turn the template into a target.
     target = render_template(spec, {"employee": requester})
 
-    # Step 2: if it's a role like "hr-admin", pick an actual person.
     if is_role(target):
         members = org.role_members(target, at=when)
         if not members:
             raise NoApproverFound(target)
         target = pick_round_robin(members)
 
-    # Step 3: follow the vacation chain, with safety guards.
     return follow_delegation(target, when, depth=0, visited=set())
 
 
 def follow_delegation(user, when, depth, visited):
-    if depth > 5:                           # don't follow more than 5 hops
+    if depth > 5:
         raise DelegationTooDeep(user)
-    if user.id in visited:                  # Alice → Bob → Alice = cycle
+    if user.id in visited:
         raise DelegationCycle(visited)
     visited.add(user.id)
 
-    if not user.exists:                     # user left the company
+    if not user.exists:
         return fallback_for_departed(user)
 
     ooo = org.get_active_ooo(user, at=when)
     if ooo is None or ooo.delegate is None:
-        return user                         # found a live approver
+        return user
     return follow_delegation(ooo.delegate, when, depth + 1, visited)
 ```
 
-Four real-life cases this handles cleanly:
-
-| Case | Result |
-|------|--------|
-| Bob is in | Returns Bob |
-| Bob OOO → Carol (Carol in) | Returns Carol |
-| Bob OOO → Carol OOO → Dave (Dave in) | Returns Dave |
-| Bob OOO → Carol OOO → Bob (cycle) | Raises error, assigns to Bob anyway with a warning |
-
-The `when` parameter looks redundant but it is the key to audit replay. To rebuild who *would have been* the approver back when this request was created, you need a point-in-time view of the org chart. People change jobs. Delegations expire. Roles get reassigned.
-
-One last detail: when the engine assigns to Dave (after a Bob → Carol → Dave chain), it stores the chain on the task as `assigned_via`. Dave's dashboard then shows *"You are approving on behalf of Bob, via Carol."* The audit log records the full chain. Five years later, an auditor can see exactly how the approval reached Dave.
+The `when` parameter looks redundant but is the key to audit replay. To rebuild who *would have been* the approver back when this request was created, you need a point-in-time view of the org chart. People change jobs. Delegations expire. Roles get reassigned.
 
 </details>
 
 ---
 
-## Step 6: The audit trail (why it must be unbreakable)
+## Step 9: The audit trail
 
-Five years from now, an auditor will ask you: *"Show me every approval decision on purchase orders over $50,000 in Q3 2024."*
+Five years from now an auditor will ask: *"Show me every approval decision on purchase orders over $50,000 in Q3 2024."*
 
 By then:
-- The people who made those decisions may have left
-- The workflow definitions have changed many times
-- The approvers' roles have been reorganized
 
-How does your system answer the question?
+- The people who made those decisions may have left.
+- The workflow definitions have changed many times.
+- The approvers' roles have been reorganized.
+
+Your system must still answer. That means audit is not a log file. It is a product.
+
+```mermaid
+flowchart LR
+    Engine[Workflow Engine] -->|every state change| Hot[("Hot audit<br/>Postgres<br/>last 90 days")]
+    Hot -->|nightly job| Cold[("Cold audit<br/>S3 Parquet<br/>up to 7 years")]
+    Hot -->|fast queries| API1[Audit API]
+    Cold -->|Athena queries| API1
+```
+
+Five rules you cannot break:
+
+1. **Append-only.** No UPDATE. No DELETE. Ever. The DB user that writes audit has INSERT-only privileges.
+2. **Snapshot in every row.** The request's full state at that moment, frozen. Lets you replay the request's life by walking events in order.
+3. **Workflow version pinned.** If `leave_request` is on v5 today and this request ran against v3, the audit row shows v3.
+4. **Who and on whose behalf.** If Carol approved as Bob's delegate, both names are recorded.
+5. **Hash chain for high-compliance industries.** Each event has `prev_hash` and `hash`. Tampering with one event invalidates every event after it. Required in healthcare and finance.
 
 <details markdown="1">
-<summary><b>Show: how to design the audit log</b></summary>
+<summary><b>Show: the audit_log schema</b></summary>
 
 ```sql
 CREATE TABLE audit_log (
@@ -396,7 +403,7 @@ CREATE TABLE audit_log (
     request_id        UUID NOT NULL,           -- referenced, not foreign key
     workflow_id       TEXT NOT NULL,
     workflow_version  INT NOT NULL,            -- pinned forever
-    event_type        TEXT NOT NULL,           -- request.created, decision.recorded, etc.
+    event_type        TEXT NOT NULL,
     actor             JSONB,                   -- {user, role, delegated_from}
     payload           JSONB NOT NULL,
     snapshot          JSONB                    -- request state at this moment
@@ -407,72 +414,24 @@ CREATE INDEX idx_audit_workflow  ON audit_log (workflow_id, occurred_at);
 CREATE INDEX idx_audit_actor     ON audit_log USING gin (actor);
 ```
 
-Five rules you cannot break:
-
-1. **Append-only.** No UPDATE. No DELETE. Ever. The DB user that writes audit has INSERT privilege only.
-2. **Snapshot in every row.** The request's state at that moment, frozen. Lets you replay the request's life by walking events in order.
-3. **Workflow version pinned.** If `leave_request` is on v5 today and this request ran against v3, the audit shows v3.
-4. **Who and on whose behalf.** If Carol approved as Bob's delegate, both names are recorded.
-5. **Hash chain (for high-compliance industries).** Each event has `prev_hash` and `hash`. Tampering with one event invalidates every event after it. Healthcare and finance often require this.
-
-**How long?** Default 7 years (SOX for US public companies). Two tiers of storage:
-
-- Last 90 days in Postgres for fast queries.
-- Older in S3 (Parquet format), queried via Athena when an auditor calls.
-- A nightly job moves rows from hot to cold.
-
-**Why a separate audit table at all?** The `requests` table holds *current* state, which gets overwritten on every transition. The audit holds *history*. Auditors need history, not current state. The two are different products in the same database.
+There is no foreign key to `requests`. On purpose. If a request is ever deleted (GDPR, mistaken bulk import), the audit must survive. Audit is the truth-of-record, not the requests table.
 
 </details>
 
 ---
 
-## Step 7: Four workflows, one engine
+## Step 10: Four workflows, one engine
 
 Here are four real workflows. The same engine, the same data model, the same audit log runs all of them. Each one stresses a different feature.
 
-For each, guess which engine feature it depends on most. Then check.
+| Workflow | What stresses the engine | The lesson |
+|----------|--------------------------|------------|
+| **Purchase order** ($12k for servers) | Conditional steps. Manager always approves. Finance if > $5k. CFO if > $25k. | The engine must evaluate `when:` at each step and skip cleanly. |
+| **Leave request** (21-day vacation) | Parallel approval with quorum. After manager, HR and grandboss in parallel. **Both** must approve. | Default quorum must be `all`, not `any`. Otherwise rubber-stamping is too easy. |
+| **Expense report** (finance asks for a missing receipt) | Backward transitions. Request rewinds to the requester, then forward again. | Engine needs explicit `return_to_step`. Pending downstream tasks must be cancelled when the request rewinds. |
+| **Code review** (PR with 2 approvals, new commit pushed) | External events. CI status must pass. New commits invalidate prior approvals. | Engine needs `on_input_change: invalidate_approvals` and the ability to react to non-human events. |
 
-**A. Purchase Order.** Engineer submits PO for $12,000 for servers. Workflow: manager approves. If amount > $5k, finance also approves. If amount > $25k, CFO approves too.
-
-**B. Leave Request.** The one we already built. Short leaves auto-approve. Medium leaves need manager. Long leaves need HR + grandboss in parallel.
-
-**C. Expense Report.** Submit receipts. Manager reviews. Finance reviews. Finance often says "receipt is missing, please resubmit." Request goes back to the requester, then forward again.
-
-**D. Code Review.** Pull request needs 2 approvals from senior engineers. Author cannot approve their own. CI must pass. If anyone requests changes, prior approvals are wiped when new commits land.
-
-<details markdown="1">
-<summary><b>Show: what each one teaches</b></summary>
-
-**A. Purchase Order: conditional branching.**
-
-The workflow has three potential approval steps. Only the ones that match the amount run. The engine evaluates `when:` at each step. A $12k PO hits manager + finance, skips CFO. A $30k PO hits all three.
-
-> *Common bug:* the workflow author writes `when: amount > 5000` in CFO too (copy-paste). A $6k PO needlessly goes to the CFO. Lint your workflow definitions.
-
-**B. Leave Request: parallel approval with quorum.**
-
-A 21-day leave goes to manager (one step), then in parallel to HR-admin AND grandboss. Both must approve. The engine creates two tasks at once and waits for both. If grandboss rejects, the whole request rejects, even if HR-admin already approved.
-
-> *Common bug:* default quorum is `any`. Now one approver rubber-stamps before the other has even seen it. Default should be `all`, require explicit `any` in YAML.
-
-**C. Expense Report: going backward.**
-
-Finance rejects. The request goes back to the requester (state: `returned_to_requester`). Requester edits, resubmits. Now what?
-
-Two options. Reset to start (manager re-approves from scratch). Or resume from manager (manager sees "Carol resubmitted with new receipts"). Most real systems do the second. The engine needs explicit `on_action: return_to_step(<step_id>)` support.
-
-> *Common bug:* when the request rewinds, finance's pending task is left orphan. The engine must close that task with reason `request_returned` so it disappears from finance's dashboard.
-
-**D. Code Review: invalidating on input change.**
-
-Two reviewers approve. Author pushes new commits. Do the approvals stick? GitHub says no (commits invalidate). The engine needs `on_input_change: invalidate_approvals`.
-
-> *Common bug:* "you cannot approve your own request" lives outside the workflow definition. The role-resolver must exclude the requester. Filter `approver != requester`.
-
-**The big idea.** One engine. One data model. One audit log. Four totally different workflows. If you instead built a separate `purchase_orders` service, you would also need a separate `leave_requests` service, then `expense_reports`, then `code_reviews`, then twenty more. That is the trap.
-
-</details>
+The big idea: one engine, four wildly different workflows, no special cases. If you instead built a separate `purchase_orders` service, you would also need a separate `leave_requests` service, then `expense_reports`, then `code_reviews`, then twenty more. That is the trap the design exists to avoid.
 
 ---
 

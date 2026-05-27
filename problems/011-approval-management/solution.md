@@ -2,16 +2,16 @@
 
 ### The short version
 
-An approval service is a small state machine. You read a recipe that says *"first the manager approves, then finance approves, then we are done,"* and you walk through it step by step. Each step gets assigned to a real person. You wait for them to click Approve or Reject. You move on.
+An approval service is a small state machine, run many times, on many shapes of request. You read a recipe that says *"first the manager approves, then finance approves, then we are done,"* and you walk through it step by step. Each step is assigned to a real person. You wait for them to click Approve or Reject. You move on.
 
 The runtime is tiny. What makes the problem interesting is everything around it:
 
 - Turning *"the requester's manager"* into a real person when that person is on vacation.
 - Surviving the approver leaving the company while the task is still pending.
 - Stopping someone from approving their own request.
-- Keeping an audit trail that holds up five years from now in court.
+- Keeping an audit trail that holds up five years later, in court.
 
-The data model fits on a napkin: workflow definitions, requests, tasks, decisions, audit log. Scale is not the hard part. At 100,000 employees, the whole company only generates about 1 request per second. The hard part is **organizational complexity**, not throughput.
+The data model fits on a napkin: **workflow definitions, requests, tasks, decisions, audit log.** Scale is not the hard part. At 100,000 employees, the whole company only generates about 1 request per second. The hard part is **organizational complexity**, not throughput.
 
 ---
 
@@ -19,7 +19,7 @@ The data model fits on a napkin: workflow definitions, requests, tasks, decision
 
 If you only get to ask two clarifying questions, ask these.
 
-**One workflow or many?** If it is just leave requests, you have a CRUD app. If it is a workflow engine that runs many types defined by config, you have a real system design.
+**One workflow, or many?** If it is just leave requests, you have a CRUD app. If it is a workflow engine that runs many types defined by config, you have a real system design.
 
 **Who writes workflows?** If HR admins through a UI, you need a definition store, versioning, and a lint pass. If engineers in YAML in the repo, you skip half of that.
 
@@ -34,7 +34,7 @@ Everything else (vacation, escalation, audit, retention) follows from those two 
 | 50-person startup | ~36 | ~0.0004 | 50 to 70 |
 | 100k enterprise | ~71,000 | ~1 sustained, ~3 peak | ~200,000 |
 
-The throughput is small. A single Postgres handles it. The interesting numbers are:
+The throughput is small. A single Postgres handles it. The numbers that matter:
 
 - **200,000 active requests at any moment.** The "show me my pending approvals" query has to find the right ones in under 50ms.
 - **5,000 different workflow types** at a mature company. Most are cold. A few (leave, expense) are hot.
@@ -57,7 +57,7 @@ Idempotency-Key: <uuid>
 }
 ```
 
-You get back the request id and the tasks just created. Two parallel approvers needed? Two tasks. The workflow auto-approved (under-3-day leave)? You get back a finalized request immediately.
+You get back the request id and the tasks just created. Two parallel approvers? Two tasks. Auto-approved (under-3-day leave)? A finalized request immediately.
 
 ```
 POST /api/v1/tasks/{task_id}/decisions
@@ -69,13 +69,13 @@ POST /api/v1/tasks/{task_id}/decisions
 }
 ```
 
-A few small but load-bearing choices:
+Small but load-bearing choices:
 
-- **Idempotency-Key is required on create.** Mobile retries the submit on timeout. Without the key, you get duplicate requests and double-charged budget reservations.
-- **`workflow_version: null` defaults to the latest published.** You can pin to a specific version for testing.
-- **Tasks are the unit of work, not requests.** A request can have multiple tasks in flight at once (parallel approval). Approvers act on tasks. This shapes the database design too.
+- **Idempotency-Key is required on create.** Mobile retries on timeout. Without the key, you get duplicate requests and double-charged budget reservations.
+- **`workflow_version: null` defaults to latest published.** Pin to a specific version for testing.
+- **Tasks are the unit of work, not requests.** A request can have multiple tasks in flight (parallel approval). Approvers act on tasks.
 
-Status codes worth knowing: **409** on the decision endpoint means the task was already decided (someone else, or a delegate, beat you to it). **410** means the task was cancelled because the request was withdrawn or returned to the requester.
+Status codes worth knowing: **409** means the task was already decided (someone else, or a delegate, beat you). **410** means the task was cancelled because the request was withdrawn or returned to the requester.
 
 ---
 
@@ -133,7 +133,6 @@ erDiagram
 <summary><b>Show: the full SQL</b></summary>
 
 ```sql
--- Workflows live here. Versioned. Never edited in place.
 CREATE TABLE workflow_definitions (
     workflow_id      TEXT NOT NULL,
     version          INT NOT NULL,
@@ -144,7 +143,6 @@ CREATE TABLE workflow_definitions (
     PRIMARY KEY (workflow_id, version)
 );
 
--- One row per request.
 CREATE TABLE requests (
     request_id          UUID PRIMARY KEY,
     workflow_id         TEXT NOT NULL,
@@ -163,13 +161,12 @@ CREATE TABLE requests (
 CREATE INDEX idx_req_requester ON requests (requester_id, created_at DESC);
 CREATE INDEX idx_req_open      ON requests (state) WHERE finalized_at IS NULL;
 
--- One row per pending human action.
 CREATE TABLE tasks (
     task_id        UUID PRIMARY KEY,
     request_id     UUID NOT NULL REFERENCES requests(request_id),
     step_id        TEXT NOT NULL,
     assignee_id    TEXT NOT NULL,
-    assigned_via   JSONB,                  -- delegation chain, if any
+    assigned_via   JSONB,                  -- delegation chain
     state          TEXT NOT NULL,          -- 'pending' | 'decided' | 'cancelled' | 'expired'
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at     TIMESTAMPTZ
@@ -177,7 +174,6 @@ CREATE TABLE tasks (
 CREATE INDEX idx_tasks_assignee_pending
     ON tasks (assignee_id) WHERE state = 'pending';
 
--- Immutable record of every decision.
 CREATE TABLE decisions (
     decision_id    UUID PRIMARY KEY,
     task_id        UUID NOT NULL REFERENCES tasks(task_id),
@@ -187,10 +183,9 @@ CREATE TABLE decisions (
     decision       TEXT NOT NULL,
     comment        TEXT,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (task_id)                       -- one decision per task, enforced by the DB
+    UNIQUE (task_id)                       -- one decision per task
 );
 
--- Append-only audit. INSERT privilege only.
 CREATE TABLE audit_log (
     event_id           UUID PRIMARY KEY,
     occurred_at        TIMESTAMPTZ NOT NULL,
@@ -209,13 +204,13 @@ CREATE INDEX idx_audit_request ON audit_log (request_id, occurred_at);
 
 Three small things doing real work:
 
-**`UNIQUE (task_id)` on decisions.** Two managers in parallel both click Approve at the same instant. The database serializes them. The first INSERT wins. The second fails with a unique-violation. The API turns that into a friendly 409. The request still advances exactly once. No application-level locks needed.
+**`UNIQUE (task_id)` on decisions.** Two managers click Approve at the same instant. The database serializes them. First INSERT wins. Second fails with a unique-violation. The API turns that into a friendly 409. The request still advances exactly once. No application-level locks needed.
 
 **`workflow_definitions` is immutable per version.** Publishing v4 of `leave_request` does not touch v3. In-flight requests stay on v3 forever. This is what lets you ship workflow changes without breaking running requests, and what makes audit replay work years later.
 
-**`audit_log` has no foreign key to `requests` on purpose.** If you ever delete a request (GDPR, mistaken bulk import), the audit must survive. Audit is the truth-of-record, not the requests table.
+**`audit_log` has no foreign key to `requests`.** On purpose. If a request is ever deleted (GDPR, mistaken bulk import), the audit must survive. Audit is the truth-of-record, not the requests table.
 
-Why Postgres, not Cassandra? Because the whole system is small and ACID matters here (claiming a task, recording a decision, advancing the request state all happen together). Postgres gives you that in one box.
+Why Postgres, not Cassandra? The system is small and ACID matters here (claim a task, record a decision, advance the request, all in one go). Postgres gives you that in one box.
 
 ---
 
@@ -225,16 +220,17 @@ The engine is a state machine executor. One function does most of the work. It i
 
 ```mermaid
 stateDiagram-v2
+    direction LR
     [*] --> Created
-    Created --> Resolving: pick approver for next step
+    Created --> Resolving: pick approver
     Resolving --> Pending: task assigned
-    Pending --> Pending: still waiting (quorum not met)
+    Pending --> Pending: waiting (quorum not met)
     Pending --> Advancing: decision recorded
     Advancing --> Resolving: next step exists
     Advancing --> Finalized: terminal step
-    Finalized --> [*]
     Pending --> Rewound: returned to requester
     Rewound --> Resolving: resubmit
+    Finalized --> [*]
 ```
 
 <details markdown="1">
@@ -250,7 +246,6 @@ def advance_request(request_id):
         workflow = workflow_store.get(request.workflow_id, request.workflow_version)
         current_step = workflow.find_step(request.state)
 
-        # Is the current step done?
         if current_step.type == "approval":
             tasks = db.query_tasks(request_id, current_step.id)
             if not quorum_met(tasks, current_step.quorum):
@@ -281,23 +276,19 @@ def advance_request(request_id):
 
 Three things make this safe:
 
-The whole advance happens in one DB transaction. Crashes mid-way roll back. After restart, the engine sees the same state and tries again. No partial-advance ever lands on disk.
-
-The `SELECT ... FOR UPDATE` lock on the request row serializes concurrent attempts to advance the same request. Without it, two simultaneous decisions could each push the request forward and corrupt the state machine.
-
-The function is idempotent at step boundaries. Calling it twice on the same request either sees the same state and proceeds, or sees that someone else already advanced and does nothing.
+- The whole advance happens in one DB transaction. Crashes mid-way roll back. After restart, the engine sees the same state and tries again. No partial advance ever lands on disk.
+- The `SELECT ... FOR UPDATE` lock on the request row serializes concurrent attempts to advance the same request. Without it, two simultaneous decisions could each push the request forward and corrupt the state machine.
+- The function is idempotent at step boundaries. Calling it twice on the same request either sees the same state and proceeds, or sees that someone else already advanced and does nothing.
 
 ---
 
 ### 6. Resolving an approver
 
-The workflow says `approver: "{{ employee.manager }}"`. The engine has to turn that into a real person before assigning a task. That sounds simple. Production says otherwise.
-
-The full algorithm is in `question.md` Step 8. The key ideas:
+The workflow says `approver: "{{ employee.manager }}"`. The engine must turn that into a real person before assigning a task. That sounds simple. Production says otherwise. The full algorithm is in `question.md` Step 8. The key ideas:
 
 - Cache role membership for 5 minutes. Cache OOO state for 1 minute. Cuts HRIS load by 100x.
-- When you follow a delegation chain (Bob OOO → Carol OOO → Dave), store the full chain on the task as `assigned_via`. Dave's UI shows *"approving on behalf of Bob, via Carol."* Audit logs the same chain.
-- The `when` parameter to `resolve_approver` is what lets audit replay work years later. People change jobs. Delegations expire. Roles get reassigned. You need a point-in-time view of the org chart.
+- When you follow a delegation chain (Bob OOO → Carol OOO → Dave), store the full chain on the task as `assigned_via`. Dave's UI then shows *"approving on behalf of Bob, via Carol."*
+- The `when` parameter to `resolve_approver` is what lets audit replay work years later. You need a point-in-time view of the org chart.
 
 ---
 
@@ -305,88 +296,96 @@ The full algorithm is in `question.md` Step 8. The key ideas:
 
 ```mermaid
 flowchart TB
-    subgraph Clients
-        Web[Web]
-        Mobile[Mobile]
-        Slack[Slack/Teams bot]
+    subgraph Edge["Client edge"]
+        C([Web / Mobile / Slack]):::user
+        GW["API Gateway<br/>(auth · idempotency · rate limit)"]:::edge
     end
 
-    Gateway["API Gateway<br/>auth · idempotency · rate limit"]
-
-    subgraph WritePath["Write path"]
-        Engine["Workflow Engine<br/>(stateless pods)"]
-        Org["Org Service<br/>HRIS adapter + cache"]
+    subgraph WritePath["Synchronous write path"]
+        E["Workflow Engine<br/>(stateless pods)"]:::app
+        O["Org Service<br/>HRIS adapter + cache"]:::ext
+        Defs[("Workflow<br/>Definitions")]:::db
     end
 
-    Read["Read Service<br/>Redis cache · 'my pending' < 50ms"]
+    DB[("Postgres<br/>requests · tasks ·<br/>decisions · audit (90d hot)")]:::db
 
-    Defs[("Workflow Definitions")]
-
-    DB[("Postgres<br/>requests · tasks · decisions<br/>audit (90 days hot)")]
-
-    Kafka{{"Kafka<br/>approval.request.created<br/>approval.task.assigned<br/>approval.decision.recorded<br/>approval.request.finalized"}}
-
-    subgraph Consumers
-        Notify[Notification Service]
-        Integ["Downstream<br/>NetSuite, Workday"]
-        Cold[("Audit cold tier<br/>S3 + Athena · 7yr")]
+    subgraph ReadPath["Dashboard read path"]
+        R["Read Service"]:::app
+        Cache[("Redis")]:::cache
     end
 
-    Web --> Gateway
-    Mobile --> Gateway
-    Slack --> Gateway
+    K{{"Kafka<br/>approval.request.created<br/>approval.task.assigned<br/>approval.decision.recorded<br/>approval.request.finalized"}}:::queue
 
-    Gateway -->|create| Engine
-    Gateway -->|read| Read
+    subgraph Consumers["Async consumers"]
+        N["Notification Service"]:::app
+        I["Downstream<br/>NetSuite, Workday"]:::ext
+        Cold[("Audit cold tier<br/>S3 + Athena · 7yr")]:::db
+    end
 
-    Engine --> Org
-    Engine --> Defs
-    Engine --> DB
-    Read --> DB
+    C --> GW
+    GW -->|create| E
+    GW -->|read| R
+    E --> Defs
+    E --> O
+    E --> DB
+    R --> Cache
+    R -.miss.-> DB
+    DB -->|CDC / outbox| K
+    K --> N
+    K --> I
+    K --> Cold
 
-    DB -->|CDC / outbox| Kafka
-    Kafka --> Notify
-    Kafka --> Integ
-    Kafka --> Cold
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+    classDef ext fill:#e9d5ff,stroke:#7e22ce,color:#581c87
 ```
 
-Five things to notice while reading this:
+Five things to notice:
 
-- The engine reads workflow definitions but does not call out to other services on the write path. The Org Service is the only external call (cached aggressively). Everything else is a Postgres transaction.
-- Notifications, integrations, and audit archival are downstream of Kafka. They are not in the write path. If the notification service dies, requests still get created and approved. Emails just queue up.
+- The engine does not call out to other services on the write path, except the Org Service (cached aggressively). Everything else is a Postgres transaction.
+- Notifications, integrations, and audit archival are downstream of Kafka. Not on the write path. If the notification service dies, requests still get created and approved. Emails just queue up.
 - The Read Service is denormalized. It listens to Kafka and maintains a "what is pending for each user" Redis cache. Dashboards never touch the primary DB in the common case.
 - Audit lives in two tiers. Last 90 days in Postgres. Older in S3 Parquet, queried via Athena. A nightly job moves rows between tiers.
-- Engine pods are stateless. State is in Postgres. You can roll them in the middle of the day with zero impact.
+- Engine pods are stateless. State is in Postgres. Roll them in the middle of the day with zero impact.
 
 ---
 
-### 8. A request, drawn end to end
+### 8. A request, end to end
 
 ```mermaid
 sequenceDiagram
-    participant Client
-    participant Gateway as API Gateway
-    participant Engine
-    participant Org as Org Service
+    autonumber
+    participant Alice
+    participant GW as API Gateway
+    participant E as Engine
+    participant O as Org Service
     participant DB as Postgres
-    participant Kafka
-    participant Notify as Notification Svc
+    participant K as Kafka
+    participant N as Notification Svc
 
-    Client->>Gateway: POST /requests
-    Gateway->>Engine: forward (auth ok, idempotency checked)
-    Engine->>Org: resolve first approver
-    Org-->>Engine: Bob
-    Engine->>DB: BEGIN TX
-    Engine->>DB: INSERT request
-    Engine->>DB: INSERT task (assignee=Bob)
-    Engine->>DB: INSERT audit_log
-    Engine->>DB: COMMIT
-    Engine->>Kafka: emit request.created
-    Engine->>Kafka: emit task.assigned
-    Engine-->>Gateway: 201 Created
-    Gateway-->>Client: 201 Created
-    Kafka->>Notify: task.assigned event
-    Notify->>Notify: email + slack to Bob
+    Alice->>GW: POST /requests (5 days off)
+    GW->>E: forward (auth ok, idempotency checked)
+    E->>O: who is Alice's manager?
+    O-->>E: Bob (in office)
+
+    rect rgb(241, 245, 249)
+        Note over E,DB: one database transaction
+        E->>DB: INSERT request
+        E->>DB: INSERT task (assignee=Bob)
+        E->>DB: INSERT audit_log
+        E->>DB: COMMIT
+    end
+
+    E->>K: emit request.created
+    E->>K: emit task.assigned
+    E-->>GW: 201 Created
+    GW-->>Alice: 201 Created
+    K->>N: task.assigned event
+    N-->>Bob: email + Slack
 ```
 
 Recording a decision looks almost the same. The engine fetches the task, checks the caller, inserts a row in `decisions` (the unique constraint catches double-decide races), updates the task, writes an audit event, and calls `advance_request` to see if the workflow can move forward. All in one transaction.
@@ -395,36 +394,44 @@ Reads have their own short flow. Client → API gateway → Read Service → Red
 
 Target latencies, roughly:
 
-- Create request: P99 ~200ms (bottleneck is the role resolver when cache is cold).
-- Decision: P99 ~150ms (role is usually warm because it was looked up when the task was created).
-- Dashboard read: P99 ~50ms.
+| Operation | P99 |
+|-----------|-----|
+| Create request | ~200ms (bottleneck: role resolver when cache is cold) |
+| Record decision | ~150ms (role usually warm) |
+| Dashboard read | ~50ms |
 
 ---
 
 ### 9. The scaling journey: 10 users to 1 million
 
-This is the part interviewers care about most. At every stage, name what just broke and what fixes it. Build nothing preemptively.
+At every stage, name what just broke and what fixes it. Build nothing preemptively.
 
 ```mermaid
 flowchart LR
-    S1["Stage 1<br/>10–100 users<br/>1 Postgres, 1 app pod<br/>~$80/mo"]
-    S2["Stage 2<br/>1,000 users<br/>+ workflow store<br/>+ HRIS<br/>~$250/mo"]
-    S3["Stage 3<br/>10k–100k users<br/>+ read replicas<br/>+ Redis<br/>+ Kafka<br/>+ S3 audit<br/>~$2–5k/mo"]
-    S4["Stage 4<br/>1M users<br/>+ multi-region<br/>+ hash chain audit<br/>+ workflow RBAC"]
+    S1["Stage 1<br/>10–100 users<br/>1 Postgres + 1 pod<br/>~$80/mo"]:::s1
+    S2["Stage 2<br/>~1,000 users<br/>+ workflow store<br/>+ HRIS<br/>~$250/mo"]:::s2
+    S3["Stage 3<br/>10k–100k users<br/>+ read replicas<br/>+ Redis · Kafka<br/>+ S3 audit<br/>~$2–5k/mo"]:::s3
+    S4["Stage 4<br/>1M users<br/>+ multi-region<br/>+ hash chain audit<br/>+ workflow RBAC"]:::s4
+
     S1 --> S2 --> S3 --> S4
+
+    classDef s1 fill:#e0f2fe,stroke:#0369a1,color:#0c4a6e
+    classDef s2 fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef s3 fill:#fef3c7,stroke:#a16207,color:#713f12
+    classDef s4 fill:#fce7f3,stroke:#be185d,color:#831843
 ```
 
 #### Stage 1: 10 to 100 users
 
-One Postgres, one app instance. Workflow YAML lives in the repo. Manager mappings hardcoded. No cache, no queue. Notifications are inline HTTP calls to SendGrid. About $80/month total. Two weeks to ship.
+One Postgres, one app instance. Workflow YAML lives in the repo. Manager mappings hardcoded. No cache, no queue. Notifications are inline HTTP calls to SendGrid. ~$80/month. Two weeks to ship.
 
-Enough because you see ten requests a day. Postgres is loafing. Building anything more is over-engineering.
+Enough because you see ten requests a day. Building more is over-engineering.
 
 #### Stage 2: 1,000 users
 
 Something breaks: someone asks for a new workflow type without a deploy.
 
-Move workflow YAML out of code into a `workflow_definitions` Postgres table with a minimal admin UI. While you are in there, add versioning. Integrate with the HRIS (Workday or BambooHR) instead of hardcoded manager mappings. 5-minute cache on HRIS responses. Notifications stop being inline calls and start consuming a small `request_events` table. About $250/month.
+Move workflow YAML out of code into a `workflow_definitions` Postgres table with a minimal admin UI. Add versioning while you are in there. Integrate with the HRIS (Workday or BambooHR) instead of hardcoded manager mappings. 5-minute cache on HRIS responses. Notifications stop being inline and start consuming a small `request_events` table. ~$250/month.
 
 Still no Kafka, no read replicas, no Redis. One request every couple of minutes. One Postgres is still fine.
 
@@ -440,7 +447,7 @@ Several things break at once:
 Fixes, in order:
 
 - Two Postgres read replicas. Dashboards read from them, engine writes go to primary. ~1s replication lag is fine.
-- A Redis cache for "my pending tasks" populated by listening to engine events. Dashboards read Redis directly.
+- A Redis cache for "my pending tasks" populated by listening to engine events.
 - Move audit older than 90 days to S3 Parquet. Athena for ad-hoc queries.
 - Partition engine pods by `request_id` hash. Stops them racing for the same locks.
 - Tighten Org Service cache. Pre-fetch on dashboard load.
@@ -473,7 +480,7 @@ You wouldn't. By then you are bigger than any one company, which means you are s
 
 Same engine. Four real workflows. Each one stresses a different feature.
 
-- **Purchase order** uses conditional branching. `when: amount > 5000` sends to finance. `when: amount > 25000` adds the CFO. Lint your conditions or you get edge cases like a $25,001 PO needlessly going to both finance and the CFO.
+- **Purchase order** uses conditional branching. `when: amount > 5000` sends to finance. `when: amount > 25000` adds the CFO. Lint your conditions or a $25,001 PO needlessly goes to both finance and the CFO.
 - **Leave request** uses parallel with quorum. Long leaves go to HR and grandboss at the same time. Both must approve. If one rejects, the other's task is cancelled and the request rejects.
 - **Expense report** needs backward transitions. Finance says "missing receipt." The request rewinds to the requester. The engine has `on_action: return_to(<step>)` for this. Subtle: pending downstream tasks must be cancelled when the request rewinds.
 - **Code review** needs external-event integration. The workflow waits for CI status, not just a human. When a new commit lands, prior approvals get invalidated.
@@ -581,7 +588,7 @@ A `netsuite-sync-worker` consumes `request.finalized` from Kafka. For each event
 
 **12. The "approve all" button.**
 
-API: `POST /api/v1/tasks/bulk_decide` with `{"task_ids": [...], "decision": "approve"}`. Server iterates serially (serial because each decision might advance a request and concurrent advances cause version skew). 80 decisions at 50ms each = 4 seconds. Returns a per-task result array. Some tasks might 409 if a delegate beat the user to it. The result shows that.
+API: `POST /api/v1/tasks/bulk_decide` with `{"task_ids": [...], "decision": "approve"}`. Server iterates serially (each decision might advance a request and concurrent advances cause version skew). 80 decisions at 50ms each = 4 seconds. Returns a per-task result array. Some tasks might 409 if a delegate beat the user. The result shows that.
 
 **13. Privacy and visibility scoping.**
 
@@ -605,7 +612,7 @@ The lesson: data residency forces the request to be the unit of locality. The us
 
 **Why Postgres and not Cassandra.** Approval needs strong consistency. No double-approve. No lost decisions. Postgres gives ACID for free. Cassandra would force you to invent compensating logic for the same guarantees.
 
-**Why YAML for workflow definitions and not code.** YAML lets non-engineers author workflows through a UI. Plugins force every workflow change through a deploy. The cost is limited expressiveness. For the few workflows that need real code (a custom integration step), the engine has an `exec` step that runs sandboxed JavaScript.
+**Why YAML for workflow definitions and not code.** YAML lets non-engineers author workflows through a UI. Code forces every workflow change through a deploy. The cost is limited expressiveness. For the few workflows that need real code (a custom integration step), the engine has an `exec` step that runs sandboxed JavaScript.
 
 **Why an immutable audit log and not just event-sourcing the requests.** Event-sourcing would make audit queries fast but ties the application's data model to the audit format. Decoupling lets you refactor the application without breaking audit. Worth the duplication.
 

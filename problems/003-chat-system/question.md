@@ -9,524 +9,520 @@ solution: solution.md
 
 ## The scene
 
-You sit down. The interviewer used to work at WhatsApp. Then Slack. They open with one line:
+You sit down. The interviewer used to work at WhatsApp.
 
-> *"Design a chat system. One-to-one chats and group chats. Real-time. Mobile is the main client. Go."*
+> *"Last week I sent my wife a message saying I'd be late. She saw it immediately. Two blue ticks. She typed back before I finished putting my phone away."*
+>
+> *"That's one person sending to one person. Now design the thing that makes it work for a billion people at the same time. One-to-one and groups. Real-time. Mobile first."*
 
-It looks simple. It is not. The trap is the word "real-time." If you start by listing REST endpoints, you have already missed the point. If you draw one box called "WebSocket server" and stop, you missed the other point.
+That is the question. It sounds like a simple inbox. It is not.
 
-Two things make chat hard:
+The word **real-time** is the first trap. If you start listing REST endpoints, you have already missed it. If you draw one box labeled "WebSocket server" and stop, you have missed the second trap.
 
-1. Holding open hundreds of millions of network connections at the same time.
-2. Keeping messages in the right order even when phones lose signal every few minutes.
+Three things make chat hard:
 
-We will walk this from a tiny chat app for 100 users to a system that holds 500 million open connections. At each step we will name what breaks first, then add the smallest fix.
+1. Holding hundreds of millions of open connections simultaneously.
+2. Keeping messages in the right order even when phones drop signal in the subway.
+3. Delivering receipts cheaply when a group message to 1,000 people creates 1,400 events.
 
----
-
-## Step 1: Ask the right questions
-
-Before you draw anything, sit for 5 minutes. Write down the questions you would ask the interviewer.
-
-A good answer is not "ask 20 questions about every edge case." It is the small set of questions that change the design if answered differently.
-
-<details markdown="1">
-<summary><b>Show: 8 questions that matter</b></summary>
-
-1. **How many users? How many open connections at peak?** *(WhatsApp answer: 1 billion daily users, 500 million open connections at peak. The connection count drives the whole edge fleet size.)*
-2. **One-to-one only, or groups too? How big can groups get?** *(WhatsApp caps groups at 1024. Slack channels can hit 10,000+. Group size decides if fan-out fits in one transaction or needs a worker pool.)*
-3. **What order guarantees do we need?** *(Most chat apps promise: messages from the same sender stay in order. They do not promise a strict global order. That difference saves you from needing distributed consensus on every message.)*
-4. **Do we show sent / delivered / read?** *(Receipts triple the load in groups. One message to 1000 people creates 1000 "delivered" events. Receipts are the real workload, not messages.)*
-5. **Do we show online / typing / last-seen?** *(Presence is its own beast. High update rate, low durability, different audience.)*
-6. **History on the server? How long?** *(WhatsApp keeps little server-side. Slack keeps everything forever. This decides your storage tier.)*
-7. **End-to-end encryption?** *(If yes, the server cannot read messages. That limits search, notifications, and moderation.)*
-8. **Push notifications when offline?** *(Apple APNs and Google FCM have their own rules. They are part of the design.)*
-
-> **Why these matter most.** Asking just "how many users?" misses the questions that actually shape the system. Concurrent connections, group size, and receipts together drive 80% of the architecture.
-
-</details>
+We will start with a tiny chat app for Alice and Bob. Then we add one pressure at a time and watch the design grow.
 
 ---
 
-## Step 2: How big is this thing?
+## Step 1: Picture one message
 
-Same problem, two scales. Do the math.
-
-**Inputs from the interviewer (enterprise scale):**
-
-- 1 billion daily active users
-- 500 million WebSocket connections open at peak (a WebSocket is a long-lived two-way connection)
-- 100 billion messages per day
-- Half the messages go to groups. Average group has 50 people. Biggest group has 1000.
-- Each message creates one "delivered" event from each online recipient. 80% of recipients open and read it.
-- Average message is 200 bytes
-- Keep history for 1 year, searchable
-
-Compute four things on paper, then peek.
-
-<details markdown="1">
-<summary><b>Show: the math</b></summary>
-
-**Messages per second.**
-
-- 100B / 86,400 seconds = ~1.16M messages/second steady
-- Peak is about 3x = ~3.5M messages/second
-
-**Total events per second (messages + receipts).**
-
-- Half the messages are 1-to-1: 1 delivered + 0.8 read = ~1.8 receipts per message
-- Half are group messages with ~49 other people. About 80% are online. So ~39 delivered + ~31 read = ~70 receipts per group message
-- Weighted average: 0.5 x 1.8 + 0.5 x 70 = ~36 receipts per message
-- Total events: 1.16M x (1 + 36) = ~43M events/second steady, ~130M peak
-
-> **Receipts dominate.** This is the first non-obvious insight. A group message of 1000 people creates 1 write to the message store and ~1800 receipt events. If you treat each receipt like a real message, you store 36 PB/year instead of 12.
-
-**Edge servers (the boxes holding open connections).**
-
-- 500M connections / 100K per server = 5,000 servers
-- Add 30-40% spare = 7,000-8,000 servers
-- Each connection uses ~10 KB of memory. 100K x 10 KB = ~1 GB per server. Trivial.
-
-**Storage for 1 year.**
-
-- 100B/day x 365 = 36.5 trillion messages
-- 350 bytes per message (200 content + ~150 metadata) = ~12 PB/year
-- Need 3 copies for safety = ~36 PB
-
-**Outbound bandwidth at peak.**
-
-- 3.5M messages x 36 fan-out x ~300 bytes = ~38 GB/second
-- Spread across 7,000 servers = ~5 MB/second per server. Trivial.
-
-> **What the math tells you.** Receipts beat messages 30 to 1. Connection count drives the server fleet. Group size drives the fan-out cost. None of it is about raw message throughput.
-
-</details>
-
----
-
-## Step 3: How do messages reach phones?
-
-Phones need to receive messages without asking the server "any new messages?" every second. There are three ways to do this. Think about each one before peeking.
-
-| Way | How it works |
-|---|---|
-| **Short polling** | Phone asks "any new messages?" every 5 seconds |
-| **Long polling** | Phone asks "any new messages?" Server waits up to 30 seconds before answering |
-| **WebSocket** | One always-open connection. Server pushes messages instantly |
-
-Which one wins for chat at 500M users? Why?
-
-<details markdown="1">
-<summary><b>Show: why WebSocket wins</b></summary>
-
-> **Why not short polling?** With 500M users polling every 5 seconds, that is 100 million requests per second hitting your servers. Almost all of them get back "nothing new." That is a huge waste of CPU, bandwidth, and battery.
-
-> **Why not long polling?** Better, but the server still holds the connection open. You get all the cost of WebSocket without the two-way push benefit. Also, every message takes a round trip: phone asks, server waits, server answers, phone asks again.
-
-> **Why WebSocket wins.** One always-open connection per user. Server pushes messages the moment they arrive. The same connection sends receipts back. No wasted polling. An idle WebSocket on Linux costs ~10 KB of memory. Cheap.
-
-**The trade-off.** WebSockets are stateful. Each one lives on a specific server. If that server dies, every connection on it drops. Phones drop signal often (subway, elevator, plane). So you need:
-
-- A way for the phone to reconnect fast
-- A way to catch up on messages missed during the drop
-- A way to route the phone back to the same logical place each time
-
-Use WebSocket as the main transport. Fall back to plain HTTPS only when WebSocket is blocked (some corporate networks block the upgrade).
-
-</details>
-
----
-
-## Step 4: Draw the system
-
-You know phones use WebSockets. Now draw the boxes behind them.
-
-Try to fill in the missing pieces below. Eight boxes are missing. Think about: where the WebSocket lands, who validates the message, where messages get stored, how the system knows which other users are online and where, and how offline users get a push notification.
-
-```
-            Phone (iOS, Android, web)
-                       |
-                       | WebSocket over TLS
-                       v
-              +-----------------+
-              |   [ ? ]         |   holds 100K connections per node,
-              |   (stateful)    |   pushes messages out
-              +----+--------+---+
-                   |        |
-        send       |        |    receive (from other gateways)
-                   |        |
-                   v        ^
-              +-----------------+
-              |   [ ? ]         |   validates, assigns message ID,
-              |   (stateless)   |   saves to storage
-              +--------+--------+
-                       |
-                       v
-              +-----------------+      +------------------+
-              |   [ ? ]         | ---> |   [ ? ]          |
-              |   (durable      | CDC  |   (decides who   |
-              |    storage)     |      |    needs this    |
-              |                 |      |    message)      |
-              +-----------------+      +-------+----------+
-                                               |
-                       +-----------------------+---------------------+
-                       |                       |                     |
-                       v                       v                     v
-              +----------------+      +----------------+    +----------------+
-              |   [ ? ]        |      |   [ ? ]        |    |  APNs / FCM    |
-              |   (knows which |      |   (sends to    |    |  (push for     |
-              |    gateway     |      |    online      |    |   offline      |
-              |    each user   |      |    users)      |    |   users)       |
-              |    is on)      |      |                |    |                |
-              +----------------+      +----------------+    +----------------+
-```
-
-<details markdown="1">
-<summary><b>Show: the full architecture</b></summary>
-
-```
-            Phone (iOS, Android, web)
-                       |
-                       | WebSocket over TLS
-                       v
-              +---------------------+
-              | Connection Gateway  |   holds 100K connections per node,
-              | (stateful edge)     |   pushes messages out
-              +----+-----------+----+
-                   |           |
-        send       |           |    receive (from other gateways)
-                   |           |
-                   v           ^
-              +---------------------+
-              | Message Service     |   validates, mints message_id,
-              | (stateless)         |   saves to Cassandra, sends ack
-              +----------+----------+
-                         |
-                         v
-              +---------------------+    +----------------------+
-              | Cassandra (sharded  |--->| Fan-out Dispatcher   |
-              | by conversation_id) |CDC | (reads new messages, |
-              |                     |    |  finds recipients)   |
-              +---------------------+    +-----+----------------+
-                                               |
-              +--------------------------------+----------------+
-              |                                |                |
-              v                                v                v
-        +----------------+         +----------------+    +----------------+
-        | Presence /     |         | Delivery       |    | Push Service   |
-        | Session        |         | Workers        |    | (APNs for iOS, |
-        | Registry       |         |                |    |  FCM for       |
-        |                |         | Sends to       |    |  Android)      |
-        | Redis: maps    |         | online users   |    |                |
-        | user_id ->     |         | via pub/sub    |    | For offline    |
-        | gateway_id     |         | to their       |    | users          |
-        |                |         | gateway        |    |                |
-        +----------------+         +----------------+    +----------------+
-```
-
-What each piece does in one line:
-
-- **Connection Gateway.** The edge server. Holds the open WebSocket. Knows nothing else. Stateless except for the live socket. If it dies, phones reconnect to a new one.
-- **Message Service.** The brain. Validates the message, gives it an ID, saves it. Stateless. Scales by adding more pods.
-- **Cassandra.** The message store. Sharded (split) by conversation_id, so all messages in one chat live on one node. Reading the last 50 messages of a chat is one fast query.
-- **Fan-out Dispatcher.** Reads new messages from Cassandra's change stream. Looks up who is in the conversation. Sends each one a delivery task.
-- **Presence / Session Registry.** A small Redis cluster. Knows which user is on which gateway right now. Also tracks online/idle/offline.
-- **Delivery Workers.** Take a delivery task. Look up the user's gateway. Publish the message to that gateway's channel.
-- **Push Service.** For users with the app closed. Talks to Apple (APNs) and Google (FCM). Sends a push notification so the user knows to open the app.
-
-> **Why pub/sub between Delivery Workers and Gateways?** The worker does not know directly which socket the user is on. The gateway is the only place that knows for sure. Publishing to a gateway channel lets the gateway decide if the socket is alive. If the user moved to a different gateway, the old one drops the event. The user's reconnect protocol catches them up later.
-
-</details>
-
----
-
-## Step 5: The send-message flow
-
-A user named Alice sends "hi" to Bob. Both are online. Trace it step by step. What happens between Alice pressing Send and Bob seeing the message?
-
-<details markdown="1">
-<summary><b>Show: the full path with diagram</b></summary>
-
-```mermaid
-sequenceDiagram
-    participant A as Alice phone
-    participant GA as Gateway A
-    participant MS as Message Service
-    participant DB as Cassandra
-    participant K as Kafka (CDC)
-    participant FD as Fan-out Dispatcher
-    participant PR as Presence Registry
-    participant DW as Delivery Worker
-    participant GB as Gateway B
-    participant B as Bob phone
-
-    A->>GA: send "hi" (client_msg_id)
-    GA->>MS: forward send
-    MS->>MS: validate, mint message_id
-    MS->>DB: write message (QUORUM)
-    DB-->>MS: ack
-    MS-->>GA: ack
-    GA-->>A: ack (single check shown)
-    DB->>K: CDC event
-    K->>FD: new message
-    FD->>PR: where is Bob?
-    PR-->>FD: gateway_B
-    FD->>DW: deliver task
-    DW->>GB: publish to gw:B
-    GB->>B: push "hi"
-    B->>GB: delivered receipt
-    GB->>MS: forward receipt
-    MS->>DB: update receipt
-    MS->>GA: notify Alice
-    GA->>A: double check shown
-```
-
-Step by step:
-
-1. Alice's phone sends a frame over the WebSocket: `{type: send, client_msg_id: uuid, body: "hi"}`. The `client_msg_id` is for safety. If the phone retries after a network blip, the server uses this ID to skip the duplicate.
-2. Gateway A forwards to the Message Service.
-3. Message Service does five things: checks Alice is allowed to send to this chat, mints a `message_id` (Snowflake style, sortable by time), saves to Cassandra, and sends back an ack.
-4. Alice's UI shows a single check (sent).
-5. Cassandra emits a CDC event (CDC = "change data capture", a stream of every row change). The Fan-out Dispatcher reads it.
-6. Dispatcher asks the Presence Registry: where is Bob? Answer: Gateway B.
-7. Dispatcher creates a delivery task. A Delivery Worker publishes to Gateway B's channel.
-8. Gateway B sees the event. It finds Bob's live socket. It writes the message frame.
-9. Bob's phone receives "hi". It sends back a "delivered" receipt (batched with other recent receipts to save bandwidth).
-10. The receipt flows back the same way. Alice's UI updates to show double check (delivered).
-11. Bob opens the chat. His phone sends a "read" receipt. Alice sees double check turn blue.
-
-> **Why a separate ack and delivery path?** Sender's ack means "the server has your message safe." Delivery means "the other person's device got it." Read means "they opened it." Three states, three events. Users want all three.
-
-> **Why client_msg_id?** Phones lose signal mid-send all the time. The phone retries. Without an ID, the server might save the same message twice. With it, the server says "already saved, here's the message_id again."
-
-</details>
-
----
-
-## Step 6: Keeping messages in order
-
-A user types fast: "hi", "are you there", "ok bye". On the other phone, they must appear in that order. Even if the network reorders. Even if the phone retries.
-
-What if Alice and Bob are typing at the same time in a group? What order does everyone see?
-
-<details markdown="1">
-<summary><b>Show: ordering rules and how to make them work</b></summary>
-
-**The rules chat apps actually promise:**
-
-1. **Same sender stays in order.** Alice's three messages appear in the order Alice sent them. Always.
-2. **Same view for everyone in a conversation.** If Alice and Bob both send at nearly the same time, the server picks an order. Every viewer sees the same order. Nobody tries to enforce a specific cross-sender order.
-3. **No order across different chats.** Messages in chat X and chat Y are independent.
-
-**How to make it work:**
-
-The `message_id` is the canonical order. It is a Snowflake ID:
-
-```
-| 41 bits timestamp (ms) | 10 bits machine ID | 12 bits sequence |
-```
-
-- Time-prefixed, so newer messages have bigger IDs
-- Globally unique without needing a coordinator
-- Sortable, so recipients sort by message_id when displaying
-
-> **Why Snowflake and not a database auto-increment?** Auto-increment needs a single source. At 3.5M messages/second across many regions, that source becomes the bottleneck. Snowflake lets each Message Service instance mint IDs without talking to anyone, and the IDs still sort by time.
-
-**FIFO per sender, enforced in the engine.** Each client has a counter (`client_seq`) that goes up per conversation. The Message Service tracks the last seen `client_seq` for (sender, conversation). If a new send has a smaller or equal seq, reject it. The client refreshes and retries.
-
-**What you do NOT need:**
-
-- Vector clocks (overkill, users do not notice 1ms reorderings)
-- Distributed consensus per message (slow, expensive)
-- Lamport timestamps (the Snowflake already gives you time ordering)
-
-> **Common trap.** Junior candidates try to design Paxos for chat ordering. The interviewer lets you. Then asks: "what does the user see if order breaks by 1ms on a 50-message screen?" Answer: nothing. Match the engineering to the user-visible problem.
+Before any architecture, just picture what sending a message **is**. Alice types. The server saves it. Bob sees it.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Sent: server saves
-    Sent --> Delivered: recipient device got it
-    Delivered --> Read: recipient opened chat
+    direction LR
+    [*] --> Sent: Alice taps Send, server saves
+    Sent --> Delivered: Bob's device receives it
+    Delivered --> Read: Bob opens the chat
     Read --> [*]
-    Sent --> Failed: timeout, error
-    Failed --> Sent: retry with same client_msg_id
+    Sent --> Failed: timeout or error
+    Failed --> Sent: Alice retries (same client ID)
 ```
+
+That is the whole product in one picture. Everything we add later (groups, receipts, presence, offline push) sits on top of this three-state machine.
+
+> **Take this with you.** A chat system is a message moving through three states: Sent, Delivered, Read. The hard part is making each transition reliable at scale.
+
+---
+
+## Step 2: Ask the right questions
+
+In a real interview, pause for two minutes. Write down what you want to ask. Not twenty questions. Five that change the design if answered differently.
+
+<details markdown="1">
+<summary><b>Show: 5 questions that change the design</b></summary>
+
+1. **How many open connections at peak?** One billion daily users can mean 100 million or 500 million concurrent connections. That number drives the entire edge fleet size. Ask for it explicitly. *WhatsApp answer: 500 million open WebSockets at peak.*
+2. **Groups: how big?** WhatsApp caps groups at 1,024. Slack channels can hit 10,000+. Group size decides whether fan-out fits in one fast loop or needs a dedicated worker pool. The receipt math changes dramatically.
+3. **Do we show delivered and read receipts?** Receipts are 30x more events than messages in group chats. Knowing this upfront changes the schema, the storage, and the throughput plan.
+4. **How long do we keep history?** WhatsApp keeps very little server-side. Slack keeps everything forever. This alone decides whether you need tiered cold storage or a simple delete-on-delivery model.
+5. **End-to-end encrypted?** If yes, the server cannot read message bodies. That kills server-side search, changes push notification previews, and makes moderation purely metadata-based.
+
+A strong candidate also asks the meta question: *"Is presence (online/offline) part of this, or a separate service?"* It should be separate. The engine emits events. The presence service maintains its own state.
 
 </details>
 
 ---
 
-## Step 7: The receipt problem (groups are expensive)
+## Step 3: How big is this thing?
 
-A message goes to a group of 1000 people. 800 are online. Each one's phone says "delivered." 600 open the chat and say "read." That is 1400 events from one message.
+Same product, two very different scales.
 
-How do you store that? How do you show the sender "delivered to 800 out of 1000"?
+| Company | DAU | Peak connections | Messages/day | Groups |
+|---------|-----|-----------------|--------------|--------|
+| Startup | 10,000 | ~3,000 | ~500,000 | Small, <20 people |
+| WhatsApp scale | 1 billion | 500 million | 100 billion | Up to 1,024 members |
 
 <details markdown="1">
-<summary><b>Show: the receipt model</b></summary>
+<summary><b>Show: how the numbers come out</b></summary>
 
-**For 1-to-1 chats.** Store sent_at, delivered_at, and read_at on the message row itself. One row covers everything.
+**Messages per second (WhatsApp scale).**
+- 100 billion / 86,400 seconds = ~1.16 million/second steady
+- Peak is roughly 3x: ~3.5 million/second
 
-**For group chats.** A new table:
+**Receipt events per second.**
+- Half the messages are 1-to-1: ~1.8 receipts per message (delivered + read)
+- Half are group with ~50 people. About 80% online = ~39 delivered + ~31 read = ~70 receipts per message
+- Weighted average: 0.5 × 1.8 + 0.5 × 70 = ~36 receipts per message
+- Total events: 1.16M × (1 + 36) = ~43 million/second steady, ~130 million at peak
+
+**Edge servers needed to hold connections.**
+- 500M connections / 100K per server = 5,000 servers
+- Add 30-40% spare for failures: 7,000-8,000 servers
+- Each idle WebSocket uses ~10 KB of memory: 100K × 10 KB = ~1 GB per server. Fine.
+
+**Storage for 1 year.**
+- 100B/day × 365 = ~36 trillion messages
+- ~350 bytes per message (200 content + 150 metadata) = ~12 PB raw
+- With 3 replicas: ~36 PB
+
+**The number that matters most.** Receipts beat messages 30 to 1. A 1,000-person group message creates 1 storage write and ~1,800 receipt events. Design the receipt path badly and the system melts on the first viral group.
+
+</details>
+
+> **Take this with you.** Receipts dominate the load. Raw message throughput is a distraction. Ask about groups and receipts before you draw a single box.
+
+---
+
+## Step 4: The smallest thing that works
+
+Forget WhatsApp. We are building a chat app for Alice and Bob. 100 users. No groups yet.
+
+Three boxes. One sequence diagram.
+
+```mermaid
+flowchart LR
+    A([Alice]):::user --> GW["Connection<br/>Gateway"]:::edge
+    GW --> MS[/"Message<br/>Service"/]:::app
+    MS --> DB[("Postgres<br/>messages")]:::db
+    DB -.->|push frame| GW
+    GW --> B([Bob]):::user
+
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+```
+
+The end-to-end flow:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Alice
+    participant GW as Gateway
+    participant MS as Message Service
+    participant DB as Postgres
+    participant Bob
+
+    Alice->>GW: send "hi" (client_msg_id=uuid)
+    GW->>MS: forward
+    MS->>DB: INSERT message (state=sent)
+    DB-->>MS: ok
+    MS-->>GW: ack (message_id)
+    GW-->>Alice: single check (sent)
+    GW->>Bob: deliver "hi"
+    Bob->>GW: delivered receipt
+    GW->>MS: receipt
+    MS->>DB: UPDATE delivered_at
+    GW-->>Alice: double check (delivered)
+```
+
+<details markdown="1">
+<summary><b>Show: the two tables</b></summary>
+
+```sql
+CREATE TABLE messages (
+    message_id      BIGINT PRIMARY KEY,
+    conversation_id BIGINT NOT NULL,
+    sender_id       BIGINT NOT NULL,
+    client_msg_id   TEXT,
+    body            TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    delivered_at    TIMESTAMPTZ,
+    read_at         TIMESTAMPTZ
+);
+
+CREATE TABLE conversations (
+    conversation_id BIGSERIAL PRIMARY KEY,
+    member_a        BIGINT NOT NULL,
+    member_b        BIGINT NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+This is enough for 100 users. The interesting part starts next.
+
+</details>
+
+> **Take this with you.** Always start here. The interview is about what you add next, and why.
+
+---
+
+## Step 5: The first crack
+
+Alice sends a message. Bob is on the subway. His phone drops signal for 8 minutes.
+
+You look at your code. When Bob reconnects, his phone asks: "Any new messages?" Your server scans the whole messages table. That is already slow at 10,000 users. At 100 million, it melts.
+
+Also: the gateway is holding both Alice's and Bob's connections. What happens when that box restarts for a deploy? Both connections drop, and the server has no idea what Bob already has.
+
+Two problems. Both solvable with one idea.
+
+**Make the message ID a Snowflake.** Give every message a globally sortable ID. The client stores the last message_id it has seen, per conversation. On reconnect, it tells the server: *"I have everything up to message 9,187,201 in this chat."* The server returns only what's newer.
+
+```mermaid
+flowchart LR
+    subgraph ID["Snowflake ID: 64 bits"]
+        T["41 bits<br/>timestamp (ms)"]
+        M["10 bits<br/>machine ID"]
+        S["12 bits<br/>sequence"]
+    end
+```
+
+No coordinator. Each Message Service pod mints its own IDs. They still sort by time globally.
+
+The second problem: the gateway cannot hold durable state. If it crashes, connections drop but no messages are lost, because everything durable lives in the database. The client just reconnects and runs the resume protocol.
+
+> **Take this with you.** Gateways are stateful by necessity (they hold sockets), but they must hold no durable data. Crashes are routine at this scale. Design for it from the start.
+
+---
+
+## Step 6: Build the architecture, one layer at a time
+
+We have a gateway, a message service, and a database. Now add layers only as real problems arrive.
+
+### v1: just the core
+
+```mermaid
+flowchart TB
+    C([Client]):::user --> GW["Connection Gateway<br/>(holds WebSocket)"]:::edge
+    GW --> MS[/"Message Service<br/>(validate, mint ID, save)"/]:::app
+    MS --> DB[("Postgres")]:::db
+
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+```
+
+Fine for 10,000 users.
+
+### v2: we need to know who is online and where
+
+Bob has a connection on Gateway 7. Alice has a connection on Gateway 2. When Alice sends a message, Gateway 2 must somehow push it to Gateway 7. They need a shared directory.
+
+Add a **Presence Registry**: a Redis cluster mapping user_id to gateway_id.
+
+```mermaid
+flowchart TB
+    C([Client]):::user --> GW["Connection Gateway"]:::edge
+    GW --> MS[/"Message Service"/]:::app
+    MS --> DB[("Postgres")]:::db
+    MS --> PR[("Presence Registry<br/>(Redis)")]:::cache
+    GW -.->|subscribe gw:{id}| PR
+
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+```
+
+### v3: Postgres cannot hold 100 billion messages, and groups need fan-out
+
+Move messages to **Cassandra**, partitioned by `conversation_id`. All messages in one chat live on one node. Reading the last 50 is one fast range query.
+
+Add a **Fan-out Dispatcher**: reads Cassandra's change stream, finds all members of the conversation, and sends each a delivery task. Separating fan-out from the write path means the send-ack latency no longer depends on group size.
+
+```mermaid
+flowchart TB
+    C([Client]):::user --> GW["Connection Gateway"]:::edge
+    GW --> MS[/"Message Service<br/>(stateless)"/]:::app
+    MS --> Cass[("Cassandra<br/>messages, partitioned<br/>by conversation_id")]:::db
+    MS --> PR[("Presence Registry<br/>(Redis)")]:::cache
+    Cass -->|CDC| FD[/"Fan-out Dispatcher"/]:::app
+    FD --> PR
+    FD -.->|deliver to gateway| GW
+    FD --> Push["Push Service<br/>(offline users)"]:::app
+
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+```
+
+### v4: receipts explode, and offline push needs its own path
+
+A 1,000-person group creates 1,800 receipt events per message. Writing a row per event per member per message will overwhelm any database. And APNs/FCM have their own rate limits and rules: they cannot share the delivery path.
+
+Add **Kafka** to buffer receipt events. Add **receipt counters** in Redis. The sender sees "delivered to 800/1,000" from a counter lookup, not a table scan.
+
+```mermaid
+flowchart TB
+    subgraph Edge["Client edge"]
+        C([Web / Mobile]):::user
+        GW["Connection Gateway<br/>(stateful, 100K sockets/node)"]:::edge
+    end
+
+    subgraph WritePath["Write path (synchronous)"]
+        MS[/"Message Service<br/>(stateless pods)"/]:::app
+        Pg[("Postgres<br/>conversations · members")]:::db
+    end
+
+    Cass[("Cassandra<br/>messages · group_receipts")]:::db
+
+    subgraph FanOut["Async fan-out"]
+        FD[/"Fan-out Dispatcher<br/>(Kafka consumer)"/]:::app
+        DW[/"Delivery Workers"/]:::app
+    end
+
+    PR[("Presence Registry<br/>(Redis)")]:::cache
+    RC[("Receipt Counters<br/>(Redis)")]:::cache
+    K{{"Kafka<br/>msg.new · receipt.*"}}:::queue
+    Push["Push Service<br/>(APNs / FCM)"]:::ext
+
+    C --> GW
+    GW -->|send frame| MS
+    MS --> Cass
+    MS --> Pg
+    MS -.->|ack| GW
+    Cass -->|CDC| K
+    K --> FD
+    FD --> PR
+    FD --> DW
+    FD --> Push
+    DW --> RC
+    DW -.->|publish gw:{id}| GW
+    GW -->|receipt frame| MS
+    MS --> RC
+
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+    classDef ext fill:#e9d5ff,stroke:#7e22ce,color:#581c87
+```
+
+Each box, in one line:
+
+| Box | What it does |
+|-----|--------------|
+| **Connection Gateway** | Holds the WebSocket. Stateful but no durable data. Safe to crash. |
+| **Message Service** | Validates, mints Snowflake ID, writes to Cassandra. Stateless. |
+| **Cassandra** | The message log. Partitioned by `conversation_id`. RF=3, QUORUM writes. |
+| **Kafka** | Buffers the CDC stream. Backpressure builds here if fan-out falls behind. |
+| **Fan-out Dispatcher** | Reads new messages. Finds members. Routes online vs. offline. |
+| **Delivery Workers** | Publish to per-gateway Redis channels. Receipt counters live here too. |
+| **Presence Registry** | Redis. Maps user_id to gateway_id. Also online/idle/offline state. |
+| **Push Service** | Talks to APNs and FCM. Separate from the real-time path on purpose. |
+
+> **Take this with you.** If the Push Service dies at 3 a.m., online users still get messages instantly. Offline users queue up and get notified when the service recovers. Separate the paths.
+
+---
+
+## Step 7: One message, all the way through
+
+Alice sends "hi" to Bob. Both are online on different gateways.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Alice
+    participant GA as Gateway A
+    participant MS as Message Service
+    participant Cass as Cassandra
+    participant K as Kafka
+    participant FD as Fan-out Dispatcher
+    participant PR as Presence Registry
+    participant GB as Gateway B
+    participant Bob
+
+    Alice->>GA: send "hi" (client_msg_id=abc)
+    GA->>MS: forward
+
+    rect rgb(241, 245, 249)
+        Note over MS,Cass: write path - one atomic operation
+        MS->>MS: validate, mint message_id=9187202
+        MS->>Cass: INSERT message (QUORUM)
+        Cass-->>MS: ack
+    end
+
+    MS-->>GA: ack (message_id=9187202)
+    GA-->>Alice: single check (sent)
+    Cass->>K: CDC event
+    K->>FD: new message
+    FD->>PR: where is Bob?
+    PR-->>FD: gateway_B
+    FD->>GB: publish to gw:B channel
+    GB->>Bob: deliver "hi"
+    Bob->>GB: delivered receipt
+    GB->>MS: forward receipt
+    MS->>Cass: UPDATE delivered_at
+    MS->>GA: notify Alice
+    GA->>Alice: double check (delivered)
+```
+
+Three things worth pointing at:
+
+1. The Cassandra write happens before the ack. Alice's single check means *"the server has your message."* Not "Bob got it."
+2. Kafka is written after Cassandra via CDC. Fan-out is completely async. Send latency does not grow with group size.
+3. The gateway holds no durable state. If Gateway A crashes after step 6, Alice reconnects, sends a `resume` frame, and catches up. No message is lost.
+
+---
+
+## Step 8: When the phone drops signal
+
+Bob goes into the subway at 9:03. His WebSocket dies. He comes out at 9:11. He missed 20 messages across 4 chats.
+
+The naive fix is a per-user inbox queue on the server. At 500 million users that is enormous state to maintain. There is a simpler way.
+
+**The resume protocol.** The client stores the last `message_id` it has received, per conversation. On reconnect, it sends one frame:
+
+```
+resume: {
+  conv_abc: msg_9187190,
+  conv_xyz: msg_8800041
+}
+```
+
+The server queries Cassandra for each conversation: *"give me messages with `message_id > last_seen`."* Cap at 1,000 messages or 7 days. Returns them as `history` frames. The client renders them in order.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Bob
+    participant GW as Gateway
+    participant MS as Message Service
+    participant Cass as Cassandra
+
+    Note over Bob: subway, 8 minutes offline
+    Bob->>GW: reconnect (new WebSocket)
+    Bob->>GW: resume {conv_abc: msg_9187190}
+    GW->>MS: forward resume
+    MS->>Cass: SELECT WHERE conv_id=abc AND message_id > 9187190
+    Cass-->>MS: 7 messages
+    MS->>GW: history frames
+    GW->>Bob: caught up
+```
+
+Most reconnects find 0-3 missed messages. They complete in under 100ms. Bob notices nothing.
+
+> **Take this with you.** The client tracks what it has. The server fills the gap. No per-user delivery queue. No massive server-side state. Cassandra reads are cheap because the partition is already by `conversation_id`.
+
+---
+
+## Step 9: The receipt problem in groups
+
+A message goes to a group of 1,000 people. 800 are online. Each device says "delivered." 640 open the chat and say "read." That is 1,440 events from one message.
+
+How do you store it? How do you show the sender "delivered to 800/1,000" without a table scan?
+
+**For 1-to-1 chats.** Store `delivered_at` and `read_at` on the message row. One row. Done.
+
+**For groups.** A separate table with a 90-day TTL:
+
+<details markdown="1">
+<summary><b>Show: the group_receipts table</b></summary>
 
 ```sql
 CREATE TABLE group_receipts (
     conversation_id  TEXT,
     message_id       BIGINT,
     member_id        BIGINT,
-    state            SMALLINT,    -- 1=delivered, 2=read
+    state            SMALLINT,      -- 1=delivered, 2=read
     state_ts         TIMESTAMP,
     PRIMARY KEY ((conversation_id, message_id), member_id)
 ) WITH default_time_to_live = 7776000;   -- 90 days
 ```
 
-One row per (message, member). At 1000 members per message, that table grows fast.
-
-**Three tricks to make it affordable:**
-
-1. **Batch receipts.** The phone does not send one receipt per message. Every 1-2 seconds it sends "everything up to message_id X is delivered." One event covers many messages. Saves bandwidth and database writes.
-
-2. **TTL the table.** After 90 days, nobody cares who read what. Cassandra deletes the rows for free.
-
-3. **Drop "delivered" in huge groups.** In WhatsApp groups over 256 members, only "sent" and "read" are shown. "Delivered" is skipped. That alone cuts receipt volume in half.
-
-**Showing "delivered to 800/1000" without scanning 800 rows.**
-
-Maintain a counter in Redis:
-
-```
-Key:   receipts:{conv_id}:{msg_id}
-Value: hash { delivered: 800, read: 600 }
-TTL:   90 days
-```
-
-The Delivery Worker bumps this counter as receipts come in. The sender's UI shows the counter. Reading is one Redis get. No scan.
-
-> **Why a counter instead of a list?** The sender wants two numbers, not 1000 names with checkmarks. The counter answers the question in O(1). The list is only used when the user taps "see who read this," which is rare.
+Nobody asks "who read this 6 months ago?" Cassandra deletes expired rows automatically.
 
 </details>
+
+Three tricks that make receipts affordable:
+
+1. **Batch receipts.** The phone sends "delivered up to message_id X" once per second, not once per message. One event covers many messages.
+2. **Counter in Redis for the sender's UI.** The sender wants two numbers, not a list of 800 names:
+   ```
+   receipts:{conv_id}:{msg_id}  ->  { delivered: 800, read: 640 }
+   ```
+   One Redis GET. No scan.
+3. **Drop "delivered" in large groups.** WhatsApp skips "delivered" in groups over 256 members. Only "sent" and "read" are shown. That alone cuts receipt volume roughly in half.
+
+> **Take this with you.** Receipts are the busiest pipe in the system. Batch them, counter them, and drop them when they don't add user value.
 
 ---
 
-## Step 8: What happens when the phone drops signal?
+## Step 10: Four features, one engine
 
-This is the hard part of mobile chat. A user goes into a subway tunnel. WebSocket dies. 5 minutes later they come out. New connection. They might have missed 20 messages from 5 different chats.
+Same architecture. Four real features. Each stresses something different.
 
-How do they catch up without re-downloading their whole history?
-
-<details markdown="1">
-<summary><b>Show: the reconnect-with-resume protocol</b></summary>
-
-The trick is the client remembers what it has. On reconnect, it tells the server "I have everything up to here in each chat. What did I miss?"
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant GW as Gateway
-    participant MS as Message Service
-    participant DB as Cassandra
-
-    Note over C: signal lost,<br/>WebSocket dies
-    Note over C: signal back<br/>5 minutes later
-    C->>GW: reconnect (TLS handshake)
-    GW->>C: connected
-    C->>GW: resume {chat1: msg_100, chat2: msg_50}
-    GW->>MS: forward resume
-    loop for each chat
-        MS->>DB: SELECT * WHERE conv_id=? AND msg_id > ?
-        DB-->>MS: missed messages
-    end
-    MS->>GW: history frames
-    GW->>C: catch-up complete
-```
-
-**The protocol:**
-
-1. Phone connects WebSocket. Sends a `resume` frame with the last message_id it has per conversation.
-2. Server reads Cassandra: "give me messages with `message_id > last_seen` per conversation." Cap at 1000 messages or 7 days.
-3. Server sends them back as `history` frames over the WebSocket.
-4. If the gap is too big (more than 1000 missed messages), server says "too old." The phone falls back to the REST history API and pages through.
-
-**Most reconnects find 0-2 missed messages.** They resume in under 100ms. The user does not notice anything.
-
-> **Why client-side state instead of a server-side queue?** Some designs maintain a per-user inbox queue. At 500M users that is a huge state to keep current. Letting the client track what it has and asking the server to fill the gap is simpler and just as correct. Cassandra reads are cheap (one partition).
-
-> **Why does this work even if the gateway crashes?** The gateway has no durable state. Everything that matters is in Cassandra, Postgres, or Redis. A gateway crash drops 100K connections. They reconnect to other gateways within seconds. No message is ever lost.
-
-</details>
-
----
-
-## Step 9: Online users vs offline users
-
-A message goes out. Some recipients have the app open (online). Some have it closed (offline). They need different paths.
-
-**Online users.** The system finds their gateway and pushes through the WebSocket. Instant.
-
-**Offline users.** No socket. The system sends a push notification through Apple APNs (iOS) or Google FCM (Android). The phone shows a notification banner. The user taps it. The app opens. The resume protocol catches them up.
-
-<details markdown="1">
-<summary><b>Show: the push path and why it is separate</b></summary>
-
-```
-Message Service writes to Cassandra
-         |
-         v
-   Fan-out Dispatcher
-         |
-         +---- for each recipient ----+
-         |                            |
-   is user online?                  is user offline?
-         |                            |
-         v                            v
-   Delivery Worker             Push Service
-   (publish to gateway)        (call APNs / FCM)
-         |                            |
-         v                            v
-   live WebSocket              notification banner
-```
-
-Why two paths:
-
-1. **APNs and FCM have their own rules.** They batch. They rate-limit. They sometimes drop messages. You cannot treat them like an internal queue.
-2. **Push is best-effort.** If the provider is down for an hour, you do not buffer pushes. The user opens the app and resume catches them up.
-3. **Push payload is small.** Some apps send the message body in the push. End-to-end encrypted apps send only "new message from X" because the server cannot decrypt the body.
-4. **Token management is its own problem.** Each device has a push token. Tokens expire. Users uninstall. The Push Service maintains the token registry and cleans up dead ones.
-
-> **Why not just rely on push?** Push is slow (1-5 seconds) and unreliable (occasional drops). The WebSocket path is fast (under 500ms) and direct. Use WebSocket when you can. Use push when you must.
-
-</details>
+| Feature | The user-visible behavior | What it stresses | The key decision |
+|---------|--------------------------|-----------------|-----------------|
+| **Typing indicator** | "Alice is typing..." | Fire-and-forget. Never stored. | Flows gateway to fan-out to recipient gateway. No Cassandra write. Auto-expires after 5s without refresh. Skip in large groups. |
+| **Presence** | Green dot means online | 300K events/second at WhatsApp scale | Redis only. Subscriber model: only subscribe to contacts visible on screen. Coarse 5-minute idle window to stop flickering. |
+| **Multi-device** | Read on phone, badge clears on laptop | Session model | Session Registry stores per-device entries. Fan-out emits one delivery task per session. Receipt sync sends a `state_change` frame to sibling sessions. |
+| **End-to-end encryption** | Server cannot read body | Search, push previews, moderation | Body is a ciphertext blob. Server routes by metadata. Push says "new message from Alice," not the content. No server-side search. |
 
 ---
 
 ## Follow-up questions
 
-Try answering each in 2 or 3 sentences before opening the solution.
+Try answering each in 2 or 3 sentences before reading the solution.
 
-1. **Catch-up after a 30-minute drop.** A user goes offline mid-conversation, comes back 30 minutes later. How does the client catch up without re-downloading everything?
+1. **Reconnect after 30 minutes offline.** A user goes offline mid-conversation. Comes back 30 minutes later. How does the client catch up without re-downloading the full history?
 
-2. **A chatty bot.** A group has 1000 members. One member is a bot sending a message every 5 seconds. What strain does this put on the system? How do you protect against it?
+2. **A bot in a big group.** A group has 1,000 members. One member is a bot sending a message every 5 seconds. What strain does this put on the system? How do you protect against it?
 
-3. **Presence at scale.** Every user has 200 contacts and toggles online/offline often. What is the fan-out? Where is presence stored?
+3. **Presence at scale.** Every user has 200 contacts and toggles online/offline often. What is the total fan-out? Where is presence stored? Why not in Cassandra?
 
-4. **Typing indicators.** How do you deliver these? Are they saved anywhere? What happens if the user closes the app while typing?
+4. **Typing indicators.** How are they delivered? Are they stored anywhere? What happens if the user closes the app while typing?
 
-5. **Multi-device sync.** A user has a phone and a laptop both logged in. How do you make a message read on the phone disappear from the unread badge on the laptop?
+5. **Multi-device sync.** A user has a phone and a laptop both logged in. How does reading a message on the phone remove the unread badge on the laptop?
 
 6. **End-to-end encryption.** If messages are E2E-encrypted, the server cannot see them. How does that affect search, push previews, and group fan-out?
 
-7. **Gateway crash.** A gateway holding 100K WebSocket connections crashes. What happens to those clients? How fast do they recover?
+7. **Gateway crash.** A gateway holding 100K connections crashes. What happens to those clients? How fast do they recover?
 
 8. **New device bootstrap.** A user logs in on a new phone. They have 500 chats and 10 years of history. How do you bootstrap them without sending gigabytes?
 
 9. **Spam detection.** A user is mass-DMing strangers. How do you detect and rate-limit them without blocking legitimate business accounts?
 
-10. **Sudden lag in one region.** At 3am, message delivery lag in one region spikes to 30 seconds. The message store metrics look fine. Where do you look first?
+10. **Delivery lag spikes in one region.** At 3am, message delivery lag in one region spikes to 30 seconds. The message store metrics look fine. Where do you look first?
 
 ---
 
 ## Related problems
 
-- **[News Feed (002)](../002-news-feed/question.md).** Same fan-out patterns. A group chat is fan-out-on-write with a small audience.
-- **[Notification System (010)](../010-notification-system/question.md).** The push notification path here uses the same machinery for offline users.
-- **[Distributed Cache (009)](../009-distributed-cache/question.md).** The presence registry and receipt counters lean on Redis. Knowing its limits matters.
+- **[News Feed (002)](../002-news-feed/question.md).** Same fan-out patterns. A group chat is fan-out-on-write to a small audience. The write-heavy fan-out tradeoffs are identical.
+- **[Notification System (010)](../010-notification-system/question.md).** The push path here (APNs/FCM) uses the same offline delivery machinery. The quiet-hours and preference logic lives there.
+- **[Distributed Cache (009)](../009-distributed-cache/question.md).** The presence registry and receipt counters are Redis. Knowing its eviction and failure modes matters here.

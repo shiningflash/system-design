@@ -9,537 +9,552 @@ solution: solution.md
 
 ## The scene
 
-You sit down for the interview. The interviewer says:
+You sit down. The interviewer leans forward.
 
-> *"Design YouTube. Or Netflix, pick one. I want to see how a video gets from a phone to a screen on the other side of the world."*
+> *"Describe how YouTube works. Someone records a video on their phone in Tokyo. Someone else watches it on their TV in São Paulo. What happens in between?"*
 
-It sounds like one problem. It is really two problems sharing a database.
+It sounds like one problem. It is really two problems that share a database.
 
-**Problem one: upload and prepare a video.** Someone records a video. We take their file, convert it into many sizes, and store it. This part is slow. It runs in the background. We do it once per video.
+**Problem one: the upload pipeline.** A creator sends a 5 GB file. We take it, convert it to seven different resolutions, and cut each resolution into thousands of small chunks. We do this once per video. It is slow on purpose.
 
-**Problem two: play a video.** Millions of people press play. We send them video bytes fast, in the right size for their internet speed. This part has to be quick. We do it billions of times per day.
+**Problem two: the playback path.** A billion hours of video are watched every day. The system has to send bytes to 125 million people at the same moment, each on a different network, each in a different city. It has to be fast. It does nothing else.
 
-These two halves share almost nothing. They use the same database for video info, and the same storage bucket for files. That is it. If you try to design both at the same time with one big diagram, you will get lost in ten minutes.
+These two halves share almost nothing. They use the same metadata database and the same file storage. That is it. Candidates who try to design both at once in a single diagram get lost in ten minutes.
 
-We will walk through this step by step. We will start small and add pieces as needed.
+We will start with the smallest picture that captures the shape of the problem, then build up one layer at a time.
 
 ---
 
-## Step 1: Ask the right questions
+## Step 1: Picture one video's journey
 
-Before drawing anything, sit for five minutes. Write down questions you would ask the interviewer.
+Before any boxes, trace one video from phone to screen.
 
-A good answer here is not "20 questions about edge cases." It is a small set of questions where the answer changes the whole design.
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Uploading: creator presses Upload
+    Uploading --> Transcoding: file received
+    Transcoding --> Ready: all qualities done
+    Ready --> Streaming: viewer presses Play
+    Streaming --> [*]: playback ends
+```
+
+That is the whole product. A video starts as a raw file, becomes a set of small chunks at multiple quality levels, and then gets served to viewers from a server near them. Every design decision below exists to make one of those three transitions faster or cheaper.
+
+> **Take this with you.** Video streaming is a pipeline, not a service. Upload and playback are two different systems. Treat them that way from the first sentence.
+
+---
+
+## Step 2: Ask the right questions
+
+In a real interview, spend two minutes writing down your questions before drawing anything. Not twenty questions. Five focused ones.
 
 <details markdown="1">
-<summary><b>Show: 8 questions that matter</b></summary>
+<summary><b>Show: 5 questions that change the design</b></summary>
 
-1. **YouTube or Netflix?** They look the same but they are not. YouTube takes uploads from anyone (any quality, any format, billions of videos most people never watch). Netflix has a small library where every video is popular. Storage choices and the pipeline both change. For this design, assume YouTube-style.
+1. **YouTube or Netflix?** They look the same from the outside. YouTube takes uploads from anyone (any quality, any format, billions of videos most people never watch). Netflix has a small curated library where nearly every video is popular. Storage tiering is nearly opposite: YouTube is cold-heavy, Netflix is mostly hot. *This is the biggest design fork.*
 
-2. **Live or recorded?** Live streaming (a concert happening right now) needs sub-3-second delay between camera and screen. Recorded videos (VOD = video on demand) get prepared once and served forever. They share almost no infrastructure. Scope to VOD. Mention live as an extension.
+2. **Live or recorded (VOD)?** Live streaming needs sub-3-second glass-to-glass latency. Recorded video (VOD) is prepared once and served forever. They share almost no infrastructure. Scope to VOD and mention live as an extension.
 
-3. **Global or one country?** Global means we need servers in many places. The bill for sending bytes around the world is the biggest cost in the whole system.
+3. **Which codecs?** H.264 encodes fast and plays everywhere. H.265 cuts file size by 30% but encodes 3x slower. AV1 cuts another 30% but is 15-30x slower than H.264 to encode. Deciding to support AV1 can multiply the compute bill by 5x. *The codec ladder is the transcoding budget.*
 
-4. **How many video qualities?** The standard set: 240p, 360p, 480p, 720p, 1080p, 1440p, 4K. More qualities means more files to make. Adding the AV1 codec (newer, smaller files but slow to make) can multiply our compute bill by 5x.
+4. **How large can uploads be?** YouTube allows videos up to 256 GB. A file that large cannot arrive in one HTTP request. If the Wi-Fi drops at 4.9 GB, the user starts over unless you support resumable uploads.
 
-5. **How big can uploads be?** YouTube allows 12-hour videos up to 256 GB. A file that big cannot be uploaded in one go. If the wifi drops once, the whole upload restarts. We need resumable uploads.
+5. **How fresh do analytics need to be?** View counts that are a few minutes stale are fine for the watch page. Creator dashboards that update hourly are fine. Anything under 5 seconds freshness requires a separate real-time pipeline. *Each freshness target is a different system and a different cost.*
 
-6. **DRM (digital rights management) and paid content?** YouTube is free with ads. Netflix needs DRM, which means encrypted videos and a license server. Different system.
-
-7. **Is search and recommendations in scope?** Huge separate systems. Right answer: "out of scope, but I will show where they plug in."
-
-8. **Analytics speed?** View counts can be a few minutes late (YouTube famously delays them). Creator dashboards can update once a day. Each freshness target costs different money.
-
-If you only asked "how many users," you missed the biggest questions. Question 2 (live or VOD) and question 4 (which codecs) each move the compute bill by 10x.
+A strong candidate also asks whether DRM is in scope. YouTube is ad-supported and open. Netflix encrypts every segment and requires a per-device license. The license server is its own system.
 
 </details>
 
 ---
 
-## Step 2: How big is this thing?
+## Step 3: How big is this thing?
 
-Same problem, real numbers. Do the math before you draw boxes.
+The same design phrase, two very different companies.
 
-Assume:
-
-- **500 hours** of video uploaded per minute
-- **1 billion hours** watched per day
-- Average view: **10 minutes**
-- Average upload: **4 minutes**
-- Bitrate ladder (the standard set of qualities and their data rates):
-  - 240p = 400 kbps (kilobits per second)
-  - 360p = 700 kbps
-  - 480p = 1.2 Mbps (megabits per second)
-  - 720p = 2.5 Mbps
-  - 1080p = 5 Mbps
-  - 1440p = 9 Mbps
-  - 4K = 20 Mbps
-- Codecs (the rules for compressing video): H.264 always, H.265 for 720p and above, AV1 for the top 1% most-watched
-- Source files kept forever (in case we need to re-encode in a new codec later)
-- Target start time: under 2 seconds before video plays
-
-Try to compute these on paper first:
-
-1. Upload bandwidth (bytes per second arriving from creators)
-2. New videos per day
-3. Viewers watching at the same time
-4. Egress (bytes per second going out to viewers) at peak
-5. Storage growth per year
+| Metric | YouTube scale | Smaller platform |
+|--------|--------------|-----------------|
+| Upload | 500 hours of video per minute | 5 hours per minute |
+| Viewers | 125 million concurrent at peak | 1 million |
+| Egress | 250 Tbps peak | 2.5 Tbps |
+| Storage growth | 70 PB per year | 700 TB per year |
 
 <details markdown="1">
-<summary><b>Show: the math</b></summary>
+<summary><b>Show: how the numbers come out</b></summary>
 
-**Upload bandwidth.** 500 hours per minute = 500 × 60 = 30,000 seconds of video per minute = **500 seconds of video per second**. At an average 10 Mbps (a typical phone upload), that is 500 × 10 = **5 Gbps sustained**, **15 Gbps at peak**.
+**Upload ingest.** 500 hours per minute = 500 × 60 = 30,000 seconds of video arriving every 60 seconds. That means 500 seconds of new footage lands every second (many creators uploading at once). At an average source bitrate of 10 Mbps per upload, that is 500 × 10 Mbps / 8 = **5 Gbps sustained**, roughly **15 Gbps at peak**.
 
-> Why "seconds of video per second"? If 500 seconds of new footage arrives every second, our system is taking in video faster than time itself. That sounds wrong but it is just many people uploading at once.
+**New videos per day.** 500 hours/min × 60 min × 24 hr / 4-min average video length ≈ **450,000 videos per day**, or about 5 per second at steady state.
 
-**Videos per day.** 500 hours × 60 min × 24 hours / 4-minute average length = **about 450,000 new videos per day**. About 5 new videos every second. At peak: 15 per second.
+**Concurrent viewers.** 1 billion watch-hours per day × 3,600 sec/hr / 86,400 sec/day = **42 million people watching at any moment** on average. At peak (Friday night, major event): about **125 million at once**.
 
-**Concurrent viewers.** 1 billion hours per day × 3600 seconds / 86400 seconds in a day = **42 million viewer-seconds per second**. That means 42 million people watching at the same moment on average. At peak (Friday night, big sports event): about **125 million at once**.
+**Peak egress.** 125 million viewers × 2 Mbps average (most people on mobile watch 480p or 720p) = **250 Tbps**. No single server, no single data center, can send that. This is the reason a CDN exists.
 
-**Egress at peak.** 125 million viewers × 2 Mbps average (most people watch at 480p or 720p on mobile) = **250 Tbps (terabits per second) peak**.
+**Storage growth.** 500 sec of source video per second × 86,400 sec/day × 365 days/year × (10 Mbps / 8 bits per byte) ≈ **20 PB/year for source files**. Transcoded variants add another 50 PB/year (each source becomes 7-9 quality copies). Total: roughly **70 PB of new data per year**.
 
-> Why this is the whole story. 250 Tbps is the dominant number in the design. No single server can send that. No single data center can send that. This is why we need a CDN (content delivery network, a set of servers placed close to users that cache content). The CDN serves 95% of bytes from close-by caches. Our origin only sees the 5% that misses.
+**Three numbers dominate the whole design:**
 
-**Storage per year.** 500 seconds of input per second × 86,400 seconds per day × 365 days × (10 Mbps / 8 bits per byte) = **about 20 PB (petabytes) per year just for source files**. Plus the converted versions (more on these later), the system grows by **about 70 PB per year**. And it never stops growing.
-
-**The takeaway.** Three numbers dominate the whole design:
-
-| Number | Size | Where it lives |
+| Number | Size | Why it matters |
 |--------|------|----------------|
-| Egress | 250 Tbps peak | CDN |
-| Transcoding compute | thousands of CPU cores | A worker farm |
-| Storage | 70 PB per year, forever | Tiered S3 |
+| Peak egress | 250 Tbps | Requires a global CDN with hundreds of servers |
+| Transcoding compute | Thousands of CPU cores | Running 24/7, just to keep up with uploads |
+| Storage | 70 PB/year, growing forever | Tiering by access frequency saves ~5x in cost |
 
-Everything we design exists to make one of these three numbers smaller.
+Everything in the architecture exists to keep one of these three numbers manageable.
 
 </details>
 
 ---
 
-## Step 3: How does an upload work?
+## Step 4: The smallest thing that works
 
-A creator on their phone records a 5 GB video. They press upload. What happens next?
+Forget YouTube. We are a tiny platform with 100 creators and 10,000 viewers.
 
-Take ten minutes to think. Consider:
-- What if their wifi drops at 90%?
-- Where does the file land first?
-- Who decides when to start converting?
-- How does the creator know "uploaded" vs "ready to watch"?
+Three boxes. One upload flow.
 
-<details markdown="1">
-<summary><b>Show: the upload pipeline</b></summary>
+```mermaid
+flowchart TB
+    C([Creator]):::user --> UGW["Upload Service<br/>(receive file, queue jobs)"]:::app
+    UGW --> S3src[("S3<br/>source files")]:::db
+    S3src --> TW["Transcoding Worker<br/>(ffmpeg)"]:::app
+    TW --> S3out[("S3<br/>segments")]:::db
+    S3out -.CDN.-> V([Viewer]):::user
 
-The upload pipeline has six stages. Each must be restartable on its own. A failure at stage 5 should not redo stages 1 through 4.
+    classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef app   fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+```
 
-**The flow:**
+The sequence for an upload is short.
 
 ```mermaid
 sequenceDiagram
-    participant C as Client (phone)
+    autonumber
+    participant Creator
+    participant Upload as Upload Service
+    participant S3src as S3 (source)
+    participant Worker as Transcoding Worker
+    participant S3out as S3 (segments)
+    participant Viewer
+
+    Creator->>Upload: POST /uploads (file)
+    Upload->>S3src: store raw file
+    Upload-->>Creator: video_id, status=transcoding
+    Worker->>S3src: download source
+    Worker->>Worker: run ffmpeg (7 qualities)
+    Worker->>S3out: write segments + playlists
+    Upload-->>Creator: status=ready (on poll)
+    Viewer->>S3out: GET master.m3u8, then segments
+```
+
+<details markdown="1">
+<summary><b>Show: the two key tables</b></summary>
+
+```sql
+CREATE TABLE videos (
+    video_id    VARCHAR(16) PRIMARY KEY,
+    owner_id    BIGINT NOT NULL,
+    title       VARCHAR(200),
+    status      TEXT NOT NULL,   -- 'uploading', 'transcoding', 'ready', 'blocked'
+    source_path TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE variants (
+    video_id    VARCHAR(16),
+    quality     VARCHAR(20),     -- '360p_h264', '1080p_h265'
+    status      TEXT NOT NULL,   -- 'pending', 'encoding', 'ready', 'failed'
+    output_path TEXT,
+    completed_at TIMESTAMPTZ,
+    PRIMARY KEY (video_id, quality)
+);
+```
+
+`variants` has one row per (video, quality) so each transcoding job updates its own row independently. No locking on a shared JSON blob.
+
+</details>
+
+> **Take this with you.** At small scale, the whole system is a file upload, a background job, and a CDN URL. Complexity comes in when you need resumable uploads, queuing, and storage tiering, not before.
+
+---
+
+## Step 5: The first crack
+
+The startup gets traction. Creators complain that a bad Wi-Fi connection makes them restart their 2 GB upload from zero. A 5-minute video is now 45 minutes because they have to keep trying.
+
+The fix is resumable uploads. The idea: instead of one big HTTP request, the client sends 16 MB chunks. If a chunk fails, only that chunk retries.
+
+```mermaid
+flowchart LR
+    subgraph Upload["Resumable upload (TUS protocol)"]
+        A[POST /uploads<br/>get upload ID] --> B[PATCH chunk 1<br/>offset 0]
+        B --> C[PATCH chunk 2<br/>offset 16MB]
+        C --> D[...]
+        D --> E[POST /finalize<br/>check sha256]
+    end
+    subgraph Resume["If Wi-Fi drops"]
+        F[HEAD /uploads/id<br/>get current offset] --> G[PATCH chunk N<br/>resume from offset]
+    end
+```
+
+This is called the **TUS protocol** (or S3 multipart, which uses the same idea). The client calls `HEAD /uploads/<id>` to ask "where did we stop?" Then it continues from that byte offset. Only the failed chunk retries.
+
+The second crack arrives right after: uploads are fast but transcoding is slow. A single worker falls behind when multiple creators upload at the same time. The worker needs to be a pool, not a single process. And a crash mid-job should not lose the work.
+
+Both of these problems point toward the same fix: a durable job queue.
+
+> **Take this with you.** Chunked uploads and a job queue are not extras. They are what makes the system work for anyone uploading from a phone.
+
+---
+
+## Step 6: Build the architecture, one layer at a time
+
+### v1: one upload flow
+
+```mermaid
+flowchart TB
+    C([Creator]):::user --> U["Upload Service"]:::app
+    U --> S3src[("S3 source")]:::db
+    U --> DB[("Postgres<br/>videos · variants")]:::db
+    S3src --> TW["Transcoding Worker"]:::app
+    TW --> S3out[("S3 segments")]:::db
+
+    classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef app   fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+```
+
+Fine for a few uploads per minute.
+
+### v2: add a job queue so the worker pool can scale
+
+When uploads outnumber workers, jobs need to wait somewhere. The queue also makes each job retryable: if a worker crashes, the job goes back to the queue.
+
+```mermaid
+flowchart TB
+    C([Creator]):::user --> U["Upload Service"]:::app
+    U --> S3src[("S3 source")]:::db
+    U --> DB[("Postgres")]:::db
+    U --> K{{"Kafka<br/>transcode.requested"}}:::queue
+    K --> TW["Transcoding Workers<br/>(pool, autoscales)"]:::app
+    TW --> S3out[("S3 segments")]:::db
+    TW --> K2{{"Kafka<br/>transcode.completed"}}:::queue
+    K2 --> MB["Manifest Builder"]:::app
+    MB --> S3out
+
+    classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef app   fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+```
+
+### v3: add the playback path
+
+Upload and playback share almost nothing. The playback path is its own service.
+
+```mermaid
+flowchart TB
+    subgraph Upload["Upload pipeline"]
+        C([Creator]):::user --> U["Upload Service"]:::app
+        U --> S3src[("S3 source")]:::db
+        U --> K{{"Kafka"}}:::queue
+        K --> TW["Transcoding Workers"]:::app
+        TW --> S3out[("S3 segments")]:::db
+        TW --> K
+        K --> MB["Manifest Builder"]:::app
+        MB --> S3out
+        MB --> DB[("Postgres<br/>videos · variants")]:::db
+    end
+
+    subgraph Playback["Playback path"]
+        V([Viewer]):::user --> WA["Watch Page API<br/>(metadata + sign URLs)"]:::app
+        WA --> DB
+        WA --> CDN["CDN<br/>(3-tier cache)"]:::edge
+        CDN -.miss.-> S3out
+    end
+
+    classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge  fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app   fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+```
+
+### v4: add telemetry, analytics, and storage tiering
+
+Now viewers are watching and creators want to see data. And 70 PB/year of storage costs money unless you tier it.
+
+```mermaid
+flowchart TB
+    subgraph Edge["Client edge"]
+        C([Creator / Viewer]):::user
+        GW["API Gateway<br/>(auth · rate limit)"]:::edge
+    end
+
+    subgraph WritePath["Upload pipeline"]
+        U["Upload Service<br/>(TUS / S3 multipart)"]:::app
+        S3src[("S3 source<br/>(lifecycle: hot→cold)")]:::db
+        K{{"Kafka<br/>transcode.requested<br/>transcode.completed\nvideo.published"}}:::queue
+        TW["Transcoding Farm<br/>(H.264 · H.265 · AV1 pools)"]:::app
+        S3out[("S3 segments<br/>(tiered: hot/warm/cold)")]:::db
+        MB["Manifest Builder"]:::app
+        DB[("Postgres<br/>videos · variants")]:::db
+    end
+
+    subgraph PlaybackPath["Playback path"]
+        WA["Watch Page API"]:::app
+        CDN["CDN<br/>Edge PoPs → Shields → Origin"]:::edge
+        Cache[("Redis<br/>hot video metadata")]:::cache
+    end
+
+    subgraph Telemetry["Telemetry pipeline"]
+        TK{{"Kafka<br/>playback events"}}:::queue
+        FL["Flink<br/>(aggregate view counts)"]:::app
+        VDB[("Redis + ClickHouse<br/>view counts · analytics")]:::db
+    end
+
+    C --> GW
+    GW -->|upload| U
+    GW -->|watch| WA
+    U --> S3src
+    U --> K
+    K --> TW
+    TW --> S3out
+    TW --> K
+    K --> MB
+    MB --> S3out
+    MB --> DB
+    WA --> DB
+    WA --> Cache
+    WA --> CDN
+    CDN -.miss.-> S3out
+    GW -->|telemetry| TK
+    TK --> FL
+    FL --> VDB
+
+    classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge  fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app   fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+```
+
+Each box in one line:
+
+| Box | What it does |
+|-----|--------------|
+| **API Gateway** | Auth, rate limits, routes upload vs playback vs telemetry traffic |
+| **Upload Service** | Accepts chunked uploads, issues TUS resumption tokens, triggers transcoding |
+| **Kafka** | Durable queue between pipeline stages. Worker crashes do not lose jobs |
+| **Transcoding Farm** | Pools of ffmpeg workers, one pool per codec. Autoscales on Kafka lag |
+| **Manifest Builder** | Assembles master.m3u8 as quality variants complete |
+| **Postgres** | Video catalog, per-variant job status |
+| **Watch Page API** | Reads metadata, signs CDN URLs, returns JSON. The only code on the playback hot path |
+| **CDN** | Three tiers: edge PoPs, regional shields, S3 origin. 95%+ cache hit rate target |
+| **Redis** | Hot video metadata cache. Cuts Postgres reads by 100x for popular videos |
+| **Flink + ClickHouse** | Stream-aggregate view counts and watch-time data for creator dashboards |
+
+> **Take this with you.** Kafka is the backbone of the upload pipeline. If a transcoding worker dies at 3 a.m., the job is not lost. Kafka holds it until another worker picks it up.
+
+---
+
+## Step 7: One upload, all the way through
+
+Alice records a 5 GB video of her cooking a meal. She presses Upload from her phone.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Alice
+    participant GW as API Gateway
     participant U as Upload Service
-    participant S3 as S3 (source bucket)
+    participant S3src as S3 (source)
     participant K as Kafka
-    participant W as Transcoding Workers
-    participant M as Manifest Builder
-    participant CDN as CDN
+    participant W as Transcoding Worker
+    participant S3out as S3 (segments)
+    participant MB as Manifest Builder
+    participant DB as Postgres
 
-    C->>U: POST /uploads (filename, size)
-    U->>S3: Reserve upload ID
-    U-->>C: video_id + upload URL + chunk size
+    Alice->>GW: POST /uploads (filename, size, sha256)
+    GW->>U: forward (auth ok)
 
-    loop For each 16 MB chunk
-        C->>U: PATCH chunk (with offset)
-        U->>S3: Write chunk to multipart upload
-        U-->>C: 204 OK (new offset)
+    rect rgb(241, 245, 249)
+        Note over U,DB: one transaction
+        U->>DB: INSERT video (status=uploading)
+        U->>S3src: initiate multipart upload
+        U-->>Alice: video_id=v_8h3jK2p, chunk_size=16MB
     end
 
-    Note over C,U: If connection drops, client calls HEAD<br/>to get current offset and resumes
-
-    C->>U: POST /finalize
-    U->>S3: Complete multipart upload (assembles file)
-    U->>K: Publish transcode.requested (one per quality)
-    U-->>C: status = transcoding
-
-    par For each quality
-        W->>K: Consume transcode.requested
-        W->>S3: Read source
-        W->>W: Run ffmpeg (cut into 6-sec segments)
-        W->>S3: Write segments to transcoded bucket
-        W->>K: Publish transcode.completed
+    loop 320 chunks × 16 MB each
+        Alice->>U: PATCH chunk N (offset=N×16MB)
+        U->>S3src: write chunk N to multipart
+        U-->>Alice: 204, new offset
     end
 
-    M->>K: Consume transcode.completed events
-    M->>S3: Write master.m3u8 (lists all qualities)
-    M->>CDN: Warm cache for hot videos
-    M-->>C: status = ready (creator polls)
+    Note over Alice,U: Wi-Fi drops → Alice calls HEAD /uploads/v_8h3jK2p → gets offset → resumes
+
+    Alice->>U: POST /finalize
+    U->>S3src: complete multipart (assemble 5 GB)
+    U->>DB: UPDATE video (status=transcoding)
+    U->>K: emit transcode.requested × 7 (one per quality)
+    U-->>Alice: status=transcoding
+
+    par 7 quality jobs in parallel
+        W->>K: consume transcode.requested
+        W->>S3src: download source
+        W->>W: run ffmpeg (cut into 6-second segments)
+        W->>S3out: write segments + per-quality playlist
+        W->>K: emit transcode.completed
+    end
+
+    MB->>K: consume transcode.completed (all 7)
+    MB->>S3out: write master.m3u8
+    MB->>DB: UPDATE video (status=ready)
 ```
 
-**What each stage does:**
+Three things worth pointing at:
 
-1. **Start.** Client calls `POST /uploads` with filename and total size. Server returns an upload ID and a chunk size (usually 16 MB). Server writes a row in the database with `status = uploading`.
-
-2. **Send chunks.** Client cuts the file into 16 MB pieces. For a 5 GB video that is about 320 chunks. Each chunk is sent as `PATCH /uploads/<id>` with a header telling the server which byte range this is. The server writes it to S3 as part of a multipart upload.
-
-    This uses the **TUS protocol** (or S3 multipart, similar idea). TUS = a standard for resumable uploads on top of HTTP. The key point: each chunk has an offset. If chunk 47 fails, the client retries chunk 47 only.
-
-    > Why chunks instead of one big upload? A single 5 GB PUT cannot resume. If the wifi drops at 4.9 GB, you start over. With chunks, only the failing chunk retries. If the connection drops for ten minutes, the client asks the server "where am I?" using `HEAD /uploads/<id>`, gets back the current offset, and continues from there.
-
-3. **Finalize.** When all chunks are in, client calls `POST /uploads/<id>/finalize`. Server tells S3 to glue the chunks into one file. Server checks the sha256 hash if the client sent one. Status changes to `transcoding`.
-
-4. **Queue conversion jobs.** Server publishes messages to Kafka (a durable message queue). One message per quality level: "convert v_123 to 240p", "convert v_123 to 360p", and so on. About 7-9 messages per video.
-
-5. **Workers convert.** A pool of transcoding workers (running ffmpeg) read jobs from Kafka. For each job, a worker:
-    - Downloads the source from S3.
-    - Runs ffmpeg with the right codec and bitrate.
-    - Cuts the output into 6-second segments (small files like `seg_42.ts`).
-    - Uploads the segments back to S3 in a per-video folder.
-    - Writes a per-quality playlist (`playlist.m3u8`) that lists all the segment files.
-    - Publishes `transcode.completed`.
-
-6. **Build the master manifest.** A separate service watches for `transcode.completed` events. When all qualities are done (or even after the first one if we want fast availability), it writes a `master.m3u8` file. This is a small text file listing all the qualities. Status changes to `ready`. The creator can now publish the video.
-
-> Why 6-second segments? If your network drops mid-video, only the next 6 seconds need to re-buffer, not the whole movie. The player can also switch to a lower quality between segments (without restarting the video) if your wifi gets weaker.
-
-</details>
+1. The `INSERT video` and `initiate multipart` happen in the same transaction. If the server crashes mid-way, the video row and the S3 upload either both exist or neither does.
+2. The `finalize` call is idempotent. If Alice retries because her connection dropped, the second call sees the multipart upload is already complete and skips ahead.
+3. Workers produce segments at the same time cut points across all qualities. That alignment is what lets the player switch from 360p to 1080p mid-stream without a visual glitch.
 
 ---
 
-## Step 4: Draw the upload architecture
+## Step 8: How playback works
 
-You know the upload flow. Now draw the boxes. Six pieces are missing. Think about: what catches the chunks, where source files land, what queues the work, what does the converting, what builds the playlist, and where video info lives.
-
-```
-            Creator (phone, browser)
-                    |
-                    | upload chunks
-                    v
-            +-----------------+
-            |   [ ? A ]       |  catches chunks, validates, writes to source
-            +--------+--------+
-                     |
-                     v
-            +-----------------+
-            |   [ ? B ]       |  source files
-            +--------+--------+
-                     |
-                     | enqueue convert jobs
-                     v
-            +-----------------+
-            |   [ ? C ]       |  message queue
-            +--------+--------+
-                     |
-                     v
-            +-----------------+
-            |   [ ? D ]       |  convert workers (CPU + GPU)
-            +--------+--------+
-                     |
-                     | write segments
-                     v
-            +-----------------+
-            |  S3 transcoded  |  240p, 360p, 480p ... segments
-            +--------+--------+
-                     |
-                     v
-            +-----------------+
-            |   [ ? E ]       |  builds master.m3u8 when ready
-            +--------+--------+
-                     |
-                     v
-            +-----------------+
-            |   [ ? F ]       |  video catalog (title, status, owner)
-            +-----------------+
-```
-
-<details markdown="1">
-<summary><b>Show: the full upload architecture</b></summary>
-
-```
-            Creator (phone, browser)
-                    |
-                    | TUS or S3 multipart (chunked, resumable)
-                    v
-            +-------------------+
-            | Upload Gateway    |  Stateless API. Auth, quota check,
-            | (API pods)        |  sha256 verify, chunk routing.
-            +---------+---------+
-                      |
-                      v
-            +-------------------+
-            | s3://video-source |  Source bucket. Lifecycle policy
-            | (S3 Standard)     |  moves old files to cold storage.
-            +---------+---------+
-                      |
-                      | on finalize -> Kafka
-                      v
-            +-------------------+
-            | Kafka             |  Topics: transcode.requested,
-            | (message queue)   |  transcode.completed,
-            |                   |  video.published.
-            +---------+---------+
-                      |
-                      v
-            +-------------------+
-            | Transcoding Farm  |  Kubernetes pool.
-            | (ffmpeg workers)  |  CPU nodes for H.264 / H.265,
-            |                   |  CPU nodes for AV1 (slow but worth
-            |                   |  it for popular videos).
-            +---------+---------+
-                      |
-                      v
-            +-------------------+
-            | s3://transcoded   |  Per-video folder of segments.
-            +---------+---------+  Hot videos copied to many regions.
-                      |
-                      v
-            +-------------------+
-            | Manifest Builder  |  Reads transcode.completed events.
-            | (stateless svc)   |  Writes master.m3u8 / manifest.mpd.
-            +---------+---------+
-                      |
-                      v
-            +-------------------+
-            | Metadata DB       |  Cassandra. videos table:
-            | (videos, variants)|  video_id PK; title, status, owner,
-            |                   |  ready_qualities, created_at.
-            +-------------------+
-```
-
-**What each piece does, in one line:**
-
-- **Upload Gateway.** A stateless web service. Catches the chunks, checks the user is logged in, checks they have not exceeded their upload quota.
-- **Source bucket.** Cheap, durable object storage. Sources move to colder (cheaper) storage after 30 days.
-- **Kafka topic.** A durable queue. If the worker farm is busy, jobs wait their turn. If a worker crashes, the job becomes available to another worker.
-- **Transcoding workers.** Pods running ffmpeg. One worker handles one (video, quality) job at a time. Idempotent: re-running a job overwrites the same output files.
-- **Transcoded bucket.** Holds all the small segment files. The whole playback path reads from here (through the CDN).
-- **Manifest Builder.** Stateless service. Listens for "this quality is done" events. When enough qualities are done, writes the master playlist that the player will read.
-- **Metadata DB.** The catalog. One row per video. Cassandra is the right pick because reads are by `video_id` only (no complex joins).
-
-</details>
-
----
-
-## Step 5: How does playback work?
-
-A viewer presses play. The player makes a series of HTTP requests. Think about: what does it ask for first? In what order? How does the player decide what quality to send?
-
-Take ten minutes, then check.
-
-<details markdown="1">
-<summary><b>Show: the playback flow</b></summary>
-
-The playback sequence:
+A viewer opens the watch page. Their player makes a sequence of small HTTP requests, each to the CDN.
 
 ```mermaid
 sequenceDiagram
-    participant P as Player (browser, app)
-    participant API as Watch Page API
-    participant CDN as CDN (edge near user)
-    participant S3 as Origin (S3)
+    autonumber
+    participant Bob as Bob (viewer)
+    participant WA as Watch Page API
+    participant CDN as CDN (edge near Bob)
+    participant S3out as S3 (origin)
 
-    P->>API: GET /videos/v_8h3jK2p
-    API->>API: Look up metadata, sign URLs
-    API-->>P: title, master.m3u8 URL, thumbnail
+    Bob->>WA: GET /videos/v_8h3jK2p
+    WA->>WA: look up metadata, sign CDN URL
+    WA-->>Bob: title, signed master.m3u8 URL
 
-    P->>CDN: GET master.m3u8
-    alt cache hit
-        CDN-->>P: master playlist (~1 KB)
+    Bob->>CDN: GET master.m3u8 (signed URL)
+    alt cache hit (95% of requests)
+        CDN-->>Bob: 1 KB text file (list of qualities)
     else cache miss
-        CDN->>S3: fetch master.m3u8
-        S3-->>CDN: master playlist
-        CDN-->>P: master playlist
+        CDN->>S3out: fetch master.m3u8
+        S3out-->>CDN: file
+        CDN-->>Bob: 1 KB text file
     end
 
-    Note over P: Player picks a starting quality<br/>(usually 360p to be safe)
+    Note over Bob: player picks starting quality (360p to be safe)
 
-    P->>CDN: GET 360p/playlist.m3u8
-    CDN-->>P: list of segment files
+    Bob->>CDN: GET 360p/playlist.m3u8
+    CDN-->>Bob: list of segment file names
 
-    P->>CDN: GET 360p/seg_0.ts
-    CDN-->>P: 1 MB segment
-    Note over P: Decodes, starts playing.<br/>Measures download speed.
+    Bob->>CDN: GET 360p/seg_0.m4s
+    CDN-->>Bob: ~1 MB segment (6 seconds of video)
+    Note over Bob: starts playing, measures download speed
 
-    P->>CDN: GET 360p/seg_1.ts
-    CDN-->>P: 1 MB segment
+    Bob->>CDN: GET 360p/seg_1.m4s
+    CDN-->>Bob: ~1 MB segment
+    Note over Bob: 40 Mbps available → switch up to 1080p
 
-    Note over P: Bandwidth looks like 40 Mbps.<br/>Switch up to 1080p.
-
-    P->>CDN: GET 1080p/seg_2.ts
-    CDN-->>P: 2 MB segment
+    Bob->>CDN: GET 1080p/seg_2.m4s
+    CDN-->>Bob: ~2.5 MB segment
 ```
 
-**Step by step:**
+The player switches quality between segments, not mid-segment. This is called **ABR (adaptive bitrate streaming)**. Every quality uses the same segment start times (every 6 seconds), so switching from one quality to another is a clean cut.
 
-1. **Watch page loads.** Browser calls `GET /videos/v_8h3jK2p`. Server returns title, thumbnail, and the URL of the master playlist. The master URL is signed (has a token that expires in 4 hours) so it cannot be embedded for free elsewhere.
+The master playlist looks like this:
 
-2. **Player fetches the master playlist.** A tiny text file (~1 KB) like this:
+```
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=700000,RESOLUTION=640x360
+360p/playlist.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+720p/playlist.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+1080p/playlist.m3u8
+```
 
-    ```
-    #EXTM3U
-    #EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=426x240
-    240p/playlist.m3u8
-    #EXT-X-STREAM-INF:BANDWIDTH=700000,RESOLUTION=640x360
-    360p/playlist.m3u8
-    #EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
-    720p/playlist.m3u8
-    #EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
-    1080p/playlist.m3u8
-    ```
+The player reads this file and picks a starting quality based on the viewer's bandwidth. Then it keeps measuring and adjusts up or down as conditions change.
 
-    Each line says: "this quality needs this much bandwidth." The player picks one.
+> **Take this with you.** The player never asks your servers for video bytes. It asks the CDN. Your Watch Page API only provides the signed URL and metadata. After that, your code is out of the loop.
 
-3. **Player picks a starting quality.** Usually starts at 360p or 480p. Not at 1080p, because we do not yet know how fast the network is.
+---
 
-4. **Player fetches the variant playlist.** Returns a list of segment files:
+## Step 9: Why the CDN is the whole story
 
-    ```
-    #EXTM3U
-    #EXT-X-TARGETDURATION:6
-    #EXTINF:6.0,
-    segment_0.ts
-    #EXTINF:6.0,
-    segment_1.ts
-    ...
-    ```
+250 Tbps egress. No single data center can send that. The CDN is not an optimization. It is the only reason the system works.
 
-    Each segment is 6 seconds of video.
-
-5. **Player fetches segments and plays.** It downloads segment 0, starts decoding, starts playing. While segment 0 plays, it fetches segment 1. Then segment 2. The buffer (the amount of video ready to play next) fills up to about 30 seconds ahead.
-
-6. **Player measures bandwidth.** If a 1 MB segment downloads in 200 ms, that is 5 MB/s = 40 Mbps. So we have plenty of room for 1080p (5 Mbps).
-
-7. **Player switches qualities between segments.** Next request goes to `1080p/seg_3.ts` instead of `360p/seg_3.ts`. The viewer sees the picture get sharper.
-
-**This is called ABR (adaptive bitrate).** The player adapts the bitrate to your current network.
+A CDN has three tiers. The viewer's request lands at the closest tier first. Each tier caches to protect the tier behind it.
 
 ```mermaid
-flowchart TD
-    A[Measure last segment download speed] --> B{Buffer level?}
-    B -->|Buffer < 5 sec| C[Drop one quality<br/>refill fast]
-    B -->|Buffer 5-25 sec| D{Bandwidth check}
-    B -->|Buffer > 25 sec| E[Try next quality up]
+flowchart TB
+    V([Viewers in Tokyo, São Paulo, Lagos]):::user
 
-    D -->|Bandwidth × 0.8 > current bitrate| F[Keep current quality]
-    D -->|Bandwidth × 0.8 < current bitrate| G[Drop one quality]
+    subgraph Tier1["Tier 1: Edge PoPs (200+ worldwide)"]
+        E1["Tokyo PoP"]:::edge
+        E2["São Paulo PoP"]:::edge
+        E3["Lagos PoP"]:::edge
+    end
 
-    C --> H[Fetch next segment]
-    F --> H
-    G --> H
-    E --> I{Bandwidth allows<br/>higher quality?}
-    I -->|Yes| J[Step up to 720p/1080p/4K]
-    I -->|No| F
-    J --> H
+    subgraph Tier2["Tier 2: Regional Shields (10-20 worldwide)"]
+        SH1["Asia Shield"]:::edge
+        SH2["Americas Shield"]:::edge
+    end
+
+    subgraph Tier3["Tier 3: Origin"]
+        S3out[("S3 + signing service")]:::db
+    end
+
+    V --> E1
+    V --> E2
+    V --> E3
+    E1 -.miss.-> SH1
+    E2 -.miss.-> SH2
+    E3 -.miss.-> SH1
+    SH1 -.miss.-> S3out
+    SH2 -.miss.-> S3out
+
+    classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge  fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
 ```
 
-> Why does every quality need the same segment boundaries? Because the player switches between segments. If 360p cuts at 6.0s, 12.0s, 18.0s, then 1080p must also cut at 6.0s, 12.0s, 18.0s. Otherwise switching mid-stream causes a visible glitch.
+Why the regional shield matters: without it, 200 edge PoPs each missing the same segment all hit S3 directly. That is 200 S3 requests for one piece of content. The shield absorbs them. It fetches from S3 once and serves the other 199 edge PoPs from its cache.
 
-**HLS vs DASH.** Both do the same thing two ways:
+With a 95% edge hit rate, only 5% of requests reach the shield. Only 20% of those reach S3. Your origin sees roughly 1% of total traffic. At 250 Tbps total, that means S3 sees about 2.5 Tbps. Without the CDN, S3 would see 250 Tbps and your cost would be 100x higher.
 
-- **HLS** (HTTP Live Streaming, Apple's standard). Manifests are `.m3u8` text files. Segments are `.ts` or `.m4s` files. Default on iOS and Safari.
-- **DASH** (Dynamic Adaptive Streaming over HTTP, an ISO standard). Manifests are `.mpd` XML files. Segments are `.m4s`. Default on Android.
+**Cache TTL choices:**
 
-Modern systems write segments once in `.m4s` (the **CMAF** format, Common Media Application Format) and produce both an HLS playlist and a DASH manifest pointing to the same byte files. Best of both.
+| Content | TTL | Reason |
+|---------|-----|--------|
+| Video segments (`seg_N.m4s`) | 7 days | Segments never change once written |
+| Master playlist (`master.m3u8`) | 60 seconds | New qualities become available as transcoding completes |
+| Thumbnails | 1 year | Immutable once created |
+| Signed URLs | 4-8 hours | Expire before they can be shared for free |
 
-</details>
+> **Take this with you.** "Use a CDN" is not a design. The regional shield is the critical piece. Without it, S3 cannot absorb the request volume on cache misses.
 
 ---
 
-## Step 6: Why the CDN is the whole story
+## Step 10: Storage tiering
 
-We computed 250 Tbps egress at peak. No single server can send that. We need to spread the load across hundreds of servers placed close to viewers around the world. That is what a CDN does.
+The system produces 70 PB of new data per year. Storage is the third-biggest cost, after CDN and compute. The key insight: most videos are never watched after the first week.
 
-A CDN has three tiers (layers). The viewer hits the closest tier first. If that tier does not have the file, it asks the next tier up.
+| Tier | What lives here | S3 class | Cost ($/GB/month) |
+|------|-----------------|----------|-------------------|
+| Hot | Segments watched in the last 7 days | S3 Standard | $0.023 |
+| Warm | Segments watched in the last 90 days | S3 Infrequent Access | $0.0125 |
+| Cold | Long-tail segments, source files after 30 days | S3 Glacier Instant | $0.004 |
+| Archive | Source files with no view in a year | S3 Glacier Deep Archive | $0.00099 |
 
-<details markdown="1">
-<summary><b>Show: the three-tier CDN</b></summary>
+A daily tiering job reads `last_viewed_at` from the analytics database. It demotes variants with no recent views. It promotes them back when a cold video suddenly goes viral.
 
-```
-                  +-------------------------------+
-                  |  Viewers (all around globe)   |
-                  +---+---------+--------+--------+
-                      |         |        |
-            Tokyo     |    NYC  |    Sao Paulo
-                      v         v        v
-                  +-------+ +-------+ +-------+
-                  | Edge  | | Edge  | | Edge  |     Tier 1: Edge PoPs
-                  | PoP   | | PoP   | | PoP   |     200+ worldwide
-                  | Tokyo | | NYC   | | SP    |     Cache: 95% hit
-                  +---+---+ +---+---+ +---+---+     TTL: 7 days
-                      |         |         |          Latency: <50ms
-                      |         |         |
-                      v         v         v
-                  +---------+         +---------+
-                  | Shield  |         | Shield  |    Tier 2: Regional
-                  | (Asia)  |         | (US-E)  |    shields, 10-20
-                  +----+----+         +----+----+    Cache: 80% hit on miss
-                       |                   |        TTL: 7 days
-                       |                   |        Latency: <100ms
-                       +---------+---------+
-                                 |
-                                 v
-                          +-------------+
-                          |   Origin    |             Tier 3: Origin
-                          |   (S3 +     |             1 per region
-                          |   signer)   |             Authoritative
-                          +-------------+             Latency: ~30ms
-```
+With tiering at roughly 5% hot / 15% warm / 80% cold, the blended cost drops from $0.023/GB to about $0.005/GB. That is a 4-5x reduction on the third-biggest line item.
 
-**How it works:**
-
-- **Edge PoP.** A PoP is a "point of presence." A small data center in a city. There are 200+ around the world. Holds the most popular content. When you press play in Tokyo, your request lands at the Tokyo PoP. 95% of requests get served right here.
-
-- **Regional shield.** One per cloud region (about 10-20 worldwide). When the Tokyo edge does not have the file, it asks the Asia shield. The shield holds everything any Asia edge ever fetched. Without this shield, 200 edges would all hit S3 directly for the same missing file. With the shield, the shield does one S3 fetch and serves the other 199.
-
-- **Origin.** S3 plus a small URL-signing service. The source of truth. Holds every segment of every video ever uploaded.
-
-> Why this matters. CDN egress costs $0.005 to $0.02 per GB depending on volume. At 600 PB per day (250 Tbps), that is $3M to $12M per day if we paid for every byte. With 95% edge hit rate, only 5% of bytes touch the shield. Only 20% of that touches S3. So S3 sees about 1% of total = ~6 PB per day. The cache hit rate is the most important number in the whole bill.
-
-**Tuning:**
-
-- **Segment TTL: 7 days.** Segments never change once written. Long TTL is safe.
-- **Master playlist TTL: 60 seconds.** Master playlists do change (when a new quality finishes encoding). Short TTL so viewers see new qualities quickly.
-- **Purge on takedown.** All major CDNs (Cloudflare, Fastly, Akamai, CloudFront) can purge by pattern (`/v_123/*`) in seconds.
-
-</details>
-
----
-
-## Step 7: Storage tiering
-
-We grow by 70 PB per year. Some videos get a billion views (Gangnam Style). Most get fewer than 100 views ever. Storing them all the same way is wasteful.
-
-Think about: which videos belong on fast (expensive) storage? Which can sit on slow (cheap) storage? Where do source files go?
-
-<details markdown="1">
-<summary><b>Show: the storage tiers</b></summary>
-
-Each video has two storage components: the **source** (the original upload) and the **transcoded variants** (what viewers watch). Each one moves between tiers independently based on age and views.
-
-| Tier | What lives here | Storage type | Cost ($/GB/month) | Retrieval |
-|------|-----------------|--------------|-------------------|-----------|
-| CDN edge | Segments getting views right now | SSD/RAM at PoPs | (cache, not paid storage) | <50 ms |
-| Shield | Warm segments per region | Regional SSD | $0.10 | <100 ms |
-| Hot | Variants of popular videos | S3 Standard | $0.023 | ~30 ms |
-| Warm | Variants of less popular videos | S3 Infrequent Access | $0.0125 | ~30 ms + per-GB fee |
-| Cold | Source files after 30 days, variants of dead videos | S3 Glacier Instant | $0.004 | seconds |
-| Archive | Sources of videos with no views in a year | S3 Glacier Deep Archive | $0.00099 | 12 hours |
-
-**How content moves:**
-
-- **New upload.** Source goes to hot. Variants go to hot. CDN warms up naturally as viewers watch.
-- **Daily tiering job.** Reads last-viewed timestamps. Demotes a variant (hot to warm) if no views in 7 days. Demotes again (warm to cold) if no views in 90 days.
-- **Promotion on read.** If a cold variant suddenly gets a spike of views (an old video goes viral), the first viewer pays a small retrieval cost. The job then promotes it back to hot.
-- **Source files.** Kept forever. We might need them later to re-encode in a new codec (when AV2 ships, for example). After 30 days, source moves from hot to cold. Re-encoding from cold takes a few seconds, fine for a background job.
-
-**The money math:**
-
-- 70 PB of new content per year, growing.
-- If all of it stayed in S3 Standard: $0.023/GB/mo × 70 PB × 12 = **$20M/year** for one year of content. After 10 years compounded: hundreds of millions.
-- With tiering: roughly 5% hot, 15% warm, 80% cold. Blended cost: ~$0.005/GB/mo. Same data costs **~$4M/year**. About 5x cheaper.
-
-> Why tiering is a trade-off. Aggressive demotion saves money but costs retrieval fees when a cold video gets a sudden view. The break-even rule: a demoted video should stay demoted longer than the cost to re-promote it. Real systems measure both demote count and within-30-day promotion count. If more than 30% of demoted videos get re-promoted, you demoted too early.
-
-</details>
+Source files are kept forever. A new codec ships every few years (AV2 will follow AV1). You will need the original source to re-encode without losing quality.
 
 ---
 
@@ -547,31 +562,31 @@ Each video has two storage components: the **source** (the original upload) and 
 
 Try answering each in 2 or 3 sentences before opening the solution.
 
-1. **Delete a viral video from every cache.** A creator deletes a video with 100M views. It is cached in every CDN edge around the world. How do you make playback stop globally within 60 seconds?
+1. **Delete a viral video.** A creator deletes a video that has 100M views. It is cached in hundreds of edge PoPs around the world. How do you stop playback globally within 60 seconds?
 
-2. **Backfill a new codec.** AV2 ships. You want to re-encode the top 10,000 most-watched videos to save bandwidth. How do you pick which ones, and how do you run the backfill?
+2. **AV1 backfill.** You want to re-encode the top 10,000 videos in AV1 to reduce bandwidth costs. How do you pick which videos to prioritize, and how do you run the job without disrupting live uploads?
 
-3. **Live streaming.** A creator wants to go live to 5 million concurrent viewers with sub-3-second latency. What changes in the architecture? Hint: ingest changes, transcoding becomes real-time, the segment protocol changes (LL-HLS or LL-DASH).
+3. **Live streaming.** A creator wants to broadcast a concert to 5 million concurrent viewers with under 3 seconds of delay. What changes in the architecture? What stays the same?
 
-4. **Thumbnails.** Every video has 1 to 3 main thumbnails plus auto-generated frames for the seek-bar preview. How do you make, store, and serve them at scale (millions per day)?
+4. **Thumbnails at scale.** Every video needs 1-3 main thumbnails and auto-generated frames for the seek bar. How do you generate, store, and serve them? (There are ~120 seek frames per 4-minute video.)
 
-5. **Copyright takedown.** A takedown notice arrives. You must block playback globally within 5 minutes, but you cannot delete the file (you may need it for legal review). How do you do it?
+5. **Copyright takedown.** A valid takedown notice arrives. You must block playback globally within 5 minutes. You cannot delete the source file (it may be needed for legal review). How do you do it?
 
-6. **Watch-time analytics.** A creator wants to see "viewers dropped off at the 3:47 mark." Where does that data come from, and how do you compute it across billions of sessions?
+6. **Watch-time analytics.** A creator wants to see "60% of viewers dropped off at the 3:47 mark." Where does that data come from, and how do you compute it across billions of viewer sessions?
 
-7. **DRM (Netflix mode).** Now every segment must be encrypted. Every device must request a per-session decryption key. Add the DRM pieces to your diagram and explain the key flow.
+7. **DRM (Netflix mode).** The product switches to a subscription model. Every segment must be encrypted. Every device must get a decryption key before playback. What does the key flow look like?
 
-8. **Subtitles and multiple audio tracks.** A video has English, Spanish, and Hindi audio plus 12 subtitle languages. How do these fit into HLS or DASH? What does the manifest look like?
+8. **Multiple audio tracks.** A video has English, Spanish, and Hindi audio, plus 12 subtitle languages. How do these fit into an HLS master playlist? How does the player know which audio to download?
 
-9. **Shield outage.** Your regional shield goes down. All edges now hit S3 directly. What is the blast radius and how do you survive?
+9. **Regional shield outage.** Your Asia regional shield goes down. What is the blast radius? What happens to the 200 edge PoPs behind it?
 
-10. **Real-time view counts.** The recommendation team wants view counts with under 5 seconds of freshness for ranking. Your current pipeline is 30 minutes behind. Where do they plug in?
+10. **Real-time view counts.** The recommendation team needs view counts with under 5 seconds of freshness for ranking signals. Your current Flink pipeline has 30 minutes of lag. What do you change?
 
 ---
 
 ## Related problems
 
-- **[URL Shortener (001)](../001-url-shortener/question.md).** Introduces CDN caching, TTL trade-offs, hot keys in a smaller system.
-- **[Notification System (010)](../010-notification-system/question.md).** The "your video is ready" and "new video from someone you follow" notifications ride on it.
-- **[News Feed (002)](../002-news-feed/question.md).** The watch page is one row in a feed; they share the metadata store and the follow graph.
-- **[Distributed Cache (009)](../009-distributed-cache/question.md).** The manifest cache and metadata cache lean on the same primitives.
+- **[URL Shortener (001)](../001-url-shortener/question.md).** Introduces CDN caching, TTL trade-offs, and hot-key problems at a smaller scale.
+- **[Notification System (010)](../010-notification-system/question.md).** The "your video is ready" and "new video from someone you follow" notifications run through it.
+- **[News Feed (002)](../002-news-feed/question.md).** The watch page entry is one row in a feed. They share the metadata store and the follow graph.
+- **[Distributed Cache (009)](../009-distributed-cache/question.md).** The manifest cache and hot-metadata cache use the same principles.

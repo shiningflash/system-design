@@ -2,27 +2,21 @@
 
 ### The short version
 
-A load balancer is a reverse proxy with two jobs: pick a backend for each incoming request, and keep the list of backends honest (kick out the dead ones).
+A load balancer has two jobs: pick a backend for each incoming request, and keep the list of backends honest by kicking out the dead ones.
 
-The picking is the easy part. The interesting design work is everything around it. What does the LB *see* (L4 sees just IPs and ports, L7 sees the full HTTP request)? How does it decide a backend is healthy? What happens when a sticky cookie sends a user to a backend that then dies? And how do you stop the LB itself from being the thing that takes the whole site down?
+The picking is simple. A round-robin loop or a least-connections counter handles most workloads. The interesting design work is everything around it. What does the LB *see* (L4 sees only IPs and ports; L7 sees the full HTTP request)? How does it decide a backend is unhealthy? What happens when a sticky cookie sends a user to a backend that then dies? And how do you stop the LB itself from taking the whole site down?
 
-The right setup is layered. DNS or anycast routes users to the nearest region. Inside each region, an L7 LB terminates TLS and does path-based routing to per-service pools. Inside each service tier, you may have a smaller L4 LB or a sidecar mesh. Each layer adds 1-3 ms of latency in exchange for one specific control point. You add layers when something specific breaks. Not before.
-
-Scaling is straightforward but easy to get wrong. A single nginx is already a load balancer at 100 users. It is still fine at 10,000. Past that you add health checks and more backends. Then a managed cloud LB to handle TLS and DDoS. Then a global LB for geo-routing. Then sidecars for service-to-service traffic.
-
-The trick: each step is driven by a *specific* failure. Bandwidth. TLS CPU. Connection count. Or geographic latency. Naming which one will break first for *your* workload is the whole interview.
+The right setup is layered. DNS or anycast routes users to the nearest region. Inside each region, an L7 LB terminates TLS and does path-based routing to per-service pools. Inside each pod, a sidecar handles service-to-service traffic. Each layer adds 1-3 ms of latency in exchange for one specific control point. You add layers when something specific breaks.
 
 ---
 
-### 1. The clarifying questions, recap
+### 1. The two questions that matter most
 
-The eight questions are in `question.md`. Two of them drive almost the whole architecture.
+**Protocol shape.** HTTP/2 with multiplexed connections is a totally different load picture from HTTP/1.1 with short connections. WebSockets change it again. The algorithm that works for HTTP/1.1 fails for HTTP/2. The algorithm that works for short requests fails for WebSockets. Protocol is the single most important answer to get right.
 
-**Protocol shape.** HTTP/2 with long-lived multiplexed connections is a totally different load picture from HTTP/1.1 with short connections. WebSockets change it again. Round-robin is fine for HTTP/1.1, lies to you under HTTP/2, and actively breaks for WebSockets.
+**Stickiness requirement.** If backends are stateless (sessions in Redis, not memory), every algorithm is on the table. If they hold state (carts, WebSocket handles, in-memory caches), every algorithm has a tax: sticky algorithms cause uneven load; stateless algorithms force you to externalize state, which costs a network hop per request.
 
-**Stickiness requirement.** If backends hold no state (sessions in Redis, not memory), every algorithm is on the table. If they hold state (carts, WebSocket connections, in-memory caches), every algorithm has a tax. Sticky algorithms cause uneven load. Stateless algorithms force you to externalize state, which costs a network hop per request.
-
-Everything else (geo, TLS, health checks, failover) follows from those two answers.
+Everything else (geo-routing, TLS offload, health checks, failover) follows from those two answers.
 
 ---
 
@@ -30,114 +24,53 @@ Everything else (geo, TLS, health checks, failover) follows from those two answe
 
 | Stage | Users | Req/sec peak | Bandwidth | Concurrent conns | New TCP/sec | What hurts |
 |-------|-------|--------------|-----------|------------------|-------------|------------|
-| 1 | 100 | 10 | ~5 Mbps | ~50 | ~5 | nothing; the box is bored |
-| 2 | 10k | 500 | ~240 Mbps | ~2k | ~50 | NIC and nginx workers |
-| 3 | 100k | 5k | ~2.4 Gbps | ~20k | ~500 | TLS CPU starts to matter |
-| 4 | 1M | 30k | ~5-15 Gbps | ~200k+ | ~3k | TLS dominates, need multiple LBs |
+| **1** | 100 | 10 | ~5 Mbps | ~50 | ~5 | nothing; the box is bored |
+| **2** | 10k | 500 | ~240 Mbps | ~2k | ~50 | NIC and nginx workers |
+| **3** | 100k | 5k | ~2.4 Gbps | ~20k | ~500 | TLS CPU starts to bite |
+| **4** | 1M | 30k | ~5-15 Gbps | ~200k+ | ~3k | TLS dominates; need multiple LBs |
 
 Three ceilings to watch:
 
 **Bandwidth.** A single 10 Gbps NIC handles about 9 Gbps usable. Video and file-heavy workloads hit this first.
 
-**TLS handshakes.** Each handshake costs 1-3 ms of CPU. At 1,000/sec you spend 2 cores. At 10,000/sec, 20 cores doing nothing but handshakes. Fix: session resumption. When the same client returns, they reuse a "ticket" from last time. About 10x cheaper. TLS 1.3 with tickets is non-negotiable at scale.
+**TLS handshakes.** Each handshake costs 1-3 ms of CPU. At 500/sec you spend roughly one core. At 3,000/sec, six cores doing nothing but handshakes. Fix: session resumption. When the same client returns, they reuse a "ticket" from last time (about 10x cheaper). TLS 1.3 with tickets is non-negotiable above stage 3.
 
-**Connection count.** Each kept-alive connection costs file descriptors and ~10 KB of kernel memory. 1M concurrent connections needs Linux tuning (`ulimit`, `net.core.somaxconn`) and several GB of RAM just for the socket table.
+**Connection count.** Each kept-alive connection costs file descriptors and ~10 KB of kernel memory. 200k concurrent connections needs Linux tuning and several GB of RAM just for the socket table.
 
-Which ceiling hits first depends on your workload. Video CDN: bandwidth. IoT: TLS. Chat/WebSocket: connection count. Knowing which one is *yours* separates a generic answer from a useful one.
+Which ceiling hits first depends on your workload. Video CDN: bandwidth. IoT: TLS. Chat: connection count. Naming which one is *yours* separates a useful answer from a generic one.
 
 ---
 
-### 3. The API
+### 3. The API (control plane)
 
-A load balancer is not a REST API. It is a TCP/HTTP proxy. There are two surfaces.
-
-The **data plane** is the LB doing its actual job: accept connection, pick backend, forward bytes. No REST endpoints here. The "API" is "speak HTTP at me and I will proxy."
-
-The **control plane** is the admin API: add a backend, remove one, change weights, drain a backend before deploy, view current health.
+A load balancer is not a REST API. It is a TCP/HTTP proxy. The "API" is "speak HTTP at me and I will proxy." But every LB needs a **control plane** to manage its config.
 
 ```
-GET    /admin/v1/pools                          # list all backend pools
-GET    /admin/v1/pools/{pool}/backends          # list backends with health
-POST   /admin/v1/pools/{pool}/backends          # add a backend
-DELETE /admin/v1/pools/{pool}/backends/{id}     # remove a backend
-PUT    /admin/v1/pools/{pool}/backends/{id}     # change weight or state
+GET    /admin/v1/pools                           list all backend pools
+GET    /admin/v1/pools/{pool}/backends           list backends with health status
+POST   /admin/v1/pools/{pool}/backends           add a backend
+DELETE /admin/v1/pools/{pool}/backends/{id}      remove a backend
+PUT    /admin/v1/pools/{pool}/backends/{id}      change weight or state
 
-POST   /admin/v1/pools/{pool}/backends/{id}/drain   # no new conns,
-                                                    # let existing finish
-POST   /admin/v1/pools/{pool}/backends/{id}/ready   # re-enable
+POST   /admin/v1/pools/{pool}/backends/{id}/drain   stop new conns, let existing finish
+POST   /admin/v1/pools/{pool}/backends/{id}/ready   re-enable
 
-GET    /admin/v1/pools/{pool}/health            # current health snapshot
-GET    /admin/v1/stats                          # request rate, errors, latency
+GET    /admin/v1/stats                           request rate, errors, latency histograms
 ```
 
-The actual data model is in the LB's config file. nginx:
-
-```nginx
-upstream api_backend {
-    least_conn;
-    server 10.0.1.10:8080 weight=3 max_fails=3 fail_timeout=30s;
-    server 10.0.1.11:8080 weight=3 max_fails=3 fail_timeout=30s;
-    server 10.0.1.12:8080 weight=1 max_fails=3 fail_timeout=30s backup;
-    keepalive 64;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name api.example.com;
-
-    ssl_certificate     /etc/ssl/api.crt;
-    ssl_certificate_key /etc/ssl/api.key;
-    ssl_session_cache   shared:SSL:50m;
-    ssl_session_timeout 1d;
-
-    location /api/orders/ {
-        proxy_pass http://order_service;
-    }
-    location /api/ {
-        proxy_pass http://api_backend;
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Real-IP $remote_addr;
-
-        proxy_next_upstream error timeout http_502 http_503 http_504;
-        proxy_next_upstream_tries 2;
-    }
-    location /healthz {
-        return 200 "ok\n";
-    }
-}
-```
-
-HAProxy equivalent (you will see this in production too):
-
-```
-frontend api_frontend
-    bind *:443 ssl crt /etc/ssl/api.pem alpn h2,http/1.1
-    default_backend api_backend
-    acl is_orders path_beg /api/orders/
-    use_backend order_service if is_orders
-
-backend api_backend
-    balance leastconn
-    option httpchk GET /healthz
-    http-check expect status 200
-    server api1 10.0.1.10:8080 check inter 5s fall 3 rise 2 weight 100
-    server api2 10.0.1.11:8080 check inter 5s fall 3 rise 2 weight 100
-    server api3 10.0.1.12:8080 check inter 5s fall 3 rise 2 weight 50 backup
-```
+The `drain` endpoint is worth calling out. Before you kill a backend for a deploy, you call drain. The LB stops sending new connections to it. Existing in-flight requests finish. After a 30-second grace period, you kill the process. Skip this step and you drop requests.
 
 ---
 
 ### 4. The data model
 
-The LB itself is mostly stateless. What state it does have is small and lives in RAM.
+The LB is mostly stateless. The state it holds lives entirely in RAM. There is no database.
 
 ```
 BackendPool {
     name: string
-    algorithm: enum { round_robin, least_conn, ip_hash,
-                      consistent_hash, ewma, weighted_rr }
+    algorithm: round_robin | least_conn | ip_hash |
+               consistent_hash | ewma | weighted_rr
     health_check: HealthCheckConfig
     backends: List<Backend>
 }
@@ -145,268 +78,269 @@ BackendPool {
 Backend {
     id: string                        # "10.0.1.10:8080"
     address: ip + port
-    weight: int                       # for weighted algorithms
-    state: enum { healthy, unhealthy, draining, maintenance }
-    consecutive_failures: int         # for active health check
-    consecutive_successes: int        # for active health check
+    weight: int
+    state: healthy | unhealthy | draining | maintenance
+    consecutive_failures: int
+    consecutive_successes: int
     in_flight_requests: atomic int    # for least_conn
-    ewma_latency_ms: float            # for EWMA algorithm
-    recent_5xx_count: ring_buffer     # for passive outlier detection
+    ewma_latency_ms: float            # for EWMA
     last_check_at: timestamp
 }
 
 HealthCheckConfig {
-    type: enum { http, tcp, grpc }
-    path: string                      # for http; "/healthz"
-    interval_ms: int                  # e.g., 5000
-    timeout_ms: int                   # e.g., 1000
-    unhealthy_threshold: int          # consecutive fails to eject
-    healthy_threshold: int            # consecutive successes to re-add
-    expected_status: List<int>        # [200] or [200, 204]
-}
-
-# Only if cookie-based stickiness is on.
-StickyTable {
-    map: ConcurrentMap<cookie_value, backend_id>
-    ttl: duration
+    type: http | tcp | grpc
+    path: string                      # "/healthz"
+    interval_ms: int                  # 5000
+    timeout_ms: int                   # 1000
+    unhealthy_threshold: int          # 3 consecutive fails = eject
+    healthy_threshold: int            # 2 consecutive successes = re-add
+    expected_status: List<int>        # [200]
+    max_ejection_percent: int         # 50: never eject more than half
 }
 ```
 
-A few things to defend out loud:
+Three things to defend out loud:
 
-**All of this fits in RAM.** A pool of 1,000 backends with full state is well under 1 MB. There is no database. The LB process owns the state.
+**All of this fits in RAM.** A pool of 1,000 backends with full state is well under 1 MB. There is no database, no Zookeeper, no Consul required for the hot path. The LB process owns the state.
 
-**Each LB instance has its own opinion about health.** They do not share. By design. If LB #1's network path to backend X is broken but LB #2's path to X works fine, each should route to whatever it can reach. Sharing one global "X is unhealthy" opinion would turn a local network problem into a global outage.
+**Each LB instance has its own opinion about health.** They do not share. By design. If LB-1's network path to backend B is broken but LB-2's path to B is fine, each should route to whatever it can reach. Sharing one global "B is unhealthy" opinion would turn a local network problem into a global outage.
 
-**For sticky sessions across multiple LB instances**, the cleanest answer is: do not share state. Put the backend ID *inside the cookie itself* (signed and encrypted by the LB so clients cannot tamper with it). Any LB can read the cookie and route correctly.
+**For sticky sessions across multiple LB instances**, put the backend ID inside the cookie itself (signed and encrypted). Any LB instance can decrypt it and route correctly. No shared state needed between LB instances.
 
 ---
 
-### 5. The core algorithm
+### 5. The engine
 
-The LB's main loop is tiny.
+The LB's main loop is small.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Accept: TCP connection arrives
+    Accept --> MatchPool: match by host or port
+    MatchPool --> PickBackend: run algorithm
+    PickBackend --> Forward: send request
+    Forward --> RecordOutcome: update EWMA, in_flight counter
+    RecordOutcome --> [*]: response sent
+    Forward --> RetryNext: backend error
+    RetryNext --> PickBackend: if retries < max
+    RetryNext --> Return502: retries exhausted
+    Return502 --> [*]
+```
+
+<details markdown="1">
+<summary><b>Show: the pick and forward loop in pseudo-code</b></summary>
 
 ```python
-def handle_connection(conn):
-    """Called once per incoming TCP connection (L4) or per HTTP request (L7)."""
-    pool = match_pool_by_host_or_port(conn)
+def handle_request(conn):
+    pool = match_pool(conn.host, conn.port)
+    retries = 0
 
-    while True:
-        backend = pool.pick_backend(conn)
+    while retries < pool.max_retries:
+        backend = pick_backend(pool, conn)
         if backend is None:
             return respond_503(conn, "no healthy backends")
 
-        # Forward. If forwarding fails (backend died between health checks),
-        # try the next one. Cap retries so a broken pool fails fast.
+        backend.in_flight.increment()
         try:
-            backend.in_flight.increment()
             response = forward(conn, backend)
             backend.in_flight.decrement()
-            record_outcome(backend, response.status, response.latency)
+            record_outcome(backend, response.status, response.latency_ms)
             return respond(conn, response)
         except BackendError as e:
             backend.in_flight.decrement()
             record_failure(backend, e)
-            if retries >= pool.max_retries:
-                return respond_502(conn, "backend exhausted")
-            continue
+            retries += 1
+
+    return respond_502(conn, "backend exhausted after retries")
+
 
 def pick_backend(pool, conn):
-    """Picks one. Returns None if pool is empty."""
     healthy = [b for b in pool.backends if b.state == "healthy"]
     if not healthy:
         return None
 
-    if pool.algorithm == "round_robin":
-        return healthy[pool.rr_counter.next() % len(healthy)]
-    elif pool.algorithm == "least_conn":
+    if pool.algorithm == "least_conn":
         return min(healthy, key=lambda b: b.in_flight.get())
-    elif pool.algorithm == "ip_hash":
-        return healthy[hash(conn.client_ip) % len(healthy)]
+
+    elif pool.algorithm == "round_robin":
+        return healthy[pool.rr_counter.next() % len(healthy)]
+
     elif pool.algorithm == "consistent_hash":
         return pool.hash_ring.lookup(conn.routing_key)
+
     elif pool.algorithm == "ewma":
-        return min(healthy, key=lambda b: b.ewma_latency_ms
-                                          + b.in_flight.get() * EXP_REQ_MS)
-    elif pool.algorithm == "weighted_rr":
-        return pool.weighted_rr.next(healthy)
+        return min(healthy, key=lambda b: b.ewma_latency_ms)
 ```
 
-The health check loop runs in parallel, one thread per backend (or one batched checker per pool). It polls `/healthz`, increments consecutive_successes or consecutive_failures, and flips state when thresholds are crossed.
+The health check loop runs in parallel. It polls `/healthz` on each backend, updates consecutive failure/success counters, and flips state when thresholds are crossed. Passive outlier detection runs on every response: update the EWMA, check if the recent error rate exceeds the threshold, eject if it does (but never more than `max_ejection_percent`).
 
-Passive outlier detection runs on every request: update the EWMA latency, push to a 5xx ring buffer, eject the backend temporarily if the recent 5xx count exceeds the threshold. Critically, the eject only happens if it would not push the pool below `max_ejection_percent`.
+</details>
 
 Three things make this safe:
 
-**Pick-and-forward tolerates a backend dying between health checks.** If forwarding raises, the LB moves to the next backend. Capped so a fully broken pool fails fast instead of looping forever.
+**Pick-and-forward tolerates a backend dying between health checks.** If forwarding raises, the LB moves to the next backend. Retries are capped so a fully broken pool fails fast.
 
-**Active and passive checks complement each other.** Active catches process death and obvious failures. Passive catches slow degradation that active misses (a backend returning 200 to `/healthz` while throwing 500 on real traffic).
+**Active and passive checks complement each other.** Active catches process death. Passive catches slow degradation: a backend returning 200 to `/healthz` while throwing 500 on real traffic.
 
-**`max_ejection_percent` is the difference between graceful degradation and total outage.** The outlier code refuses to eject if doing so would push the pool below the floor. Better to keep sending traffic to a sick backend than to send it nowhere.
-
----
-
-### 6. The architecture, drawn out
-
-Here is the full stack at 1 million users.
-
-```
-                          User worldwide
-                                |
-                                v
-                       +-----------------+
-                       |       DNS       |   Returns anycast IP, or
-                       |  (Route 53,     |   geo-aware A record per region.
-                       |  Cloudflare)    |   TTL 60s for fast failover.
-                       +--------+--------+
-                                |
-                                v
-                  +---------------------------+
-                  |    Anycast IP via BGP     |   Same IP advertised from
-                  |  (Cloudflare, AWS Global  |   every region. BGP routes
-                  |  Accelerator, GCP Premium |   client to nearest healthy
-                  |  Tier)                    |   region.
-                  +-------------+-------------+
-                                |
-        +-----------------------+-----------------------+
-        |                       |                       |
-        v                       v                       v
-  +-------------+         +-------------+         +-------------+
-  | Region:     |         | Region:     |         | Region:     |
-  | us-east     |         | eu-west     |         | ap-south    |
-  |             |         |             |         |             |
-  | +---------+ |         | +---------+ |         | +---------+ |
-  | | Edge L4 | |         | | Edge L4 | |         | | Edge L4 | |
-  | |   LB    | |         | |   LB    | |         | |   LB    | |
-  | | (NLB,   | |         | |         | |         | |         | |
-  | | DDoS    | |         | |         | |         | |         | |
-  | | scrub)  | |         | |         | |         | |         | |
-  | +----+----+ |         | +----+----+ |         | +----+----+ |
-  |      |      |         |      |      |         |      |      |
-  |      v      |         |      v      |         |      v      |
-  | +---------+ |         | +---------+ |         | +---------+ |
-  | | L7 LB   | |         | | L7 LB   | |         | | L7 LB   | |
-  | | (ALB,   | |         | |         | |         | |         | |
-  | | Envoy,  | |         | |         | |         | |         | |
-  | | nginx)  | |         | |         | |         | |         | |
-  | | TLS +   | |         | |         | |         | |         | |
-  | | path    | |         | |         | |         | |         | |
-  | | routing | |         | |         | |         | |         | |
-  | +--+--+--++ |         | +---------+ |         | +---------+ |
-  |    |  |  |  |         |             |         |             |
-  |    v  v  v  |         |             |         |             |
-  | +---+ +--+ +--+       | per-service |         | per-service |
-  | |api| |au| |st|       | pools +     |         | pools +     |
-  | |   | |th| |at|       | sidecar     |         | sidecar     |
-  | +---+ +--+ +--+       | mesh        |         | mesh        |
-  |  pods (each   |       |             |         |             |
-  |  with Envoy   |       |             |         |             |
-  |  sidecar)     |       |             |         |             |
-  +---------------+       +-------------+         +-------------+
-```
-
-What each layer does and *why* it earns its slot:
-
-**DNS** is the first place where balancing happens (whether you call it that or not). Returning multiple A records to a hostname is round-robin at layer zero. Geo-aware DNS (Route 53 latency routing) is poor-man's geo-LB and works when anycast is unavailable.
-
-**Anycast** announces the same IP from every region using BGP. ISPs route each client to the nearest LB pool. Failover is automatic and silent: a region's BGP session drops, traffic shifts to the next-nearest in seconds.
-
-**Edge L4 LB** is the first line of defense. Terminates TCP, absorbs DDoS, hands off to L7. Often a managed service (AWS NLB, Cloudflare's edge). Optimized for raw packet throughput, not for parsing.
-
-**L7 LB** is where TLS termination lives. Parses HTTP. Does path and host routing. Applies per-route rate limits. Injects headers like `X-Forwarded-For`. nginx, HAProxy, Envoy, ALB.
-
-> Why two layers of load balancing? Because the edge LB does one job extremely well: terminate TLS and route to the right region. The L7 LB inside the region does the smart stuff: path-based routing, sticky sessions, header-based A/B tests. Mixing the two into one box creates a single point of failure that is also slower.
-
-**Service tier.** Each backend service has its own pool. The L7 LB routes to it by path.
-
-**Sidecar mesh (Envoy, Linkerd, Istio).** For service-to-service traffic *inside* the cluster. Every pod has its own Envoy sidecar. That sidecar is the LB for outbound traffic. Removes the central LB hop for internal calls. Adds 1-2 ms per hop but gives you per-service mTLS, retries, and observability for free.
+**`max_ejection_percent` is the difference between partial outage and total outage.** The outlier code refuses to eject if doing so would drop the pool below the floor. Better to keep sending traffic to a sick backend than to send it nowhere.
 
 ---
 
-### 7. A request's journey, end to end
+### 6. Resolving L4 vs L7
 
-There is no separate "read path" and "write path" inside the LB. There is one path: request in, pick backend, forward, response out.
+Before drawing topology, you need to know what the LB is actually doing at each layer.
 
-But it is worth tracing one request through all the layers to see where the latency comes from.
+```mermaid
+erDiagram
+    L4_LB {
+        string sees "TCP headers only: src IP, dst IP, src port, dst port"
+        string routes_by "IP and port"
+        string tls "pass-through OR terminate"
+        string latency "under 1 ms"
+        string use_when "raw TCP, databases, DDoS scrubbing"
+        string examples "AWS NLB, IPVS, HAProxy TCP mode"
+    }
 
-A user in Sydney hits `api.example.com`:
-
-```
-Browser    DNS    Anycast/BGP   Edge L4    L7 LB     Backend
-   |        |          |           |         |          |
-   |  resolve api      |           |         |          |
-   |------->|          |           |         |          |
-   |<-------|          |           |         |          |
-   | returns anycast IP|           |         |          |
-   |        |          |           |         |          |
-   | TCP SYN to anycast IP         |         |          |
-   |------------------>|           |         |          |
-   |        |  BGP routes to ap-south        |          |
-   |        |          |---------->|         |          |
-   |        |          |  5-tuple hash       |          |
-   |        |          |  to L7 LB instance  |          |
-   |        |          |           |-------->|          |
-   |        |          |           |         |          |
-   |  TLS handshake (1-RTT, or 0-RTT with ticket)       |
-   |<================================>|     |          |
-   |        |          |           |         |          |
-   |  HTTP request "GET /api/orders/123"     |          |
-   |--------------------------------------->|          |
-   |        |          |           |  parse |          |
-   |        |          |           |  match path       |
-   |        |          |           |  pick backend     |
-   |        |          |           |  (least_conn)     |
-   |        |          |           |         |  forward|
-   |        |          |           |         |-------->|
-   |        |          |           |         |  process|
-   |        |          |           |         |<--------|
-   |        |          |           |         |  200 OK |
-   |        |          |           |<--------|         |
-   |  200 OK streams back                    |         |
-   |<---------------------------------------|         |
+    L7_LB {
+        string sees "full HTTP: method, path, headers, cookies, body"
+        string routes_by "path, host, cookie, header, query string"
+        string tls "always terminates (needs to read URLs)"
+        string latency "1 to 3 ms"
+        string use_when "internet-facing HTTP, path routing, stickiness"
+        string examples "nginx, HAProxy HTTP mode, Envoy, AWS ALB"
+    }
 ```
 
-Step by step, with latency budgets:
+The common production pattern: **L4 at the edge, L7 inside the region.**
 
-- **DNS resolution.** Cached <1 ms, uncached ~30 ms. Only the first connect pays this.
-- **Anycast routing.** BGP routes the SYN to ap-south. ~10 ms round trip from Sydney.
-- **Edge L4 LB.** Picks one of N edge instances by 5-tuple hash (same connection always lands on same instance). Forwards to L7. <1 ms.
-- **L7 LB TLS handshake.** TLS 1.3. With a session ticket: 0-RTT. Without: 1 RTT. 0-15 ms.
-- **L7 LB parse and route.** Match `/api/orders/123` to the order_service pool. <1 ms.
-- **L7 LB backend selection.** Pool uses least_connections. Picks pod #7. <1 ms.
-- **L7 LB to backend.** Reuse a TCP connection from the keepalive pool. <1 ms inside the region.
-- **Backend processes.** 5-50 ms.
-- **Response streams back.** Dominated by network send time.
-
-Total: 30-100 ms for a fresh client, 10-50 ms for a returning client (DNS cached, TLS resumed). The LB layers added maybe 5 ms. That is the price for control, observability, and smart routing.
+The edge L4 terminates TCP, absorbs DDoS, and passes bytes to the L7. The L7 inside the region terminates TLS, reads URLs, does path routing, and applies per-route policy. Each does exactly one thing. A single box trying to do both is slower and harder to scale.
 
 ---
 
-### 8. The scaling journey: 10 users to 1 million
+### 7. The architecture
 
-This is the part interviewers care about most. Four stages. Each is driven by a *specific* failure, not by anticipated load. Build nothing before you need it.
+```mermaid
+flowchart TB
+    subgraph GlobalEdge["Global edge"]
+        DNS["DNS + anycast IP<br/>(Route 53, Cloudflare)"]:::edge
+    end
+
+    subgraph USEast["Region: us-east"]
+        EL4["Edge L4 LB<br/>(NLB, DDoS scrub)"]:::edge
+        L7["L7 LB<br/>(nginx / ALB<br/>TLS + path routing)"]:::edge
+        subgraph Pools["Service pools"]
+            API["Orders service<br/>(N pods)"]:::app
+            Auth["Auth service<br/>(N pods)"]:::app
+            Static["Static service<br/>(N pods)"]:::app
+        end
+        Redis[("Redis<br/>(sessions)")]:::cache
+    end
+
+    subgraph EUWest["Region: eu-west"]
+        EL4_EU["Edge L4 LB"]:::edge
+        L7_EU["L7 LB"]:::edge
+        Pools_EU["Service pools"]:::app
+    end
+
+    C([Browser]):::user --> DNS
+    DNS --> EL4
+    DNS --> EL4_EU
+    EL4 --> L7
+    L7 -->|/api/orders/*| API
+    L7 -->|/api/auth/*| Auth
+    L7 -->|/static/*| Static
+    API -.session check.-> Redis
+    EL4_EU --> L7_EU
+    L7_EU --> Pools_EU
+
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+```
+
+What each box earns:
+
+| Box | What it does | Why it exists |
+|-----|--------------|---------------|
+| **DNS + anycast** | Routes each user to the nearest healthy region | Sub-second regional failover via BGP withdraw |
+| **Edge L4 LB** | Terminates TCP, absorbs DDoS | Fast; does not parse HTTP; scales to Tbps |
+| **L7 LB** | Terminates TLS, routes by path, injects headers | Smart routing; per-route policy; observability |
+| **Service pools** | The actual backends, one pool per service | Each service scales independently |
+| **Redis** | Holds sessions | Lets backends be stateless; enables any-backend routing |
+
+> **Take this with you.** If the auth service dies, the rest of the site keeps running. Each service pool is independent. The LB is the only thing that sees all of them.
+
+---
+
+### 8. A request, end to end
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Alice
+    participant DNS
+    participant EdgeL4 as Edge L4
+    participant L7 as L7 LB
+    participant Orders as Orders backend
+
+    Alice->>DNS: resolve api.example.com
+    DNS-->>Alice: anycast IP (BGP has routed to us-east)
+
+    rect rgb(241, 245, 249)
+        Note over Alice,L7: TLS setup (paid once per connection)
+        Alice->>EdgeL4: TCP SYN to anycast IP
+        EdgeL4->>L7: 5-tuple hash picks one L7 instance
+        Alice->>L7: TLS 1.3 handshake (1-RTT new, 0-RTT returning)
+    end
+
+    Alice->>L7: GET /api/orders/123
+    L7->>L7: match /api/orders/*, pick backend (least connections)
+    L7->>Orders: GET /api/orders/123 + X-Forwarded-For: Alice's IP
+    Orders-->>L7: 200 OK + JSON
+    L7-->>Alice: 200 OK + JSON
+    Note over L7,Orders: in_flight counter decremented, EWMA updated
+```
+
+Latency budget per step:
+
+| Step | Typical latency |
+|------|-----------------|
+| DNS (cached) | < 1 ms |
+| BGP/anycast routing | ~5-20 ms (first connection only) |
+| Edge L4 forwarding | < 1 ms |
+| TLS handshake (new client) | 10-30 ms |
+| TLS resumption (returning) | 0-5 ms |
+| L7 parse + route | < 1 ms |
+| Backend processing | 5-50 ms |
+
+The LB layers add maybe 5 ms total. That is the price for control, observability, and smart routing.
+
+---
+
+### 9. The scaling journey: 10 users to 1 million
+
+```mermaid
+flowchart LR
+    S1["Stage 1\n10-100 users\n1 nginx + 1 backend\n~$5/mo"]:::s1
+    S2["Stage 2\n~10k users\n+ real health checks\n+ 3-5 backends\n~$50-100/mo"]:::s2
+    S3["Stage 3\n~100k users\n+ two LB instances\n+ managed cloud LB\n+ path routing\n~$1-5k/mo"]:::s3
+    S4["Stage 4\n1M users\n+ anycast global LB\n+ per-region L7\n+ sidecar mesh\n~$10-100k/mo"]:::s4
+
+    S1 --> S2 --> S3 --> S4
+
+    classDef s1 fill:#e0f2fe,stroke:#0369a1,color:#0c4a6e
+    classDef s2 fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef s3 fill:#fef3c7,stroke:#a16207,color:#713f12
+    classDef s4 fill:#fce7f3,stroke:#be185d,color:#831843
+```
 
 #### Stage 1: 100 users, single nginx, one backend
 
-```
-[Browser] -> [nginx :443] -> [backend :8080]
-```
+One nginx, one backend. nginx terminates TLS, proxies HTTP. Round-robin across one backend is a no-op, but the config is ready for a second.
 
-That single nginx is already a load balancer. It:
-
-- Terminates TLS so the backend speaks plain HTTP.
-- Does a trivial "round-robin" across one backend (a no-op, but the config is ready).
-- Does a trivial `/healthz` check.
-
-Why put nginx in front from day 1? Three reasons:
-
-- You can swap the backend (deploy on port 8081, switch upstream, no DNS change).
-- You can add a second backend later without restructuring.
-- TLS lives in one place, so cert renewal does not need a backend deploy.
-
-Cost: ~$5/month for a t3.micro running both nginx and the backend. Or less on a hobby tier.
-
-What you do **not** build yet: no real health checker, no failover (the box dies, the service is down; for 100 users that is fine), no sticky sessions.
+What you **do not** build: no health checker (one backend is always up or the site is down), no failover (acceptable for 100 users), no sticky sessions.
 
 #### Stage 2: 10,000 users, 3-5 backends, real health checks
 
@@ -414,365 +348,177 @@ What you do **not** build yet: no real health checker, no failover (the box dies
 
 **The fixes:**
 
-- Scale backends to 3-5 instances behind the same nginx.
-- Switch the algorithm to `least_conn`. Round-robin is okay, but `least_conn` handles variable request times better.
-- Add active health checks every 5 seconds against `/healthz`. Eject after 3 failures, re-add after 2 successes.
-- For deploys, drain one backend at a time (`down` in nginx config, reload, redeploy, bring it back).
-- Add `proxy_next_upstream` so the LB silently retries on a different backend if the first one fails.
+- Scale to 3-5 backends behind the same nginx.
+- Switch to `least_conn`. Handles variable request times better than round-robin.
+- Add active health checks every 5 seconds. Eject after 3 failures, re-add after 2 successes.
+- Add `proxy_next_upstream` so the LB retries on a different backend when one fails.
+- For deploys: drain one backend at a time before killing it.
 
-```nginx
-upstream api {
-    least_conn;
-    server 10.0.1.10:8080 max_fails=3 fail_timeout=30s;
-    server 10.0.1.11:8080 max_fails=3 fail_timeout=30s;
-    server 10.0.1.12:8080 max_fails=3 fail_timeout=30s;
-    keepalive 32;
-}
-```
+What you **do not** build yet: no second nginx instance. One LB is still a SPOF. For 10,000 users, a rare 30-second failover is acceptable.
 
-What you **do not** build yet: no second LB instance. One nginx is still the SPOF. For 10,000 users, a 30-second DNS failover for the rare event is acceptable. No L4 in front. No anycast or geo-routing.
+#### Stage 3: 100,000 users, active-active LB, path-based routing
 
-Cost: ~$50-100/month. A small LB box plus 3-5 backend boxes.
+**What just broke (several things at once):**
 
-#### Stage 3: 100,000 users, two-layer LB, regional managed LB
-
-**What just broke** (several things at once):
-
-- TLS CPU on the single nginx is biting. 500 new connections/sec × 2 ms = one whole CPU core just on handshakes.
-- One nginx is now a SPOF you cannot accept. A 30-second failover is too much.
-- The team is splitting the monolith into services (api, auth, search, static). The single nginx config is becoming a wall of `location` blocks.
-- Script-kiddies are noticing you. You want basic DDoS protection.
+- TLS CPU on the single nginx is climbing. 500 new connections/sec × 2 ms = one CPU core just on handshakes.
+- The single nginx is a SPOF you can no longer accept.
+- The team is splitting the monolith into services. The nginx config is becoming unmanageable.
 
 **The fixes:**
 
-- Add a managed cloud L7 LB at the edge (ALB, GCP HTTPS LB, or Cloudflare in front). It terminates TLS, absorbs basic DDoS, routes to per-service target groups.
-- Add an internal L7 LB per service tier (Envoy or nginx). Each service team owns their pool config.
-- Sticky sessions for the few services that need them (cart, real-time UI). Cookie-based, 1-hour TTL.
-- Active-active LBs. ALB is multi-AZ by default. For self-run, two instances behind a VIP or DNS round-robin.
-- Turn on HTTP/2 between client and LB. This cuts new-connection rate by about 10x for browsers.
+- Add a second nginx instance. Run them active-active behind a shared VIP (keepalived/VRRP). ~1-second failover.
+- Or use a managed cloud L7 LB (AWS ALB, GCP HTTPS LB). Multi-AZ by default. Terminates TLS, absorbs DDoS, routes to per-service target groups.
+- Path-based routing: `/api/orders/*` to orders service, `/api/auth/*` to auth service, `/*` to web service.
+- Enable TLS 1.3 + session tickets. Returning clients do 0-RTT. Cuts handshake CPU by ~10x.
+- Move sessions to Redis. Backends become stateless. No sticky sessions needed.
 
-Envoy config for the internal L7 tier has clusters per service, each with `lb_policy: LEAST_REQUEST`, http_health_check on `/healthz` (interval 5s, unhealthy_threshold 3, healthy_threshold 2), and outlier_detection (consecutive_5xx 5, base_ejection_time 30s, max_ejection_percent 50).
-
-What you **do not** build yet: no global LB (still one region). No sidecar mesh.
-
-Cost: ~$1-5k/month. ALB at ~$25/month + per-GB charges (~$0.008/GB), internal LB pods, more backends.
-
-#### Stage 4: 1,000,000 users, global + regional + local + sidecar mesh
+#### Stage 4: 1,000,000 users, global + regional + sidecar
 
 **What just broke:**
 
-- Users in Asia, Europe, the Americas all need <100 ms latency. One us-east LB cannot do that.
-- TLS handshake CPU at 30,000 req/s is now thousands of dollars per month if you run your own. Managed TLS is cheaper per byte.
-- Service-to-service traffic hits the central L7 LB on the way out *and* back. Internal latency budgets are eaten by LB hops.
-- Cross-region failover is too slow because DNS TTL is the bottleneck.
+- Users in Asia get 300 ms to us-east. Unacceptable.
+- TLS handshake CPU at 3,000 req/sec is expensive at scale.
+- Service-to-service traffic crosses the central L7 LB twice per call. Internal latency budgets are eaten.
 
 **The fixes:**
 
-- Add a global LB (anycast or geo-DNS): Cloudflare, AWS Global Accelerator, GCP Premium Tier. Same IP, routed by BGP to the nearest healthy region. Sub-second failover (BGP withdraw) instead of DNS-TTL-bound.
-- Regional LBs stay the same as stage 3.
-- Add a sidecar mesh (Envoy, Linkerd, Istio). Every pod gets a sidecar. Service-to-service calls go: pod -> local sidecar -> remote sidecar -> remote pod. The sidecar is the LB for outbound traffic, which removes the central L7 hop for internal traffic. Adds 1-2 ms per hop but gains per-service mTLS, retries, circuit breakers, and per-call observability.
-- Bounded-load consistent hashing for any pool with stateful affinity (cache nodes, session-affinity tiers). Spreads hot keys.
-- TLS offload to hardware or SmartNIC at the edge.
-- Slow start for new backends: ramp weight from 0 to 100% over 30 seconds so cold caches do not get hammered.
-
-Each layer adds latency in exchange for one control point:
-
-| Layer | Latency added | What you gain |
-|-------|---------------|---------------|
-| DNS + Anycast | ~5-20 ms (first connect only) | Geo-routing, regional failover |
-| Edge L4 | <1 ms | DDoS scrubbing, TLS offload |
-| Regional L7 | 1-3 ms | Path routing, TLS, per-route policy |
-| Sidecar | 1-2 ms per hop | mTLS, observability, retries |
-| Backend pod | request time | the actual work |
-
-A request crosses three or four LB layers before hitting the backend. Each layer earns its slot. You do not add one "in case."
-
-Cost: ~$10-100k/month depending on bandwidth, regions, and how much is managed.
-
-#### What you would do at 10x scale (10M+ users)
-
-Honestly, the stage-4 architecture *is* what FAANG companies run. At 10M+ you are not changing the topology. You are doing more of the same:
-
-- More regions.
-- More sophisticated outlier detection.
-- Custom-built LBs (Google's Maglev, Facebook's Katran) instead of off-the-shelf. Saves real money on CPU.
-
-The interesting work shifts from "design the LB" to "tune the LB at scale": kernel bypass (DPDK, XDP), zero-copy forwarding, custom NIC offloads. None of that changes the interview answer.
+- Add anycast global LB (Cloudflare, AWS Global Accelerator, GCP Premium Tier). Same IP announced from every region. BGP routes each user to the nearest healthy region. Failover in seconds, not minutes.
+- Add a sidecar proxy (Envoy, Linkerd) to every pod. Service-to-service calls go: pod sidecar to remote pod sidecar. Removes the central LB hop for internal traffic. Adds mTLS, retries, and per-call observability for free.
+- TLS 1.3 with 0-RTT everywhere. ECDSA certs (5x cheaper CPU than RSA at same security level).
+- Slow start for new backends: ramp weight from 0 to 100% over 30 seconds so cold caches do not get slammed.
 
 ---
 
-### 9. Reliability
+### 10. The variants
 
-**The LB itself dies.** Covered above. Two patterns: active-passive VIP with keepalived (one LB works, one stands by, ~1-second failover) and active-active with anycast (all LBs work, BGP shifts traffic on failure, sub-second).
-
-**A backend dies.** Active health checks notice within 1-3 intervals (5-15 seconds). The LB stops sending it new requests. In-flight requests on the dead backend may fail; `proxy_next_upstream` retries them on a healthy backend.
-
-**The whole backend pool dies.** `max_ejection_percent: 50` stops the LB from ejecting everyone. Worst case the LB returns 503 while a human investigates. Better the LB tells the truth (503) than tries to forward to nowhere and hangs.
-
-**A backend is alive but slow.** This is the dangerous one. Active checks pass (it answers `/healthz`). Passive checks pass (it returns 200s, just slowly). The slow backend accumulates connections. With round-robin you keep sending it more.
-
-The fix: `least_conn` avoids it naturally (most in-flight). EWMA avoids it explicitly (worst latency). Add request timeouts at the LB so a slow backend cannot tie up LB workers forever.
-
-**Cascading failure / thundering herd.** Backend A is slow. LB ejects it. Traffic shifts to B and C. They run hot. LB ejects them too. Now no backends. LB returns 503. Clients retry. The retries hammer the next backend that comes up.
-
-The fixes:
-
-- `max_ejection_percent: 50` (never eject everyone).
-- Backend-side circuit breakers (when load > threshold, return 503 fast rather than serving slowly).
-- Client-side retries with exponential backoff and jitter.
-- LB-side request hedging, *carefully* (sending the same request to a second backend if the first is slow can either save tail latency or melt a pool; use only with caps).
-
-**DNS failure / regional outage.** If a region is BGP-withdrawn, anycast handles failover automatically. If DNS fails (rare), clients with cached entries keep working until TTL expires; new clients are stranded. This is why DNS TTL matters: 60 seconds is the usual production setting.
-
-**TLS cert expiry.** A cert silently expiring takes the whole service down. Automate renewal (Let's Encrypt + cert-manager). Alert on certs expiring within 30 days. The number of outages caused by expired certs is embarrassing.
+| Variant | What changes | The lesson |
+|---------|--------------|------------|
+| **HTTP/2** | Least connections counts connections, not requests. One TCP connection carries many. | Use least *active requests* (Envoy's `LEAST_REQUEST`), not least connections. |
+| **WebSockets** | One long-lived connection per user. Round-robin spreads connects evenly. Load drifts over hours as users disconnect unevenly. | Use `least_conn` for connect. Drain gracefully on bounce. Consider a dedicated WS gateway. |
+| **gRPC** | Like HTTP/2 but with typed messages. Long-lived streams. | Same as HTTP/2. Least active requests. L7 LB that understands gRPC framing. |
+| **Canary deploy** | Route 10% of traffic to new version. | Weighted round-robin: new version weight 1, old weight 9. Ramp gradually. |
+| **Database proxy** | MySQL or Postgres connections are expensive to open. Route to a pool of persistent connections. | L4 LB + consistent hash on client session ID. PgBouncer or ProxySQL does this job. |
 
 ---
 
-### 10. Observability
+### 11. Reliability
 
-What must be instrumented from day one:
+**The LB itself dies.** Active-passive VIP with keepalived: one LB holds the VIP; standby grabs it on failure (~1-second failover). Active-active anycast: all LBs serve traffic; BGP withdraw shifts traffic sub-second. For internet-facing services at scale, active-active anycast wins.
+
+**A backend dies.** Active health checks notice within 1-3 intervals (5-15 seconds). In-flight requests on the dead backend fail; `proxy_next_upstream` retries them on a healthy backend.
+
+**The whole pool goes bad.** `max_ejection_percent: 50` stops the LB from ejecting everyone. The LB returns 503 while someone investigates. That is correct behavior. Better to tell the truth (503) than forward to nowhere and hang.
+
+**A backend is alive but slow.** The dangerous case. Active health checks pass (it answers `/healthz`). Real requests take 30 seconds. Round-robin keeps sending it more. Workers pile up.
+
+The fix: `least_conn` avoids it naturally (slow backend accumulates in-flight). Combine with `proxy_read_timeout 30s`. After 30 seconds the LB gives up and frees the worker. Add passive latency-based ejection: if a backend's p99 is more than 3x the pool median for 1 minute, eject it temporarily.
+
+**Cascading failure.** Backend A is slow. LB ejects it. Traffic shifts to B and C. They run at 1.5x load. They start timing out. LB ejects them too. No backends. LB returns 503. Clients retry. Retries hammer the next backend that comes up.
+
+The fixes: `max_ejection_percent: 50` (never eject everyone); backend-side circuit breakers (return 503 fast when overloaded, do not serve slowly); client retries with exponential backoff and jitter.
+
+**TLS cert expiry.** A cert expiring silently takes the whole service down. Automate renewal (Let's Encrypt + cert-manager). Alert on certs expiring within 30 days.
+
+---
+
+### 12. Observability
 
 | Metric | Why it matters |
 |--------|----------------|
-| `lb.request.rate` per backend | The headline distribution metric; uneven values mean uneven balancing |
-| `lb.request.error_rate` per backend | A single backend spiking errors is a candidate for ejection |
-| `lb.request.latency` p50/p95/p99 per backend | Find slow backends before EWMA / outlier ejects them |
+| `lb.request.rate` per backend | Uneven values mean the balancing algorithm is not working |
+| `lb.request.error_rate` per backend | One backend spiking errors = candidate for ejection |
+| `lb.request.latency` p50/p95/p99 per backend | Find slow backends before they cascade |
 | `lb.healthy_backend_count` per pool | Drops below threshold = page someone |
-| `lb.ejected_backend_count` per pool | Spikes = something pool-wide is wrong, possibly the health check itself |
-| `lb.tls.handshakes_per_sec` | TLS CPU bound; tells you when to scale or offload |
-| `lb.tls.session_resumption_rate` | If low (<70%), clients are not benefiting from session tickets |
-| `lb.connection.active_count` | File descriptor and memory pressure indicator |
-| `lb.connection.new_per_sec` | Should be much less than request rate (keep-alive working) |
-| `lb.upstream.retry_rate` | If high, backends are flaky; the LB is masking it |
-| `lb.upstream.queue_depth` | Requests waiting for an upstream connection |
-| `lb.bandwidth.in / out` | NIC saturation watch |
+| `lb.ejected_backend_count` per pool | Spikes = something pool-wide is wrong |
+| `lb.tls.handshakes_per_sec` | TLS CPU ceiling watch |
+| `lb.tls.session_resumption_rate` | Below 70% means clients are not using tickets |
+| `lb.connection.active_count` | File descriptor and memory pressure |
+| `lb.connection.new_per_sec` | Should be much lower than request rate (keep-alive working) |
+| `lb.upstream.retry_rate` | High = backends are flaky; the LB is masking it |
+| `lb.bandwidth.in_out` | NIC saturation watch |
 
-Per-route metrics in addition to per-backend: `lb.request.rate{path="/api/orders/*"}`. Lets you see if one route is overwhelming the pool.
+Page on: `healthy_backend_count < 50%` of total for 1 minute. LB instance unresponsive. TLS error rate > 1%.
 
-**Page on:** `healthy_backend_count < 50% of total` for 1 minute. LB instance unresponsive. TLS handshake error rate > 1%.
-
-**File a ticket on:** latency p99 regression > 30%. `ejected_backend_count > 0` sustained for 10 minutes. Bandwidth > 70% of NIC capacity.
+Ticket on: latency p99 regression > 30%. `ejected_backend_count > 0` sustained for 10 minutes. Bandwidth > 70% of NIC capacity.
 
 ---
 
-### 11. Gotchas the senior interviewer is listening for
-
-Some of these only come out when the interviewer asks "what happens if...". The senior candidate brings them up unprompted.
-
-**Sticky sessions cause uneven load.** Power users (admins, long sessions) cluster on the same backends. Fix: cap session TTL, allow rebalancing, prefer stateless backends with shared session storage.
-
-**Slow backends starve LB workers.** A slow backend ties up workers waiting for its response. Fix: aggressive timeouts. Eject slow backends on latency, not just 5xx.
-
-**TLS termination CPU.** ECDSA certs are ~5x cheaper than RSA at the same security level. TLS 1.3 with session tickets gives 0-RTT for returning clients. Without these, LB CPU climbs linearly with new-connection rate.
-
-**HTTP/2 breaks `least_conn`.** One TCP connection carries many concurrent requests. Every backend looks like it has 1 connection. Count *active requests* instead (Envoy's `LEAST_REQUEST`).
-
-**`X-Forwarded-For` trust.** If the LB does not strip incoming XFF and append carefully, a malicious client spoofs their IP. Always `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for` (appends, does not replace). Backend trusts only the rightmost N IPs where N = trusted proxy hops.
-
-**Health check thundering herd.** 100 LBs × 1,000 backends × every 5 seconds = 20,000 req/s on `/healthz`. Deep checks DoS your own DB.
-
-**DNS round-robin and TTL.** Browsers cache DNS aggressively (sometimes forever). DNS round-robin is balancing in expectation, not enforcement. Do not rely on it for failover.
-
-**Draining and graceful shutdown.** When you remove a backend, it must stop accepting new requests but finish in-flight ones. Skip this and you drop requests.
-
-**Anycast and connection state.** BGP can re-route mid-connection if a route flaps. Long-lived TCP (WebSockets, gRPC streams) can break. Fix: pin the connection to a specific LB IP using a 302 or a global LB's client affinity feature.
-
-**WebSockets and round-robin.** A WebSocket is one long connection. Round-robin spreads the initial connect evenly, but all the traffic over that connection lives on one backend for hours. Use `least_conn` for connect, accept some imbalance, rebalance on disconnect.
-
----
-
-### 12. Follow-up answers
-
-These are the questions a senior interviewer is listening for. Each answer is short on purpose. The depth is in the *why*.
+### 13. Follow-up answers
 
 **1. Sticky sessions and uneven load.**
 
-Cookie-based stickiness gives perfect affinity but creates skew when power users cluster. Options, in order of how much you give up:
-
-- **Cap session TTL.** Re-balance after, say, 1 hour. Brief inconvenience (cart sometimes re-resolves) in exchange for periodic rebalance.
-- **Bounded-load stickiness.** If the target backend is at >1.25x average load, fall back to a different one and re-emit the cookie. Slightly disrupts stickiness for the unlucky few but caps the imbalance.
-- **External session store.** Backend becomes stateless. Sessions live in Redis. Any backend handles any request. Pays a Redis hop per request (~1 ms), and the LB is back to round-robin or least_conn. This is the right answer for new systems. Legacy systems often cannot pay the rewrite cost.
-
-The choice depends on what the session contains. Tiny session (auth token): externalize. Large session (in-progress workflow with megabytes): stickiness, accept the skew, monitor outliers.
+Three options in order of how much you give up. First: cap session TTL at 1 hour. Users re-assign periodically. Brief stickiness loss, periodic rebalancing. Second: bounded-load stickiness. If the target backend is at > 1.25x average load, re-assign the user and re-emit the cookie. Disrupts stickiness for a few unlucky users but caps the imbalance. Third: externalize sessions to Redis. Backends become stateless. Any backend serves any request. Stickiness goes away entirely. Right answer for new systems. Legacy systems often cannot pay the rewrite cost.
 
 **2. TLS termination cost.**
 
-In order of cost:
-
-- **Enable TLS 1.3 with session tickets.** Returning clients do 0-RTT, about 10x cheaper than fresh handshakes. Free; just enable.
-- **Use ECDSA certs instead of RSA.** ECDSA-P256 is ~5x faster than RSA-2048. Free; cert change only.
-- **Tune session resumption cache.** Bigger cache holds more clients between visits. Costs a bit of RAM.
-- **Scale the LB horizontally.** More instances = more CPU cores doing handshakes. Linear cost.
-- **TLS offload to a dedicated tier.** Run a TLS-terminating proxy in front. L7 LB behind it speaks plain HTTP. Splits the CPU burden cleanly.
-- **SmartNIC / ASIC offload.** Some cloud providers offer hardware TLS (AWS Nitro, Cloudflare's stack). Highest fixed cost, lowest per-handshake cost. Worth it only above ~10k handshakes/sec.
-
-Most teams stop at step 3 or 4.
+In order from cheapest to most expensive: enable TLS 1.3 with session tickets (returning clients do 0-RTT, about 10x cheaper than fresh handshakes; just a config change); switch to ECDSA certs instead of RSA (ECDSA-P256 is ~5x faster at the same security level; just a cert change); tune the session resumption cache size; scale the LB horizontally (more cores); TLS offload to a dedicated proxy tier; SmartNIC/ASIC offload (worth it only above ~10k handshakes/sec). Most teams stop at step 3 or 4.
 
 **3. HTTP/2 and least connections.**
 
-With HTTP/2, each client opens *one* TCP connection and multiplexes many requests over it. The LB's `least_conn` sees: every backend has 1 connection. The first backend (lowest ID) wins ties consistently; all new connects land there. After warm-up, one backend has 100 connections, the others have 1 each.
-
-Fix: switch from "least connections" to "least active requests." Envoy's `LEAST_REQUEST`. nginx's `least_conn` is too literal with HTTP/2. The LB must parse HTTP/2 frames and count in-flight streams per backend, not connections.
-
-If the LB is L4 and cannot parse HTTP/2, switch to consistent hashing on a per-request key, or move to an L7 LB.
+With HTTP/2, each client opens one TCP connection and multiplexes many requests over it. The LB's `least_conn` sees every backend has 1 connection. The first backend wins ties consistently and gets all new traffic. Fix: switch from least connections to least active requests. Envoy calls this `LEAST_REQUEST`. The LB counts in-flight HTTP/2 streams per backend, not TCP connections. If the LB is L4 and cannot parse HTTP/2, move to a L7 LB.
 
 **4. WebSockets and uneven distribution.**
 
-WebSocket connect is one round trip. After that, the LB just shuffles bytes. Users connect once and stay connected for hours.
-
-With 10k users and 5 backends on round-robin, the initial spread is even (2k per backend). But as users disconnect and reconnect, the spread drifts based on disconnect patterns. If a backend bounces (deploy, crash), all its connections reconnect and round-robin sends them all to the next backend, doubling its load.
-
-Fixes:
-
-- `least_conn` for the connect step. Backends with more accumulated connections get fewer new ones.
-- Drain gracefully on bounce. Close connections in waves over several minutes, not all at once.
-- Cap connections per backend. If a backend hits 5,000, the LB stops sending new ones and returns 503. Client retries to a different backend.
-- Consider a dedicated WebSocket gateway layer separate from your HTTP LB. Different scaling story, different operational model.
+WebSocket connect is one round trip. After that the LB just shuffles bytes. Users connect once and stay connected for hours. With 10k users and 5 backends on round-robin, the initial spread is even (2k per backend). As users disconnect and reconnect, the spread drifts based on disconnect patterns. If a backend bounces, all its connections reconnect and round-robin slams the next backend. Fixes: `least_conn` for the connect step; drain gracefully on bounce (close connections in waves over 2 minutes, not all at once); cap connections per backend; consider a dedicated WebSocket gateway layer separate from the HTTP LB.
 
 **5. Slow backend starving the pool.**
 
-`least_conn` is the simplest fix. The slow backend accumulates in-flight requests. Once it has more than the others, the LB stops sending it new ones. It naturally drains.
-
-Combine with `proxy_read_timeout 30s` (or whatever your hard cap is). After 30 seconds the LB gives up, frees the worker, the request fails. Better than tying up a worker forever.
-
-Add passive outlier detection on latency: if a backend's p99 is >3x pool median for 1 minute, eject for 30 seconds, let it cool off, bring back gradually.
-
-Backend-side circuit breaker: when its own dependency (slow disk, slow DB) is sick, return 503 immediately rather than serving slowly. The LB ejects, the backend recovers, the LB re-admits.
-
-EWMA explicitly avoids slow backends but is harder to tune. Start with `least_conn` + timeouts.
+`least_conn` is the simplest fix. The slow backend accumulates in-flight requests. Once it has more than the others, new requests go elsewhere. Combine with `proxy_read_timeout 30s`: after 30 seconds, the LB gives up and frees the worker. Add passive latency-based ejection: if p99 is more than 3x pool median for 1 minute, eject temporarily. Backend-side circuit breaker: when the backend's own dependency (slow disk, slow DB) is sick, return 503 fast rather than serving slowly. The LB ejects, the backend recovers, the LB re-admits.
 
 **6. DNS TTL.**
 
-- Long TTL: clients cache longer, fewer DNS queries, slower to react to changes.
-- Short TTL: clients re-resolve often, faster failover, more DNS load.
-
-Production default: 60 seconds. Failover happens within 1-2 minutes worst case. Some traffic-heavy services use 30s. Internal services where you have more control can use longer (300s).
-
-For an emergency LB IP change: drop TTL to 30s 24 hours before so resolver caches have short TTLs by the time you flip. After the change, raise TTL back.
-
-The real fix is to not change LB IPs. Anycast IPs do not change; they just stop being advertised from a failed region. The IP-change problem is mostly a non-anycast problem.
+Long TTL: clients cache longer, fewer DNS queries, slower to react to changes. Short TTL: clients re-resolve often, faster failover, more DNS load. Production default: 60 seconds. Failover happens within 1-2 minutes worst case. For an emergency LB IP change: drop TTL to 30s 24 hours ahead so resolver caches have short TTLs by the time you flip. Then raise it back. The real fix is to not change LB IPs. Anycast IPs do not change; they just stop being advertised from a failed region.
 
 **7. Cross-region failover.**
 
-Layers, top to bottom:
-
-- **Anycast (if used).** BGP advertisement from the failed region is withdrawn (manually or automatically by health check). Routers learn within seconds. Clients silently routed to the next-nearest region. Sub-second on good networks. Up to 30s on slow ones.
-- **Geo-DNS (if used instead).** Route 53's latency-routing or geolocation policies have health checks. When the us-east check fails, Route 53 returns eu-west's IP. Bound by DNS TTL (60s).
-- **Regional LB.** Each region's LB is internally HA. Failure within a region is handled by the regional LB.
-- **Client retries.** Clients with cached DNS still hit us-east for up to TTL seconds. They get connection-refused and retry. SDKs with retry logic eventually succeed against eu-west.
-
-End-to-end: anycast = ~5-30s. Geo-DNS = ~60-300s. The slowest piece is whatever your DNS TTL is.
+Layer by layer. Anycast (if used): BGP advertisement from the failed region is withdrawn. Routers learn within seconds. Clients are silently routed to the next-nearest region. Sub-second on good networks, up to 30 seconds on slow ones. Geo-DNS (if used instead): Route 53's latency routing has health checks. When us-east fails, eu-west's IP is returned. Bound by DNS TTL (60 seconds). Clients with cached DNS still hit us-east for up to TTL seconds, then retry. SDKs with retry logic eventually succeed against eu-west. End-to-end: anycast = 5-30s. Geo-DNS = 60-300s.
 
 **8. Path-based routing for a monolith split.**
 
-Add a route to the L7 LB:
-
-```nginx
-location /api/orders/ {
-    proxy_pass http://order_service;
-}
-location /api/ {
-    proxy_pass http://monolith;
-}
-```
-
-Order matters. More specific paths first.
-
-Migration plan (the strangler-fig pattern):
-
-- **Phase 1:** deploy `order_service` running in parallel with the monolith. Both can handle `/api/orders/*`.
-- **Phase 2:** route a small slice (5%) using `split_clients`:
-
-```nginx
-split_clients "${request_id}" $backend {
-    5%   order_service;
-    *    monolith;
-}
-```
-
-- **Phase 3:** monitor metrics. If `order_service` handles 5% cleanly, raise to 25%, then 50%, then 100%.
-- **Phase 4:** remove order-handling from the monolith. Route 100% of `/api/orders/*` to `order_service`.
-
-The LB is the cutover point. Rollback is one config change.
+Add a route to the L7 LB: `/api/orders/` goes to `order_service`, everything else goes to `monolith`. More specific paths first. Migration plan: deploy `order_service` in parallel with the monolith (both handle `/api/orders/*`). Route 5% using `split_clients`. Monitor. If it handles 5% cleanly, raise to 25%, then 50%, then 100%. Remove order-handling from the monolith. Route 100% to `order_service`. The LB is the cutover point. Rollback is one config change.
 
 **9. Health check storm.**
 
-200 LB instances × 500 backends ÷ 5s = 20,000 req/s on `/healthz`. If checks are deep (DB query), you DoS your own DB.
+200 LBs × 500 backends ÷ 5s = 20,000 req/sec on `/healthz`. If checks are deep (DB query), you DoS your own DB. Fixes: keep `/healthz` shallow (process is alive, 200); run deep checks (DB connectivity) on a 60-second interval via monitoring, not the LB. Better: switch from pull to push. Modern LBs (Envoy) subscribe to a service-discovery system that pushes updates. The discovery system health-checks each backend once, not 200 times. In Kubernetes: `kubelet` runs liveness/readiness probes once per node; the LB watches Endpoints. Either approach cuts the health check load by 100-200x.
 
-Fixes:
+**10. LB dropping connections during deploy.**
 
-- **Shallow `/healthz`** returning 200 from the process. Catches process death, not deep issues. Deep checks (DB connectivity) run on a slower interval (60s) and report to a different system, not the LB.
-- **EDS / xDS push instead of pull.** Modern LBs (Envoy) can subscribe to a service-discovery system that *pushes* updates. The LB is told "backend X is unhealthy." The discovery system does the actual health checking centrally (once, not 200 times). Cuts traffic by 200x.
-- **Sampling.** Each LB only checks a random subset of backends each interval. Rotates over time. Cuts per-backend load proportionally.
-- **Outsource to the platform.** In Kubernetes, `kubelet` runs liveness/readiness probes once per node. The LB watches Endpoints. Backends are health-checked once by the platform, not N times by N LBs.
-
-In practice, EDS/xDS plus shallow checks gets you 99% of the way. The platform handles the rest.
-
-**10. LB dropping connections during a deploy.**
-
-Two failure modes:
-
-- New backends register and start receiving traffic before they are warm. First requests hit a cold cache or unfinished init. Clients see errors.
-- Old backends are killed mid-request. In-flight requests fail.
-
-Correct deploy sequence:
-
-1. **New backend starts.** Process boots. App initializes (DB, caches, etc.).
-2. **Readiness probe.** Backend's `/ready` returns 503 until init finishes. Kubernetes/LB does not include it in the pool until `/ready` is 200. This is separate from `/healthz`, which only indicates liveness.
-3. **Slow start.** LB ramps the new backend's weight from 0 to 100% over 30 seconds. Avoids hammering a cold backend.
-4. **Old backend drain.** Mark as `draining`. No new connections accepted. In-flight requests finish.
-5. **Old backend stop.** After drain timeout (e.g., 30s), kill the old backend. If a request is still in flight after 30s, it gets dropped (acceptable; clients retry).
-6. **Repeat per backend.** Rolling update. Never lose more than `(replicas - max_unavailable)` at once.
-
-Kubernetes does most of this with readiness probes + `preStop` hooks + `terminationGracePeriodSeconds`. Envoy and Istio do slow-start when configured. The mistake is skipping any of: readiness probe, slow start, drain. Each skipped step is a class of dropped requests.
+Two failure modes: new backends register before they finish warming up (cold cache errors); old backends are killed mid-request (dropped connections). Correct deploy sequence: new backend starts and boots its app. Readiness probe `/ready` returns 503 until init finishes. LB does not include it until `/ready` is 200. Separate from `/healthz` (liveness). LB slow-starts the new backend: ramps weight from 0 to 100% over 30 seconds. Old backend drain: mark as draining, no new connections accepted, in-flight requests finish. After drain timeout (30 seconds), kill the process. Repeat per backend in a rolling update. Never lose more than one backend at once. Kubernetes does most of this with readiness probes plus `preStop` hooks plus `terminationGracePeriodSeconds`.
 
 ---
 
-### 13. Trade-offs worth saying out loud
+### 14. Trade-offs worth saying out loud
 
-**Hardware LB vs software LB vs cloud-managed.**
+**Hardware LB vs software LB vs cloud-managed.** Hardware (F5, NetScaler): high upfront cost, very high throughput per unit, complex to operate, vendor lock-in. Common in enterprises with regulatory requirements. Software (nginx, HAProxy, Envoy): commodity hardware, open source, full control, you operate it. Default for most teams. Cloud-managed (ALB, GCLB): zero operations, pay per request and per GB, less config flexibility. Right for cloud-native teams below a certain bandwidth bill. Above tens of TB/month outbound, self-managed gets cheaper.
 
-- **Hardware (F5, Citrix NetScaler):** high upfront cost, very high throughput per unit, complex to operate, locked to one vendor. Common in enterprises with regulatory requirements.
-- **Software (nginx, HAProxy, Envoy):** commodity hardware, open source, full control, you operate it. Default for most teams.
-- **Cloud-managed (ALB, GCLB):** zero operations, pay per request and per GB, less flexible config. Default for cloud-native teams below a certain bandwidth bill. Above ~10s of TB/month outbound, self-managed gets cheaper.
+**L4 vs L7.** L4 is faster, cheaper, limited. L7 is slower, more expensive, smart. Pick L7 if you need anything HTTP-aware (path routing, cookies, headers, per-route policy). Pick L4 for raw TCP or when you need the throughput and do not need parsing.
 
-**L4 vs L7.** L4 is faster, cheaper, dumber. L7 is slower, more expensive, smarter. Pick L7 if you need anything HTTP-aware (path routing, cookies, headers, per-route policy). Pick L4 for raw TCP or when you need the throughput and do not need parsing.
+**Sidecar mesh vs centralized LB.** Centralized: one LB tier in front of all services. Easy to reason about, single config point, single failure point. Sidecar: every pod has a proxy, decisions are local, full per-call observability, more moving parts and ~50 MB overhead per sidecar. Sidecar wins for service-to-service traffic inside the cluster. Centralized wins for ingress from the internet. Most large systems use both.
 
-**Sidecar mesh vs centralized LB.**
-
-- **Centralized:** one LB tier in front of all services. Easy to reason about. Single config point. Single failure point.
-- **Sidecar:** every pod has a proxy. Decisions are local. Full per-call observability. More moving parts. More memory overhead (~50 MB per sidecar × thousands of pods = real money).
-
-Sidecar wins for service-to-service inside the cluster. Centralized wins for ingress from the internet. Most large systems use both.
-
-**Sticky sessions vs stateless backends.** Stickiness is operationally simpler (no shared state to operate). Stateless is operationally cleaner (any LB algorithm works, any backend serves any request). New systems should default to stateless with an external session store. Legacy systems are often stuck with stickiness.
-
-**What you would revisit at 10x scale.** Move to a custom LB if cloud LB costs dominate (Google built Maglev, Facebook built Katran for exactly this reason). Push more logic into the sidecar mesh; let the central L7 do less. TLS 1.3 with 0-RTT everywhere, including internal hop boundaries. Pre-compute hash rings for consistent-hash pools at config change time, not per-request.
+**Sticky sessions vs stateless backends.** Stickiness is operationally simpler (no shared state to operate). Stateless is operationally cleaner (any algorithm works, any backend serves any request). New systems should default to stateless with an external session store. Legacy systems are often stuck with stickiness.
 
 ---
 
-### 14. Common interview mistakes
-
-Most weak answers fall into one of these.
+### 15. Common mistakes
 
 **Treating "load balancer" as a single thing.** The LB is layered. Saying "we use nginx" without acknowledging the DNS/anycast layer in front and the sidecar layer behind shows you have not thought about topology.
 
-**No mention of L4 vs L7.** Knowing the difference is the most basic concept question on this topic. Skip it and you lose the round.
+**No mention of L4 vs L7.** The difference is the most basic concept question on this topic. Skip it and you lose the round.
 
-**Round-robin everywhere.** Round-robin is the wrong default for variable-duration requests, HTTP/2, WebSockets, and pretty much any modern workload. `least_conn` (or its HTTP/2 equivalent, least active requests) is a better default.
+**Round-robin everywhere.** Round-robin is the wrong default for variable-duration requests, HTTP/2, WebSockets, and most modern workloads. `least_conn` (or least active requests for HTTP/2) is a better default and the right answer to say out loud.
 
-**Ignoring sticky session costs.** Stickiness is easy to enable, hard to live with. "We'll use cookie-based stickiness" without discussing the load skew and the backend-failover reshuffle is a junior answer.
+**Ignoring sticky session costs.** "We'll use cookie-based stickiness" without discussing load skew and the backend-failover reshuffle is a junior answer.
 
-**No mention of health check storms.** At non-trivial scale, the LB tier polling backends becomes its own DoS vector. EDS/xDS or platform-managed probes (Kubernetes) is the senior answer.
+**No mention of health check storms.** At non-trivial scale, the LB tier polling backends becomes its own DoS vector. Push-based health via EDS/xDS or Kubernetes Endpoints is the senior answer.
 
-**Forgetting the LB is a SPOF.** Active-active anycast or active-passive VIP. Either is acceptable. Not addressing it is not.
+**Forgetting the LB is a SPOF.** Active-active anycast or active-passive VIP. Either works. Not addressing it is not.
 
-**TLS termination handwave.** "Terminate at the LB" is correct but incomplete. Mention session tickets, ECDSA, and at scale, hardware offload.
+**TLS termination handwave.** "Terminate at the LB" is correct but incomplete. Mention session tickets, ECDSA certs, and at scale, hardware offload or 0-RTT.
 
-**Cascading failure / thundering herd not mentioned.** This is the most common production LB incident. `max_ejection_percent` and backend-side circuit breakers are the answer.
+**Cascading failure not mentioned.** This is the most common production LB incident. `max_ejection_percent` and backend-side circuit breakers are the answer. Candidates who name both without prompting are interviewing at senior level.
 
 **No drain step in deploys.** Rolling deploys without drain drop requests. A senior candidate names readiness probes, slow start, and drain explicitly.
 
-**Treating sidecar mesh as a buzzword.** If you mention service mesh, explain *why* (removes central LB hop for internal traffic, per-service mTLS and observability), not just *that*. Otherwise it sounds like architecture-by-fashion.
+**Treating sidecar mesh as a buzzword.** If you mention service mesh, explain *why* it removes the central LB hop for internal traffic and gives per-service mTLS and observability. Not just *that* you would use it.
 
-If you can hit seven of these ten without prompting, you are interviewing at senior level on the topic. The three that separate strong from average answers: L4/L7 framing, sticky session costs, and health check storms. Those are what the senior architect listens for.
+If you can hit seven of these ten without prompting, you are interviewing at senior level. The three that separate strong from average answers: L4/L7 framing, sticky session costs, and health check storms.

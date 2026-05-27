@@ -5,3 +5,7 @@ venv/
 .venv/
 .idea/
 .vscode/
+
+# Local Claude Code rules (not pushed)
+CLAUDE.md
+.claude/

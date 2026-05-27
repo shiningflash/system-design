@@ -2,50 +2,39 @@
 
 ### The short version
 
-A shopping cart is a small thing per user. You add items. You change counts. You buy.
+A shopping cart is a small amount of mutable state per user. You add items, change quantities, and eventually buy or leave. The state machine is trivial. What makes the design interesting is three specific problems:
 
-What makes it tricky is not how many writes you handle (very few). It is three calls you have to make:
+1. Where does the cart live when a guest becomes a logged-in user, and what survives the merge?
+2. What does "in stock" mean when stock changes every second, and whose job is the guarantee?
+3. How do you serve the cart icon on every page at 350 reads per second without hammering the database?
 
-1. **Where does the cart live?** In the cookie? On the server? Both?
-2. **What happens when a guest cart meets an account cart at login?**
-3. **What does "in stock" mean when stock changes every second?**
-
-The design starts with one Postgres table behind one stateless service. When the cart icon read on every page starts showing up in your slow query logs, you put Redis in front. Events flow to Kafka so other teams can hear them: abandoned cart emails, analytics, fraud, recommendations.
-
-Cart writes stay tiny even at a million users. The real hot path is the cart icon count on every page load, and the inventory check on every cart view.
-
-The interesting work lives at the edges. Merging a guest cart into an account cart with a sane quantity rule. Picking between optimistic and reservation-based stock checks. Handling price drift without breaking trust. And quietly deleting millions of carts nobody is ever coming back to.
+The answers: Postgres as source of truth, Redis as a fast layer for icon reads, Kafka for downstream teams, and a careful merge algorithm at login. Scale is not the hard part. At 1 million users the whole site generates about 20 cart writes per second. The hard part is the 350 reads per second on the icon, plus the merge logic, the price drift policy, and the inventory handoff boundary.
 
 ---
 
-### 1. The questions that mattered
+### 1. The two questions that matter most
 
-Of the eight questions in the question file, two reshape the whole design:
+**Guests or login only?** If guests can add without an account, you need a `cart_token` cookie, a guest-to-logged-in merge endpoint, and an audit table for what changed. If it is login-only, you skip all of that.
 
-- **Inventory accuracy:** optimistic, reservation, or no check?
-- **Multi-device sync:** does the cart follow the user across devices?
+**What does "in stock" mean?** Optimistic (show last-known, re-check at checkout), soft reservation (hold on add), or no check? This single decision changes how inventory and checkout interact. The right default is optimistic, with reservation only for explicitly flagged SKUs.
 
-Skip either and the first follow-up will catch you.
-
-> Why these two? Because every other question (limits, coupons, currency) just adds a small rule. These two change which boxes you draw.
+Everything else (cart size limits, price drift policy, abandoned-cart detection) follows from these two answers.
 
 ---
 
 ### 2. The math, in plain numbers
 
-| Scale | Carts/day | Writes/sec | Reads/sec | Active now | Storage |
-|-------|-----------|-----------|-----------|------------|---------|
-| Small (500 DAU) | 150 | 0.003 | 0.06 | ~50 | 33 MB / year |
+| Scale | Carts/day | Writes/sec | Icon reads/sec | Active now | Storage |
+|-------|-----------|------------|----------------|------------|---------|
+| Small (500 DAU) | 150 | 0.003 | 0.06 | ~50 | 33 MB/year |
 | Big (1M DAU) | 300,000 | 7 (peak 21) | 115 (peak 350) | ~25,000 | ~7 GB live |
 
-A few things jump out:
+What the numbers say:
 
-- Writes stay tiny even at 1 million users. Postgres handles 20 writes/sec without breathing.
-- Reads beat writes 20 to 1. The cart icon on every page is the read that matters.
-- 25,000 active carts fit in Redis with room to spare (about 5 MB).
-- The real bottleneck is not the cart at all. It is the inventory service getting hit on every cart view.
-
-> Why are writes so small? Because a normal user adds 3 items and edits twice. That is 5 writes per cart, total. Even with millions of users, that adds up to under 25 writes per second. Do not over-build for write throughput.
+- Writes are tiny even at 1M users. Postgres handles 21 writes/sec without effort.
+- The icon read is the load to optimize. 350/sec with a <20 ms target is what pushes you to Redis.
+- 25,000 active carts fit in Redis with room to spare (about 5 MB as lean hashes).
+- The real bottleneck is not the cart at all. It is the Inventory service, which gets called on every cart page load.
 
 ---
 
@@ -54,95 +43,89 @@ A few things jump out:
 Five endpoints carry the whole product.
 
 ```
-GET /api/v1/cart
-Authorization: Bearer <token>          # if logged in
-Cookie: cart_token=<uuid>              # if guest
-
-Response 200:
-{
-  "cart_id": "crt_abc123",
-  "user_id": "usr_42",
-  "items": [
-    {
-      "sku": "shoe-blue-42",
-      "qty": 2,
-      "snapshot_price_cents": 5000,
-      "current_price_cents": 5500,
-      "availability": "in_stock",
-      "name": "Blue Runner Size 42",
-      "image_url": "..."
-    }
-  ],
-  "updated_at": "2026-05-23T10:15:00Z",
-  "expires_at": "2026-06-22T10:15:00Z"
-}
-```
-
-```
-POST /api/v1/cart/items
-Idempotency-Key: <uuid>
-{ "sku": "shoe-blue-42", "qty": 1 }
-```
-
-| Code | What it means |
-|------|---------------|
-| 201 | Item added |
-| 200 | Item already there, quantity went up |
-| 400 | Quantity out of range, or bad SKU |
-| 404 | SKU does not exist |
-| 409 | SKU is restricted (region, age) |
-| 410 | SKU is discontinued |
-| 422 | Cart is full (100 items) |
-
-```
-PATCH /api/v1/cart/items/{sku}        # qty: 0 removes
+GET  /api/v1/cart
+POST /api/v1/cart/items          Idempotency-Key: <uuid>
+PATCH /api/v1/cart/items/{sku}   qty: 0 means remove
 DELETE /api/v1/cart/items/{sku}
-POST /api/v1/cart/merge               # body: {"anonymous_token": "<uuid>"}
-POST /api/v1/cart/checkout            # returns a session, not an order
+POST /api/v1/cart/merge          body: {"anonymous_token": "<uuid>"}
 ```
 
-The checkout response returns a session ID and a frozen snapshot, good for 15 minutes. The real order is created by a different service when payment clears.
+`GET /cart` returns a hydrated response: SKU + qty from Postgres/Redis, joined with name/image/current price from Catalog, and availability from Inventory. The join happens on the server. Never push it to the browser.
 
-**A few small choices that look small but are not:**
+| Status code | Meaning |
+|-------------|---------|
+| 201 | Item added |
+| 200 | Item already present, quantity updated |
+| 400 | Quantity out of range or bad SKU |
+| 404 | SKU does not exist |
+| 409 | SKU is restricted (region, age gate) |
+| 410 | SKU is discontinued |
+| 422 | Cart is full (100-item limit) |
 
-- **Idempotency-Key on writes is required.** A phone retries on flaky Wi-Fi. Double-tapping "Add" without the key gets you qty 2 when the user wanted 1.
+Load-bearing choices:
 
-- **GET /cart returns hydrated data.** The cart service joins the bare cart (SKU + qty) with the catalog (name, image, current price) and inventory (availability) on the server. Never push that join to the browser. The browser cannot batch the calls and it would be slow.
-
-- **Both snapshot price and current price come back on every read.** Snapshot is what they saw when they added. Current is what they pay. UI shows current. Analytics needs both.
-
-- **Checkout returns a session, not an order.** The cart only clears when the checkout/payment service confirms.
-
-> Why a session instead of an order? Because payment might fail. If the cart cleared on checkout-start, a payment failure would leave the user with no cart and an angry email. The session lets us pause and recover.
+- **Idempotency-Key is required on writes.** A phone retries on flaky Wi-Fi. Without the key you get qty 2 when the user wanted 1.
+- **Both snapshot price and current price return on every read.** Snapshot is what Alice saw when she added. Current is what she pays. Show both. Audit needs both.
+- **Checkout returns a session token, not an order.** The cart does not clear until the Order Service confirms payment. If payment fails, the cart is intact.
 
 ---
 
 ### 4. The data model
 
-Three tables. Two for live data, one for audit.
+Three tables: two for live data, one for audit.
+
+```mermaid
+erDiagram
+    carts ||--o{ cart_items : contains
+    carts ||--o{ carts_merged : "audit on merge"
+
+    carts {
+        uuid cart_id
+        bigint user_id
+        uuid cart_token
+        text status
+        int item_count
+        timestamptz expires_at
+    }
+    cart_items {
+        uuid cart_id
+        text sku
+        int qty
+        int snapshot_price_cents
+        text hold_token
+    }
+    carts_merged {
+        uuid merge_id
+        bigint user_id
+        jsonb anonymous_items
+        jsonb account_items
+        jsonb merged_items
+        text rule_applied
+    }
+```
+
+<details markdown="1">
+<summary><b>Show: the full SQL</b></summary>
 
 ```sql
--- One row per cart. A user has at most one active cart.
 CREATE TABLE carts (
     cart_id          UUID PRIMARY KEY,
-    user_id          BIGINT,                       -- NULL for guests
-    cart_token       UUID,                         -- NULL for logged-in users
-    status           SMALLINT NOT NULL DEFAULT 1,  -- 1=active, 2=converted, 3=abandoned, 4=expired, 5=merged
-    item_count       INT NOT NULL DEFAULT 0,       -- for fast cart-icon reads
+    user_id          BIGINT,
+    cart_token       UUID,
+    status           TEXT NOT NULL DEFAULT 'active',
+    item_count       INT NOT NULL DEFAULT 0,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at       TIMESTAMPTZ,                  -- 30 days from last update
-    CHECK ((user_id IS NULL) <> (cart_token IS NULL))   -- exactly one is set
+    expires_at       TIMESTAMPTZ,
+    CHECK ((user_id IS NULL) <> (cart_token IS NULL))
 );
 
 CREATE UNIQUE INDEX idx_carts_user
-    ON carts (user_id) WHERE status = 1 AND user_id IS NOT NULL;
+    ON carts (user_id) WHERE status = 'active' AND user_id IS NOT NULL;
 CREATE UNIQUE INDEX idx_carts_token
-    ON carts (cart_token) WHERE status = 1 AND cart_token IS NOT NULL;
-CREATE INDEX idx_carts_expires
-    ON carts (expires_at) WHERE status = 1;
-CREATE INDEX idx_carts_abandoned
-    ON carts (updated_at) WHERE status = 1;
+    ON carts (cart_token) WHERE status = 'active' AND cart_token IS NOT NULL;
+CREATE INDEX idx_carts_abandonment
+    ON carts (updated_at) WHERE status = 'active';
 
 CREATE TABLE cart_items (
     cart_id              UUID NOT NULL REFERENCES carts(cart_id) ON DELETE CASCADE,
@@ -151,13 +134,12 @@ CREATE TABLE cart_items (
     snapshot_price_cents INT NOT NULL,
     added_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    hold_token           TEXT,                     -- if SKU needed a reservation
+    hold_token           TEXT,
     PRIMARY KEY (cart_id, sku)
 );
 
 CREATE INDEX idx_cart_items_sku ON cart_items (sku);
 
--- Audit for merges. Saves you from support tickets.
 CREATE TABLE carts_merged (
     merge_id          UUID PRIMARY KEY,
     user_id           BIGINT NOT NULL,
@@ -165,436 +147,338 @@ CREATE TABLE carts_merged (
     anonymous_items   JSONB NOT NULL,
     account_items     JSONB NOT NULL,
     merged_items      JSONB NOT NULL,
-    rule_applied      TEXT NOT NULL,              -- "qty:max" | "anon_wins" | "rebind"
-    trimmed_items     JSONB,                      -- if size limit forced drops
+    rule_applied      TEXT NOT NULL,
+    trimmed_items     JSONB,
     occurred_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_merged_user ON carts_merged (user_id, occurred_at DESC);
 ```
 
-**Four choices worth defending:**
+</details>
 
-- **The CHECK constraint:** exactly one of `user_id` or `cart_token` is set. A cart is either guest or owned. After merge, the guest row is deleted. Never demoted.
+Four choices worth defending:
 
-- **`item_count` is denormalized.** The cart icon on every page only needs the count. One row read instead of a JOIN. Updated in the same transaction as item changes, so it never goes stale.
+**The CHECK constraint** enforces that exactly one of `user_id` or `cart_token` is set. A cart is either owned or guest. After merge, the guest row is deleted.
 
-- **`snapshot_price_cents` lives on cart_items.** Each item snapshots its price when added. The total is computed at checkout, never stored stale.
+**`item_count` is denormalized.** The cart icon on every page needs one number. One row read, no JOIN, no catalog call. Updated in the same transaction as item changes so it never goes stale.
 
-- **`carts_merged` saves your support team.** When a user emails "my cart disappeared after I logged in," you query by user_id and see exactly what happened.
+**`snapshot_price_cents` on cart_items.** Each item records the price when it was added. The total is computed fresh at checkout from current prices. The snapshot is for display and audit.
 
-> Why Postgres and not DynamoDB or Cassandra? Because merging two carts is one transaction. Removing an item and releasing its hold is one transaction. The data is small (7 GB at a million users). ACID matters. Postgres gives you all of it in one box.
+**`carts_merged` has no business logic in it.** It is a record of what happened. Every merge writes a row: what was in each cart, what the rule was, what was trimmed. When a user emails support, you have the answer.
 
----
-
-### 5. The architecture
-
-The whole picture on one screen.
-
-```
-                Client (web, mobile)
-                        |
-                        v
-                +-------------------+
-                |   API Gateway     |  TLS, auth, rate limit,
-                |                   |  cart_token cookie
-                +---------+---------+
-                          |
-                          v
-                +-------------------+
-                |   Cart Service    |  stateless pods
-                |                   |  merge logic, limits,
-                |                   |  price snapshot
-                +--+------+-------+-+
-                   |      |       |
-            read   |      |       |  emit events
-                   v      |       |
-              +--------+  |       |
-              | Redis  |  |       |  cart:user:{uid}
-              | active |  |       |  TTL 30 days
-              | carts  |  |       |
-              +----+---+  |       |
-                   | write|       |
-                   |through       |
-                   v      v       |
-              +------------------+|
-              | Postgres         ||  carts, cart_items,
-              | source of truth  ||  carts_merged
-              +------------------+|
-                                  |
-                                  v
-                          +-------------+
-                          | Kafka       |  cart.item.added
-                          | cart.*      |  cart.item.removed
-                          |             |  cart.merged
-                          |             |  cart.abandoned
-                          +------+------+
-                                 |
-            +--------------------+--------+----------+
-            v                    v        v          v
-        +---------+   +------------+ +---------+ +--------+
-        |Abandoned|   | Analytics  | | Recs    | | Fraud  |
-        |cart     |   | (ClickHouse| | engine  | | check  |
-        |emails   |   |  funnel)   | |         | |        |
-        +---------+   +------------+ +---------+ +--------+
-
-       Called directly (sync):
-              +-------------------+
-              | Inventory Service |  is SKU X in stock?
-              +-------------------+
-              +-------------------+
-              | Catalog / Pricing |  name, image, current price
-              +-------------------+
-```
-
-**Four things worth noticing:**
-
-- The cart service **never writes to inventory**. It only reads. The real inventory decrease happens at checkout, in a different service. This is why an inventory outage does not break add-to-cart.
-
-- **Catalog and inventory are called in parallel** on cart read. Total latency is `max(catalog, inventory)`, not the sum.
-
-- **Redis holds the small slow-changing part:** SKU + qty + snapshot_price + hold_token. Catalog and inventory results are NOT cached here. They change too fast.
-
-- **Notifications, analytics, recommendations sit downstream of Kafka.** If the notifier is down, carts still work. The emails just queue up.
-
-> Why call catalog in parallel with inventory? Because waiting for them in sequence doubles your latency. If catalog takes 30 ms and inventory takes 40 ms, sequential = 70 ms, parallel = 40 ms. Free speedup.
+Why Postgres and not DynamoDB? Merging two carts is one transaction. Removing an item and releasing its inventory hold is one transaction. The data is small (7 GB at 1M users). ACID matters here. Postgres gives all of it in one box.
 
 ---
 
-### 6. What an "add to cart" looks like, end to end
+### 5. The merge algorithm
 
-```
-   Client    Gateway   Cart Svc  Catalog  Inventory  Postgres  Redis    Kafka
-     |          |         |         |         |         |        |        |
-     | POST /items        |         |         |         |        |        |
-     +--------->|         |         |         |         |        |        |
-     |          | idempotency check |         |         |        |        |
-     |          +-------->|         |         |         |        |        |
-     |          |         | check sku & price |         |        |        |
-     |          |         +-------->|         |         |        |        |
-     |          |         |<--------+         |         |        |        |
-     |          |         | check stock       |         |        |        |
-     |          |         +------------------>|         |        |        |
-     |          |         |<------------------+         |        |        |
-     |          |         | (if reserved SKU: place_hold)         |        |
-     |          |         |                                                |
-     |          |         | BEGIN TX          |         |        |        |
-     |          |         +------------------------------>|     |        |
-     |          |         | INSERT cart_items ON CONFLICT |     |        |
-     |          |         | UPDATE carts SET item_count   |     |        |
-     |          |         | COMMIT                        |     |        |
-     |          |         |<------------------------------+     |        |
-     |          |         |                                                |
-     |          |         | HSET cart:user:{uid}                  |        |
-     |          |         +-------------------------------------->|        |
-     |          |         |                                                |
-     |          |         | emit cart.item.added                           |
-     |          |         +-------------------------------------------->| |
-     |          | 201 OK  |                                                |
-     |          |<--------+                                                |
-     | 201 OK   |         |                                                |
-     |<---------+         |                                                |
+This is where most cart designs break. The full algorithm:
+
+```mermaid
+flowchart TD
+    Start([POST /cart/merge called]) --> FetchBoth[Fetch both carts<br/>with SELECT FOR UPDATE]
+    FetchBoth --> AnonExists{Guest cart<br/>exists?}
+    AnonExists -- No --> ReturnUser["Return account cart unchanged"]:::ok
+    AnonExists -- Yes --> UserExists{Account cart<br/>exists?}
+    UserExists -- No --> Rebind["Rebind guest cart<br/>to user_id<br/>(clear cart_token)"]:::ok
+    UserExists -- Yes --> MergeItems["For each guest SKU:<br/>skip discontinued<br/>take max(guest qty, account qty)<br/>skip if over size limit"]
+    MergeItems --> Commit["Replace account cart items<br/>Delete guest cart<br/>Write carts_merged row<br/>Clear cart_token cookie"]:::ok
+
+    classDef ok fill:#dcfce7,stroke:#15803d,color:#14532d
 ```
 
-**Reads are much shorter.** Gateway routes to the Cart Service. Redis hit returns the bare cart in single-digit ms. Then catalog and inventory get called in parallel for hydration. A cold miss falls through to Postgres and repopulates Redis.
-
-**Target latencies:**
-
-| Operation | P99 |
-|-----------|-----|
-| Cart icon count | ~20 ms (runs on every page, must be fast) |
-| Full cart read | ~80 ms (parallel hydration is the bottleneck) |
-| Add item | ~150 ms (inventory round-trip is the slow part) |
-
-> Why is the cart icon so much faster than the full cart read? Because the count is denormalized on the `carts` row. One field read. No JOINs. No catalog call. No inventory call. Just `SELECT item_count FROM carts WHERE user_id = ?`.
-
----
-
-### 7. The merge problem
-
-This is the part most people get wrong. A guest user adds three items over twenty minutes. They log in. They already had two items in their account from last week.
-
-What does the merged cart look like?
-
-**The rule: take the bigger quantity, not the sum.**
-
-If a user added 2 of shoe-A on their phone (as guest), and they had 1 of shoe-A in their account from yesterday, they almost certainly meant "I want 2," not "I want 3." Adding surprises users. Max is safer.
-
-Exception: items that should add (gift cards, digital downloads). Special-cased per category.
-
-Some teams pick "guest wins" instead. Also defensible. The most recent action is most accurate. Easier to explain. But you lose items from the older session.
-
-Whichever you pick, **tell the user clearly**: "We combined your guest cart with your saved cart."
+<details markdown="1">
+<summary><b>Show: the merge in code</b></summary>
 
 ```python
 def merge_carts(anonymous_token, user_id):
     with db.transaction(isolation="serializable"):
-        anon_cart = db.fetch_cart(cart_token=anonymous_token, lock_for_update=True)
-        user_cart = db.fetch_cart(user_id=user_id, lock_for_update=True)
+        anon_cart = db.fetch_cart(cart_token=anonymous_token, lock=True)
+        user_cart = db.fetch_cart(user_id=user_id, lock=True)
 
         if anon_cart is None:
             return user_cart
 
         if user_cart is None:
-            # Just rebind the guest cart to the user.
-            db.update(anon_cart.id, user_id=user_id, cart_token=None, updated_at=NOW())
-            audit_merge(user_id, anonymous_token, [], anon_cart.items, anon_cart.items, "rebind")
-            invalidate_redis_keys(anonymous_token, user_id)
-            emit_event("cart.merged", ...)
+            db.update(anon_cart.id, user_id=user_id, cart_token=None)
+            audit_merge(user_id, anonymous_token, rule="rebind")
+            invalidate_redis(anonymous_token, user_id)
             return db.fetch_cart(user_id=user_id)
 
-        # Both exist. Merge with max-qty.
         merged = {item.sku: item.copy() for item in user_cart.items}
         trimmed = []
-        for anon_item in anon_cart.items:
-            if not catalog.is_available(anon_item.sku):
-                trimmed.append({"sku": anon_item.sku, "reason": "discontinued"})
+        for item in anon_cart.items:
+            if not catalog.is_available(item.sku):
+                trimmed.append({"sku": item.sku, "reason": "discontinued"})
                 continue
-            if anon_item.sku in merged:
-                merged[anon_item.sku].qty = min(
-                    max(anon_item.qty, merged[anon_item.sku].qty),
-                    MAX_QTY_PER_ITEM
+            if item.sku in merged:
+                merged[item.sku].qty = min(
+                    max(item.qty, merged[item.sku].qty), MAX_QTY_PER_ITEM
                 )
             else:
                 if len(merged) >= MAX_CART_ITEMS:
-                    trimmed.append({"sku": anon_item.sku, "reason": "size_limit"})
+                    trimmed.append({"sku": item.sku, "reason": "size_limit"})
                     continue
-                merged[anon_item.sku] = anon_item
+                merged[item.sku] = item
 
         db.replace_items(user_cart.id, merged.values())
         db.delete(anon_cart.id)
-        audit_merge(user_id, anonymous_token, user_cart.items, anon_cart.items,
-                    list(merged.values()), "qty:max", trimmed=trimmed)
-        invalidate_redis_keys(anonymous_token, user_id)
-        emit_event("cart.merged", ...)
+        audit_merge(user_id, anonymous_token, rule="qty:max", trimmed=trimmed)
+        invalidate_redis(anonymous_token, user_id)
         return db.fetch_cart(user_id=user_id)
 ```
 
-**Three things make this safe:**
+</details>
 
-- **Serializable isolation.** Two simultaneous merges of the same guest cart cannot both succeed. The second finds the cart deleted and returns the user cart. Double-clicking "Log in" is a no-op the second time.
+Three things make this safe:
 
-- **Audit always written.** Whether rebind, merge, or no-op, we capture what happened. Storage is cheap. Support tickets are not.
+- **Serializable isolation.** Alice double-clicks Log In. Two merge calls race. The second finds the guest cart deleted and returns the account cart unchanged.
+- **Audit always written.** Storage is cheap. Support tickets are not.
+- **Cookie cleared after merge.** Response sets `Set-Cookie: cart_token=; Max-Age=0`. No re-merge on next page load.
 
-- **Cookie cleared after merge.** Otherwise the next page load tries to merge again, finds nothing, and just makes noise in your logs.
-
-> Why merge anonymous cart with logged-in cart on login? Because if you do not, the user just lost the items they added before logging in. Worst experience possible. The "keep the bigger quantity" rule handles the common case where they had the same item in both carts.
-
-The classic mistake is doing the merge in the browser. The browser cannot be trusted. It does not know the account cart. It cannot enforce limits. The merge must be one server-side transaction.
+The classic mistake: doing the merge in the browser. The browser does not know the account cart, cannot enforce limits, and cannot run a transaction. Always server-side.
 
 ---
 
-### 8. Inventory check at checkout
+### 6. The architecture
 
-Three approaches, none perfect.
+```mermaid
+flowchart TB
+    subgraph Edge["Client edge"]
+        C([Web / Mobile]):::user
+        GW["API Gateway<br/>(auth · cart_token · rate limit)"]:::edge
+    end
 
-**Optimistic.** Cart shows last-known state. Checkout does the real check and atomic decrease. Normal case: works. Rare case: 1-3% of checkouts hit "no longer available." Cost: low. Right for: most online shops.
+    subgraph WritePath["Synchronous write path"]
+        CS["Cart Service<br/>(stateless pods)"]:::app
+        Cat["Catalog Service"]:::ext
+        Inv["Inventory Service"]:::ext
+    end
 
-**Soft reservation with TTL.** Adding to cart places a 15-minute hold. Checkout converts it to a permanent buy. Abandonment releases it. Normal case: user never sees "sold out" mid-checkout. Rare case: hot products look artificially low because ghost carts hold them. Cost: high. Right for: limited drops, event tickets.
+    DB[("Postgres<br/>carts · cart_items · carts_merged")]:::db
+    R[("Redis<br/>cart:user:{uid}")]:::cache
 
-**No checks.** Always works at checkout. Warehouse figures it out. Normal case: fast. Rare case: "we cannot ship, here is your refund" email. Right for: pre-orders, print-on-demand.
+    K{{"Kafka<br/>cart.item.added<br/>cart.item.removed<br/>cart.merged<br/>cart.abandoned"}}:::queue
 
-**The recommendation: optimistic by default. Reservation only for special items.**
+    subgraph Consumers["Async consumers"]
+        AB["Abandoned cart<br/>emails"]:::app
+        AN["Analytics<br/>(ClickHouse)"]:::ext
+        FR["Fraud check"]:::app
+    end
 
-The default is optimistic. Cart reads inventory when item is added (green check). Reads again on cart load. The **order service** does the real reserve at checkout. For SKUs the catalog flags `requires_reservation=true` (limited drops, concert tickets), the cart places a TTL hold and stores the `hold_token` on the cart_item row.
+    C --> GW
+    GW --> CS
+    CS --> Cat
+    CS --> Inv
+    CS --> R
+    CS --> DB
+    DB -->|CDC / outbox| K
+    K --> AB
+    K --> AN
+    K --> FR
 
-> Why optimistic by default? Industry abandonment rates run 60-70%. If every add-to-cart held inventory for 15 minutes, you would show "sold out" to real buyers while ghost carts sit on the items. Right for a Taylor Swift concert. Wrong for shoes.
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+    classDef ext fill:#e9d5ff,stroke:#7e22ce,color:#581c87
+```
 
-The point most people miss: **the cart's job is to show good info, not to guarantee the buy.** That guarantee belongs at checkout.
+Five things to notice:
+
+- The cart service never **writes** to inventory. It reads. The inventory decrease happens at checkout in the Order Service. An inventory outage does not break add-to-cart.
+- Catalog and inventory are called in **parallel** on cart read. Latency is `max(catalog, inventory)`, not the sum.
+- Redis holds the compact cart (SKU + qty + snapshot_price). Catalog and inventory results are not cached there; they change too fast.
+- Postgres is still source of truth. Redis is an accelerator. If Redis loses data, Postgres can repopulate it.
+- Notifications, analytics, fraud sit downstream of Kafka. If any of them dies, carts still work.
 
 ---
 
-### 9. The scaling journey: 10 to 1 million users
+### 7. A request, end to end
 
-This is what interviewers care about most. At every step, name what just broke and what fixes it. Build nothing too early.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Alice
+    participant GW as API Gateway
+    participant CS as Cart Service
+    participant Cat as Catalog
+    participant Inv as Inventory
+    participant DB as Postgres
+    participant R as Redis
+    participant K as Kafka
+
+    Alice->>GW: POST /cart/items {sku: shoe-blue-42, qty: 1}
+    GW->>CS: forward (auth ok, idempotency checked)
+    CS->>Cat: price + name?
+    CS->>Inv: in stock?
+    Note over CS,Inv: parallel calls
+    Cat-->>CS: $50, Blue Runner Size 42
+    Inv-->>CS: in stock
+
+    rect rgb(241, 245, 249)
+        Note over CS,DB: one transaction
+        CS->>DB: INSERT cart_items ON CONFLICT DO UPDATE qty
+        CS->>DB: UPDATE carts SET item_count = item_count + 1
+        CS->>DB: COMMIT
+    end
+
+    CS->>R: HSET cart:user:42 shoe-blue-42 {qty:1, price:5000}
+    CS->>K: emit cart.item.added
+    CS-->>GW: 201 Created
+    GW-->>Alice: 201 Created
+```
+
+Target latencies:
+
+| Operation | P99 |
+|-----------|-----|
+| Cart icon count | ~20 ms (Redis hit, one field read) |
+| Full cart read | ~80 ms (parallel catalog + inventory hydration) |
+| Add item | ~150 ms (inventory round-trip is the bottleneck) |
+
+The icon count is fast because `item_count` is denormalized on the `carts` row. One Redis field. No JOIN. No catalog call.
+
+---
+
+### 8. Inventory strategy
+
+Three options. The right default is optimistic.
+
+| Option | Failure mode | Build cost | Use when |
+|--------|--------------|------------|----------|
+| **Optimistic** (re-check at checkout) | 1-3% of checkouts find item gone last-second | Low | Default for most shops |
+| **Soft reservation** (hold on add, TTL expiry) | Ghost carts make real stock look empty | High | Concert tickets, limited drops |
+| **No check** (accept all, sort in warehouse) | "Cannot ship, refund coming" email | Near zero | Pre-orders, print-on-demand |
+
+The division of responsibility matters. The cart's job is to show good information. The Order Service's job is to make the buy real. Never put the guarantee in the cart.
+
+For SKUs the catalog flags `requires_reservation=true`, the cart calls the Inventory service to place a TTL hold and stores the `hold_token` on the `cart_items` row. The hold is released if the user removes the item, the TTL expires, or checkout converts it to a real purchase.
+
+---
+
+### 9. The scaling journey: 10 users to 1 million
+
+```mermaid
+flowchart LR
+    S1["Stage 1<br/>10-100 users<br/>1 Postgres + 1 pod<br/>~$30/mo"]:::s1
+    S2["Stage 2<br/>~1,000 users<br/>+ catalog/inventory split<br/>+ merge endpoint<br/>~$150/mo"]:::s2
+    S3["Stage 3<br/>10k-100k users<br/>+ Redis · Kafka<br/>+ read replica<br/>~$1-2k/mo"]:::s3
+    S4["Stage 4<br/>1M users<br/>+ Redis sharding<br/>+ regional deployment<br/>~$10-20k/mo"]:::s4
+
+    S1 --> S2 --> S3 --> S4
+
+    classDef s1 fill:#e0f2fe,stroke:#0369a1,color:#0c4a6e
+    classDef s2 fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef s3 fill:#fef3c7,stroke:#a16207,color:#713f12
+    classDef s4 fill:#fce7f3,stroke:#be185d,color:#831843
+```
 
 #### Stage 1: 10 to 100 users
 
-One Postgres. One app server. Cart and catalog in the same app. Guest carts use a `cart_token` cookie pointing at a row. No Redis. No Kafka. No abandonment emails. Inventory is a SELECT on the products table. About $30/month. Ships in three days.
+One Postgres, one app instance. Cart and catalog in the same app. Guest carts use a `cart_token` cookie. No Redis, no Kafka, no abandonment emails. Inventory is a SELECT on the products table. Ships in three days.
 
-You see ten carts a day. Postgres is bored. Anything more is over-engineering.
+You see ten carts a day. Postgres is not working. Anything more is over-engineering.
 
 #### Stage 2: 1,000 users
 
 Marketing wants abandoned-cart emails (highest-ROI campaign in e-commerce). The catalog deserves its own service. People want phone-to-laptop sync.
 
-Split inventory and catalog into separate services. Build the login-time merge endpoint and the `carts_merged` audit table. Add a nightly cron that finds carts inactive >6h and queues an email through a simple `pending_emails` table. Enforce cart size limits (100 items, 99 qty). About $150/month.
-
-Still no Redis. One Postgres read replica handles all reads. Still no Kafka. The polling pattern works fine at this scale.
+Split inventory and catalog into their own services. Build the merge endpoint and the `carts_merged` audit table. Add a nightly job that finds carts inactive for >6h and queues emails. Enforce size limits. Still no Redis, still no Kafka. One Postgres read replica handles all reads.
 
 #### Stage 3: 100,000 users
 
 Several things break at once:
 
-- Cart icon reads (~12/sec) show up in slow query logs.
-- Cart page load creeps up because each load joins with catalog over HTTP for 5+ items.
-- Inventory has a 30-second blip. Every cart add fails because you block on it.
-- A flash sale on a limited sneaker shows "available" to 5,000 users when you have 100 pairs.
+- Cart icon reads (~12/sec) appear in slow query logs.
+- Cart page load is slow because each load joins with catalog over HTTP for 5+ items.
+- A flash sale on a limited sneaker shows "available" to 5,000 users when 100 pairs remain.
+- Inventory has a 30-second blip. Every cart add fails because the service blocks on it.
 
-Fixes, in order:
-
-- Redis as cart cache. Active carts live as a hash per user. Write-through. 95%+ hit rate.
-- Inventory check becomes best-effort. Timeout falls back to "show as available, re-check at checkout."
-- Reservation only for special SKUs (catalog flags them, cart places hold).
-- Kafka replaces the polling pattern.
-- Postgres read replica for cart reads on miss.
-- Nightly GC job deletes anonymous carts past their expiry.
-
-About $1-2k/month.
+Fixes in order: Redis as cart cache (write-through, 95%+ hit rate). Inventory check becomes best-effort with a fallback to "show as available, confirm at checkout." Reservation only for flagged SKUs. Kafka replaces the polling pattern. Postgres read replica for cart reads on Redis miss. Nightly GC deletes expired anonymous carts.
 
 #### Stage 4: 1 million users
 
 New problems:
 
-- You need HA on Redis (single-node outage = 25,000 empty carts + angry customers).
-- Write contention on the `carts` row's `item_count` update is surfacing.
-- A bot adds 50 items/sec across thousands of guest carts and melts inventory.
-- You expand to Europe. Customers complain about price drift legally (some places require notice).
+- Redis single-node failure means 25,000 empty carts for ten seconds.
+- Write contention on `item_count` update surfaces under load.
+- A bot adds 50 items/second across thousands of guest carts, hammering inventory.
+- EU expansion requires regional data storage.
 
-Solutions:
+Shard Redis by `hash(user_id) % N`, one primary and one replica per shard. Rate-limit add-to-cart per IP and per `cart_token`. Regional deployment for EU with a local Redis and a Postgres replica. Async checkout pipeline: cart emits a frozen snapshot to Kafka, Order Service handles payment and the atomic reserve, user polls.
 
-- Shard Redis by `hash(user_id) % N`. 1 primary + 1 replica per shard.
-- Logically shard Postgres by user_id (physical sharding not yet needed).
-- Regional deployment for EU with local Redis and Postgres replica. Writes still go to US primary.
-- Async checkout pipeline. Cart emits `cart.checkout_started` with a frozen snapshot. Order service does payment and atomic reserve. User polls.
-- Rate limit add-to-cart per IP and per cart_token.
-- Price drift policy: if any item's price changed by >10% or >$5, the checkout response shows a banner and the user must confirm.
-
-About $10-20k/month.
-
-The cart itself is comfortable. The new bottleneck is inventory, which has its own scaling story.
-
-#### At 10M+ users
-
-The cart's architecture stops changing. 16 or 32 Redis shards. Physical Postgres sharding by user_id. The cart team becomes its own service team. The action moves to inventory, checkout, fulfillment, personalization. The cart stops being the interesting system in the building.
-
-> Why does the cart's complexity flatten out? Because the cart is a simple key-value problem with one quirky merge step. Once you have Redis + Postgres + Kafka + sharding, you have all the parts. The work moves to harder problems.
+The cart itself is comfortable at this point. The bottleneck moves to inventory and checkout.
 
 ---
 
 ### 10. Reliability
 
-**Redis dies mid-cart.** Two flavors:
+**Redis dies mid-day.** Cart reads fall through to Postgres at ~80 ms instead of ~20 ms. Users notice slightly slower pages. Nobody loses their cart because Postgres is the truth. On recovery, the first read for each user repopulates Redis. A circuit breaker switches to "DB only" mode after N Redis failures. `cart.redis.hit_rate` drops to 0. Alert fires.
 
-- Single shard fails over to replica in ~10s. Cart reads for affected users go to Postgres (slow but works). Writes queue and retry.
-- Entire cluster down: cart falls through to Postgres for every read at ~80 ms instead of ~5 ms. Users notice slightly slower pages. Nobody notices missing carts because Postgres is the truth.
+**Postgres primary dies.** Standard failover (30-60 seconds). Writes return 503 with `Retry-After`. Reads continue from replicas. After recovery, queued writes retry.
 
-**Postgres primary dies.** Standard failover (30-60s). Writes return 503 with `Retry-After`. Reads continue from replicas. After recovery, queued writes retry.
+**Inventory service goes down.** Cart shows last-known availability or a "confirm at checkout" badge. Cart adds continue. More users hit a sold-out surprise at checkout during the outage. Acceptable.
 
-**Inventory service down.** Cart shows last-known availability or "we will confirm at checkout." Cart adds work. Risk is more "sold out at checkout" surprises during the outage.
+**Checkout starts and payment fails.** The Order Service handles it. The cart does NOT clear until it gets a `cart.converted` event. Payment failure emits `cart.checkout_failed`. Any holds release. User edits and retries.
 
-**Checkout starts but payment fails.** The order service handles it. The cart does NOT clear until it gets a `cart.converted` event. If payment fails, the order service emits `cart.checkout_failed`, any holds are released, and the user can edit and retry.
-
-**Race: user removes an item while checkout is starting.** Checkout took a frozen snapshot of the cart. The removal hits the live cart but does not affect the in-flight checkout. If checkout succeeds, snapshot items are bought. Live cart minus what was bought remains for more shopping.
-
-**Network split between regions.** EU cart reads continue from EU replica (stale by a few seconds). EU writes queue locally and retry. If the split lasts more than a minute, surface "we are having trouble saving your cart."
+**Race between remove-item and checkout starting.** Checkout took a frozen snapshot of the cart. The removal hits the live cart but does not affect the in-flight checkout. If checkout succeeds, snapshot items are bought. The live cart (minus purchased items) remains.
 
 ---
 
-### 11. What to watch
+### 11. Observability
 
 | Metric | Why it matters |
 |--------|----------------|
-| `cart.read.p99` regional | Headline SLO for cart page load |
-| `cart.write.p99` | Spike = DB contention is back |
-| `cart.icon_count.p99` | Even tighter SLO. Runs on every page. |
-| `cart.redis.hit_rate` | Should be >95%. Drop = repopulation storm or shard imbalance. |
-| `cart.merge.rate` | Sudden spike = someone broke auth (re-merging every request) |
-| `cart.merge.size_trimmed.rate` | Often non-zero = raise the size limit |
-| `inventory.timeout.rate` | Drives the fallback path |
-| `cart.checkout_started.rate` | Conversion funnel |
-| `cart.abandonment.rate` | Marketing's headline. Alert on big jumps. |
-| `cart.size.p99` | Detects bot-stuffed carts. Alert if p99 > 50 items. |
-| `cart.add.rate_limit_hits` | Bot signal |
-| `cart.price_drift.acknowledgements` | Compliance + UX |
-| `kafka.cart_events.lag` | If this lags, abandonment emails stop arriving |
-| `db.replication_lag.p99` | Read replicas must stay <1s |
+| `cart.icon_count.p99` | Tightest SLO. Runs on every page. Alert at >40 ms. |
+| `cart.read.p99` | Cart page load. Alert at >200 ms. |
+| `cart.write.p99` | Spike means DB contention is back. |
+| `cart.redis.hit_rate` | Should be >95%. Drop means shard imbalance or repopulation storm. |
+| `cart.merge.rate` | Spike means auth is broken and re-merging every request. |
+| `cart.merge.size_trimmed.rate` | Non-zero often means the size limit is too low. |
+| `inventory.check.timeout_rate` | Drives the fallback path frequency. |
+| `cart.abandonment.rate` | Marketing's headline. Alert on >20% sudden shift. |
+| `cart.size.p99` | Bot signal if p99 > 50 items. |
+| `kafka.cart_events.consumer_lag` | If this grows, abandonment emails stop arriving. |
+| `db.replication_lag.p99` | Read replicas must stay under 1 second. |
 
-**Page on:** cart.read.p99 > 200 ms for 5 min, redis.hit_rate < 80% for 5 min, kafka.lag > 5 min, cart.write error rate > 2%.
+Page on: `cart.icon_count.p99` > 40 ms for 5 min, `redis.hit_rate` < 80% for 5 min, `kafka.lag` > 5 min, cart write error rate > 2%.
 
-**Ticket on:** merge.rate or size_trimmed.rate sudden spike, inventory.timeout.rate > 5%.
+Ticket on: merge rate or size-trimmed rate sudden spike, inventory timeout rate > 5%.
 
 ---
 
-### 12. Gotchas a senior interviewer listens for
+### 12. Follow-up answers
 
-**Abandonment timezones.** "After 6 hours of no activity" runs in UTC, never in the user's local time. Daylight savings transitions otherwise double-email or skip users. Store `updated_at` as TIMESTAMPTZ. Compute "6 hours ago" in UTC.
+**1. Bots stuffing a cart with 10,000 items.**
 
-**Cart bloat from bots.** Coupon spam, scrapers. Hard size limits (100 items, 99 qty). Per-IP and per-cart_token rate limits on add. Surface `cart_full` as 422.
-
-**Bot carts skewing analytics.** A scraper opening 10k guest carts daily pollutes your "average cart size" metric. Flag carts where `cart_token` was created but never accessed from a real session. Exclude from headline metrics.
-
-**Price drift.** Show both prices in the UI. At checkout, if the difference passes the threshold, require explicit acknowledgment. Record it in audit. EU consumer law requires this. Other places may too.
-
-**Currency mismatch.** User in USD adds an item, switches to EUR. Re-display in EUR with current FX. Snapshot stays in original. Display computes converted. Never silently change the expected total.
-
-**Restricted items at checkout.** Item legal at add-time becomes restricted (regulation change, shipping address differs). Order service re-checks against shipping rules. Restricted items surface as "cannot ship, remove or change address."
-
-**Multi-tab edits.** ETags on cart responses. PATCH includes `If-Match`. Conflicts return 409 with the latest cart. UI shows "your cart was updated elsewhere."
-
-**Anonymous cookies that never die.** Browser keeps `cart_token` forever. After 30 days the cart is gone but the cookie still points at nothing. On read, treat "cookie present, no row" as "give them a new token." Do not show an error.
-
-**Decimal places.** Integer cents everywhere internally. Never store `9.99` as a float. Floats break promo math eventually.
-
-**Migration from a legacy cart.** Run dual-write during migration. Resolve conflicts user by user with a written rule.
-
-> Why integer cents and not floats? Because `0.1 + 0.2 = 0.30000000000000004` in float math. After a million transactions, you have lost real money. Cents as integers makes arithmetic exact.
-
----
-
-### 13. Follow-up answers
-
-**1. Cart bloat from bots.**
-
-Symptoms: a single guest cart with 10k items, or a cart doing add/remove/add/remove at 50/sec.
-
-Layered defenses:
-
-- Per-cart size limit (100) as a 422.
-- Per-qty limit (99).
-- Rate limit on `POST /cart/items` (30/min per IP, 60/min per logged-in user; configurable up for legit B2B bulk-add).
-- WAF rules at the edge for obvious bot user-agents.
-- Bot detection: guest carts from IPs that never load a product page get shorter TTL.
-
-For determined attackers, nothing in the cart layer alone stops them. Push detection upstream: CAPTCHA on suspicious checkout patterns, account-level fraud detection.
+Hard size limits (100 items, 99 qty per SKU) as a 422 response. Rate limit `POST /cart/items` at 30/min per IP and 60/min per logged-in user. WAF rules at the edge for known bot user-agents. Shorter TTL for guest carts created from IPs that never load a product page. For determined attackers, push detection upstream: CAPTCHA on suspicious checkout patterns, account-level fraud scoring.
 
 **2. Phone-to-laptop sync delay.**
 
-Phone's add writes to Redis and DB. Both update right away. Laptop's next page load sees the new state. No push to laptop. The user has to interact. If the cart page is already open on laptop, they see stale data until they refresh.
+The phone's add writes to Postgres and Redis immediately. The laptop's next page load sees the new state. No push happens. Acceptable: visible on next interaction. If the cart page is already open on the laptop, it shows stale data until refresh. To make it live: a WebSocket per user pushing `cart.item.added` events. More infrastructure, marginal UX win. Most shops skip it.
 
-To make it live: WebSocket per user pushing cart-change events. Cost: more infrastructure for a marginal UX win. Most online shops skip it.
+**3. Redis dies mid-day.**
 
-Acceptable: visible on next page load. Sub-100 ms after request reaches Redis.
+Circuit breaker switches the cart service to "DB only" mode after N Redis failures. Cart reads fall through to Postgres at ~80 ms. Users see slightly slower pages; nobody loses cart contents. On recovery, the first read for each user repopulates Redis via a cache-miss path. The `cart.redis.hit_rate` metric drops to 0 and alerts fire. Do not try to serve stale data from anywhere else. Postgres is the truth.
 
-**3. Redis dies mid-cart.**
+**4. Price went up.**
 
-Entire cluster down for 5 minutes during peak.
+Cart page shows current price ($55) with a note "was $50 when added." At checkout, if the difference passes the threshold (10% or $5, whichever is smaller), the response includes `price_change_acknowledgement_required: true`. The UI shows a banner. The user clicks "Confirm." The second checkout call carries `price_change_acknowledged: true`. The order record captures both prices. What they pay: always current. The snapshot is for display and audit only.
 
-User experience: first cart load after Redis dies fetches from Postgres at ~50 ms instead of ~10 ms. User does not notice. Cart writes continue normally (DB first, Redis update silently fails, next read repopulates). Once Redis is back, first cart load for each user repopulates the hash. Cold start, ~30s to warm up.
+**5. Abandoned cart detection.**
 
-Internally: circuit breaker switches to "DB only" mode after N Redis failures in a row. Re-probes regularly. The `cart.redis.hit_rate` metric drops to 0 during the outage. Alerts fire.
+Naive scan of all active carts every minute is slow at 100k+ carts. Right approach: time-window batching.
 
-What you do NOT do: try to serve stale data from somewhere else. The DB is truth. Redis is just an accelerator.
-
-**4. Price drift.**
-
-User added at $50 last week. Today is $55.
-
-- Cart page: shows current ($55) with "was $50 when added."
-- Total uses current prices.
-- At checkout: response returns live total. If any item's difference passes threshold (10% or $5), response includes `price_change_required_acknowledgement: true`. UI shows a banner. User clicks "Confirm changes." Second checkout call carries `price_change_acknowledged: true`. Audit row captures original snapshot and confirmed current price.
-
-What they pay: always current. The snapshot is for info and audit only. The exception is "price guarantee" promotions, which are a separate feature.
-
-**5. Cart abandonment detection.**
-
-Naive: scan all carts every minute where `status = active AND updated_at < NOW() - 6h`. At 100k+ active carts, that is slow.
-
-Right approach: time-window batching.
+<details markdown="1">
+<summary><b>Show: the abandonment query</b></summary>
 
 ```sql
 SELECT cart_id, user_id FROM carts
-WHERE status = 1
+WHERE status = 'active'
   AND user_id IS NOT NULL
   AND updated_at >= NOW() - INTERVAL '6 hours 15 minutes'
   AND updated_at <  NOW() - INTERVAL '6 hours'
@@ -604,90 +488,68 @@ WHERE status = 1
   );
 ```
 
-Finds carts that just crossed the 6-hour threshold in this 15-minute job run. Touches a small slice. Index on `(status, updated_at)` is the partial index that supports it. For each result, emit `cart.abandoned` to Kafka. Notification service consumes and sends. Record in `cart_abandonment_emails` to dedupe.
+This touches only carts that just crossed the 6-hour threshold. The partial index on `(status, updated_at)` makes it fast. For each result, emit `cart.abandoned` to Kafka. The notification service consumes and sends. Record in `cart_abandonment_emails` to prevent duplicates.
 
-At scale, swap the SQL for a Redis sorted set of `cart_id` by `updated_at`. zrange-pop expired entries every minute. More efficient, more moving parts.
+At scale, swap the SQL for a Redis sorted set of `cart_id` by `updated_at`. Pop expired entries every minute. More efficient, more moving parts.
 
-**6. Anonymous cart TTL and the returning user.**
+</details>
 
-Anonymous carts get 30-day TTL. Nightly GC:
+**6. Anonymous carts pile up.**
 
-```sql
-DELETE FROM carts WHERE status = 1 AND user_id IS NULL AND expires_at < NOW();
-```
-
-User comes back after 90 days with the old `cart_token` cookie. Lookup returns nothing. Cart Service issues a new token, sets the cookie, returns an empty cart. No error.
-
-If they log in: nothing to merge. Account cart loads normally.
+Anonymous carts get a 30-day TTL (`expires_at = NOW() + 30 days`, refreshed on activity). A nightly GC job deletes expired guest rows. User returns after 90 days with the old cookie: the lookup returns nothing. The cart service issues a new token, sets the cookie, returns an empty cart. No error shown. If they log in: nothing to merge. Account cart loads normally.
 
 **7. Shared account, simultaneous edits.**
 
-Two people on the same account both adding items.
+Both sessions resolve to the same `cart_id` via the unique index on `(user_id) WHERE status = 'active'`. Adds use `INSERT ... ON CONFLICT (cart_id, sku) DO UPDATE SET qty = qty + ?`. Concurrent adds for the same SKU sum correctly (each is an explicit user action; sum is right here, unlike at merge). Removes use a plain DELETE; first-wins. Both users see each other's edits on next page load. Real-time push via WebSocket is a niche add-on, not the default.
 
-Both sessions resolve to the same `cart_id` via the unique index on `user_id WHERE status = 1`. Adds use `INSERT ON CONFLICT (cart_id, sku) DO UPDATE SET qty = qty + ?`. Concurrent adds for the same SKU sum correctly (each is an explicit user action; sum is right here, unlike merge). Removes use straight DELETE. Race is first-wins, second sees zero rows. `carts.item_count` is updated in the same transaction. Both users see each other's edits on next page load.
+**8. Currency switch.**
 
-No real-time push by default. If you want it, WebSocket per session subscribed to `cart:{user_id}` events. Niche feature.
-
-**8. Currency and locale.**
-
-Cart stores `sku`, `qty`, and `snapshot_price_cents` in the original transaction currency. Catalog returns prices in a configurable currency at hydration time.
-
-User switches locale: cart's display recomputes against the new currency's prices (catalog refreshes FX hourly). Snapshot stays in original. Displayed prices change. UI shows "Prices shown in EUR. Original prices were in USD." At checkout, user is charged in the displayed currency. Order record captures both for accounting.
+Cart stores `snapshot_price_cents` in the original transaction currency. Catalog returns prices in any requested currency at hydration time. When Alice switches to EUR, displayed prices recompute against the catalog's current EUR prices. The snapshot stays in the original currency. At checkout, Alice is charged in the displayed currency. The order record captures both currencies for accounting. Never silently change the expected total without showing the user.
 
 **9. Item becomes restricted before checkout.**
 
-User added vape juice (legal when added). Their state passed a regulation. Item is no longer shippable to their ZIP.
+On cart page load, catalog and inventory return availability as `restricted_in_region`. The cart service displays the item with a "cannot ship to your address" badge. The checkout button disables until the item is removed. If the user somehow reaches checkout: the Order Service re-checks every item against the shipping address. Restricted items appear in the error response. No payment is attempted. The user sees: "Some items in your cart cannot be shipped to this address."
 
-At cart load: catalog/inventory returns availability as `restricted_in_region`. Cart Service displays the item with "cannot ship to your address" badge. Checkout button disabled until removed. At checkout, if the user bypassed: Order Service re-checks each item against the shipping address. Restricted items return in the error. Checkout fails atomically. No payment attempted.
+**10. Save for later.**
 
-User sees: "Some items in your cart cannot be shipped to this address. Remove them or change your address."
-
-**10. Save for later (wishlist).**
-
-"Move to wishlist" belongs to a separate Wishlist Service. The cart holds items the user wants to buy. The wishlist holds items they want to remember.
-
-The interaction: UI button calls `POST /wishlist/items {sku}` then `DELETE /cart/items/{sku}`. Two calls, not atomic. If wishlist add works but cart delete fails, the item is in both places (annoying, not broken). UI retries the cart delete in the background.
-
-Alternative: single `POST /cart/items/{sku}/move_to_wishlist` endpoint that does both. More cohesive UX. Couples the two services. Fine for a small site. Large sites usually own the two services separately and stick with the two-call dance.
+Move-to-wishlist belongs to a Wishlist Service. The cart holds items to buy. The wishlist holds items to remember. The interaction: the UI calls `POST /wishlist/items {sku}` then `DELETE /cart/items/{sku}`. Two calls, not atomic. If the wishlist add succeeds and the cart delete fails, the item sits in both places (annoying, not broken). The UI retries the cart delete in the background. An alternative is one endpoint `POST /cart/items/{sku}/move_to_wishlist` that calls both internally. More cohesive UX. Couples two services. Fine for a small shop; larger shops usually keep them separate.
 
 ---
 
-### 14. Trade-offs worth saying out loud
+### 13. Trade-offs worth saying out loud
 
-**Cookie vs DB vs Redis.** Cookie alone is too small and does not sync. In-memory session does not scale past one server. DB alone gets slow on cart-icon reads at scale. Redis+DB is right once DB reads become noticeable. Start with DB-only. Add Redis when metrics demand it. Never start with Redis-only because you lose durability.
+**Cookie vs DB vs Redis.** Cookie alone is too small (4 KB) and does not sync across devices. In-memory session does not scale past one server. DB alone gets slow on icon reads at scale. Redis+DB is right once DB reads appear in slow query logs. Start with DB-only. Add Redis when metrics demand it. Never Redis-only: you would lose durability.
 
-**Eager vs lazy inventory check.** Eager (reservation on add) burns inventory headroom for ghost carts. Lazy (re-check at checkout) sometimes disappoints users at the last step. Default lazy. Eager only for explicitly marked SKUs. Mixing the two by SKU is the senior answer.
+**Optimistic vs reservation.** Reservation on every add-to-cart burns headroom for ghost carts (60-70% abandonment rate). Optimistic surprises 1-3% of buyers at the last checkout step. Mix: optimistic by default, reservation for explicitly marked SKUs. That is the senior answer.
 
-**Sync vs async checkout.** Sync is simpler but couples cart latency to all downstream systems. Async absorbs spikes and isolates failures. Trade-off: worse UX (the "processing" page). At small scale sync is fine. At Black Friday scale async is required.
+**Sync vs async checkout.** Synchronous checkout is simpler but couples cart latency to payment and fulfillment. Asynchronous checkout (frozen snapshot → Kafka → Order Service) absorbs spikes and isolates failures. Trade-off: a "processing" page instead of instant confirmation. Sync is fine at small scale. Async is required on Black Friday.
 
-**Why one cart per user, not many.** Some sites support multiple carts ("birthday cart", "work cart"). Adds significant complexity (which is active? merge across them? share with family?). Do not build it until customers ask. Most never ask.
+**Why one cart per user, not many.** Some sites offer "birthday cart" or "work cart." Multiple carts add significant complexity (which is active? merge across them? share with family?). Build it only when customers ask. Most never do.
 
-**Why Postgres, not NoSQL.** ACID for merge and add-on-conflict. Analytical queries for abandonment. Small data volume. Postgres covers all three. DynamoDB would force you to build your own transaction layer for merge and your own scan layer for abandonment.
+**Why Postgres and not DynamoDB.** ACID for merge and `ON CONFLICT` add. Analytical queries for abandonment detection. Small data volume. Postgres covers all three. DynamoDB would require a custom transaction layer for merge and a separate scan layer for abandonment.
 
-**What you would revisit at 10M+ users.** Physical shard Postgres by user_id. Move from Redis-as-cache to Redis-as-source-of-truth for active carts with periodic flushes to durable store. Push cart logic to the edge (CDN-near workers) for sub-50 ms global cart reads. Pre-aggregate the abandonment funnel in ClickHouse so the cart service does not power analytics queries directly.
+**What you would revisit at 10M+ users.** Physical shard Postgres by `user_id`. Move from Redis-as-cache to Redis-as-source-of-truth for active carts with periodic Postgres flushes. Push cart logic to CDN-adjacent workers for sub-50 ms global reads. Pre-aggregate the abandonment funnel in ClickHouse so the cart service is not running analytics queries directly.
 
 ---
 
-### 15. Common mistakes
+### 14. Common mistakes
 
-**"Just store the cart in localStorage."** Misses multi-device sync, bot concerns, the merge problem on login. Fine for the smallest sites. Loses you the design problem.
+**"Just store the cart in localStorage."** Misses multi-device sync, bot concerns, and the merge problem at login. Fine for the smallest demo. Loses the design problem.
 
-**One unified cart for guest and logged-in with "user_id might be null" magic everywhere.** The two flows have different lifecycles, different TTLs, different sync requirements. Model both explicitly. Merge is its own operation.
+**No merge discussion.** Second-most asked follow-up after inventory. Walk in with a stance: max-qty rule, one serializable transaction, audit row, clear the cookie.
 
-**No discussion of merge.** Second-most asked follow-up after inventory. Walk in with a stance: max-qty, audit row, idempotent, single transaction.
+**"Reservation on add to cart for everything."** A common junior answer. Then the interviewer asks about 60-70% abandonment, ghost holds, and the design unravels. The right answer is optimistic by default with named exceptions.
 
-**"We will reserve inventory on add to cart."** A common junior answer. Then the interviewer asks about 60-70% abandonment, ghost holds, and your design unravels. The right answer is "optimistic by default, reservation only for special SKUs."
+**Ignoring price drift.** "Whatever price is in the cart is what they pay" is wrong and sometimes illegal. Snapshot vs current, surface the difference, require confirmation at threshold.
 
-**Ignoring price drift.** "Whatever was in the cart is what they pay" is wrong and sometimes illegal. Snapshot vs current, surface the difference, require acknowledgment at the threshold.
+**Checkout lives in the cart service.** Checkout is its own service: payment, address check, atomic inventory reserve, order creation, post-purchase events. Cart hands off via a frozen snapshot.
 
-**Putting checkout in the cart service.** Checkout is its own service: payment, address check, atomic inventory reserve, order creation, post-purchase events. Cart hands off via a frozen snapshot.
+**Forgetting the icon read.** Every page loads the cart count. That endpoint dominates QPS. Denormalize `item_count`, put it in Redis, target <20 ms p99.
 
-**Forgetting the cart-icon read.** Every page loads the cart count. That single endpoint dominates QPS. Optimize it (denormalized `item_count`, Redis cache, ~20 ms p99).
+**Treating inventory as a hard dependency on add.** If inventory is down, add-to-cart should degrade gracefully, not fail. Show a "confirm at checkout" badge and move on.
 
-**Treating the cart as a synchronous hard link to inventory.** If inventory is down, cart adds should not fail. Show a fallback badge. Let checkout do the real check.
+**Designing for huge write throughput.** Even at 1M DAU you see ~20 writes/sec. Do not propose Cassandra because "carts are write-heavy." They are not.
 
-**Designing for huge write throughput.** Even at 1M DAU you see ~20 writes/sec. Do not propose Cassandra or Spanner because "carts are write-heavy." They are not.
+**No audit trail on merge.** Without `carts_merged`, every "my cart is wrong after login" support ticket is unsolvable. Cheap to add. The data is irreplaceable.
 
-**No audit trail on merge.** Without `carts_merged`, every "my cart is wrong" support ticket is unsolvable. Cheap to add. The data is irreplaceable.
-
-If you can hit seven of these ten, you are interviewing at senior level. The three most senior signals: a confident merge policy, optimistic-by-default inventory with named exceptions, and explicit handling of price drift. Those three separate a thoughtful cart design from a generic CRUD answer.
+The three signals that separate a strong answer from a generic CRUD answer: a confident merge policy, optimistic-by-default inventory with named exceptions, and explicit handling of price drift with acknowledgment at checkout.

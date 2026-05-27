@@ -1,8 +1,8 @@
 ---
 id: 18
-title: Design a Write-Heavy System (Patterns Walkthrough)
+title: Write-Heavy System Patterns
 category: Patterns
-topics: [batching, async, partitioning, append-only, queues]
+topics: [batching, async, partitioning, append-only, queues, LSM trees, event sourcing]
 difficulty: Easy
 solution: solution.md
 ---
@@ -11,293 +11,431 @@ solution: solution.md
 
 You sit down. The interviewer skips the small talk.
 
-> *"I have an audit logging service. Today it does 100 events per second. One Postgres database. It works fine. My PM just told me we are going to log every user click across the company. About 1 million events per second. Walk me through what you do, in order."*
+> *"I have an audit logging service. Today it does 100 events per second. One Postgres. It works fine."*
+>
+> *"My PM just told me we are going to log every user click across the company. About 1 million events per second."*
+>
+> *"Walk me through what you do, in order."*
 
-This is not a question about a finished system. It is a question about how you *grow* a system from "one Postgres handles it" to "a million events per second." The interviewer wants to see you reach for one tool at a time. Buffering. Batching. Queues. Partitioning. Append-only logs. The moment you give up strong consistency.
+This is not a question about a finished system. It is a question about how you *grow* one. The interviewer wants to see you reach for one tool at a time. Buffering. Batching. Queues. Partitioning. Append-only logs. The moment you give up strong consistency.
 
-A write-heavy system is the opposite of a read-heavy one. The cost comes from taking in data, not from serving it. Each event is small. Queries are simple. The storage engine has one job: absorb writes faster than a normal database can.
+The word **write-heavy** sounds like a throughput problem. It is not, exactly. The cost comes from taking in data, not from serving it. Each event is small. Queries are simple. The storage engine has one job: absorb writes faster than a normal database can.
 
-If you say "use Kafka and Cassandra" in the first minute, you fail. The interviewer wants you to reach for each tool *at the moment the previous one breaks*. Not all at once.
+If you say "use Kafka and Cassandra" in the first minute, you fail. The interviewer wants each tool reached for *at the moment the previous one breaks*. Not all at once.
 
-We will walk this from 100 events per second to 1 million per second. At every step we name what breaks first, then add the smallest fix.
+We will walk six patterns, each with a diagram, a "when to use" note, and a "what breaks" note. Then we will stack them into a real pipeline growing from 100 events per second to 1 million.
 
 ---
 
-## Step 1: Ask the right questions
+## Step 1: Picture the fundamental problem
 
-Take five minutes. Do not draw anything yet.
+Before any patterns, picture what write-heavy actually means. Every write is unique. Every write must hit disk. Caching does not help.
 
-The dumb instinct is "just send it to Kafka." That is wrong until you have answers to the questions below. Aim for about 8 questions that change the design if answered differently.
+```mermaid
+flowchart LR
+    subgraph ReadHeavy["Read-heavy"]
+        R1([Many readers]):::user --> RC[("Cache")]:::cache
+        RC -.miss.-> RDB[("One DB")]:::db
+    end
+    subgraph WriteHeavy["Write-heavy"]
+        W1([Many writers]):::user --> WDB[("Every write<br/>hits disk")]:::db
+    end
+
+    classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+```
+
+A read-heavy system can serve a million reads from one cached copy. A write-heavy system cannot: every write is unique, every write must persist. The only two levers are **batch** (amortize per-write cost over many writes) and **spread** (route writes to many machines so no one machine melts).
+
+> **Take this with you.** Every pattern in this doc is either batching, spreading, or both.
+
+---
+
+## Step 2: Ask the right questions
+
+Before drawing any boxes, take five minutes with these questions. The answers decide everything.
 
 <details markdown="1">
-<summary><b>Show: 8 questions that matter</b></summary>
+<summary><b>Show: 8 questions that change the design</b></summary>
 
-1. **How much loss is OK?** "If we drop 0.1% of events when a node crashes, is that fine?" Audit logging for SOX accepts zero loss. Click tracking accepts 1%. That one answer decides if you need `acks=all` on Kafka, a transactional outbox, or fire-and-forget UDP.
+1. **How much loss is OK?** "If we drop 0.1% of events when a node crashes, is that fine?" SOX audit needs zero loss. Click tracking accepts 1%. That one answer decides whether you need `acks=all` on Kafka, a transactional outbox, or fire-and-forget UDP.
 
 2. **How fresh must reads be?** "When we save an event, when must a query see it? 100ms? 10 seconds? 5 minutes?" Real-time forces you to index right away. 5-minute lag lets you batch into Parquet files and pay 1% of the cost.
 
-3. **Does order matter?** "Do events need to be ordered globally, ordered per user, or unordered?" Global ordering means one writer (slow). Per-user ordering means partition by user (medium). Unordered is the cheapest.
+3. **Does order matter?** Global ordering means one writer (slow). Per-key ordering means partition by key (medium). Unordered is cheapest.
 
-4. **How do consumers read this data?** "By single event ID, or by aggregating?" Point lookups want an LSM tree with a primary key. Scans and counts want a columnar layout like Parquet or ClickHouse.
+4. **How do consumers read this data?** Point lookups want an LSM tree with a primary key. Scans and counts want a columnar layout like Parquet or ClickHouse.
 
 5. **How long do we keep it?** "30 days hot, 7 years cold? Forever?" Time-based partitions are easy to drop. That fact alone often picks the partition scheme.
 
-6. **How big is one event?** A 200-byte event is a totally different system from a 50KB event. Fixed schemas can use columnar formats. Random JSON forces you to store the raw bytes.
+6. **How big is one event?** A 200-byte event is a different system from a 50KB event. Fixed schemas can use columnar formats. Random JSON forces you to store raw bytes.
 
-7. **How bursty is the traffic?** "Is 1M/sec steady or a peak? Black Friday spike? Log storm risk?" A 5x burst is normal. Some systems see 50x bursts when a logging loop goes wild. Your queue size depends on this.
+7. **How bursty is the traffic?** A 5x burst is normal. Some systems see 50x bursts when a logging loop goes wild. Your queue size depends on this.
 
 8. **What delivery promise do we need?** At-most-once (lose on failure), at-least-once (may duplicate), or exactly-once. Exactly-once is expensive and almost never worth it. At-least-once with idempotent consumers is the usual answer.
 
-A strong candidate adds one more: *"What does the consumer actually do with these events?"* If it is a dashboard, you optimize for aggregation. If it is fraud detection, you optimize for low latency. If it is compliance storage, you optimize for cheap durable disk. The downstream decides the upstream.
+A strong candidate also asks: *"What does the consumer actually do with these events?"* If it is a dashboard, optimize for aggregation. If it is fraud detection, optimize for low latency. If it is compliance storage, optimize for cheap durable disk. The downstream decides the upstream.
 
 </details>
 
 ---
 
-## Step 2: How big is this thing?
+## Step 3: How big is this thing?
 
-The interviewer hands you the numbers. 1M events per second, steady. 3x that at peak. 500 bytes per event. Keep 90 days hot, 7 years cold. No global ordering needed. 10 seconds of lag is fine.
+The interviewer hands you numbers: 1M events per second, steady. 3x that at peak. 500 bytes per event. Keep 90 days hot, 7 years cold.
 
-Compute six numbers on paper before peeking:
-
-1. Bytes per second at steady state
-2. Bytes per second at peak
-3. Events per day
-4. Hot storage size (90 days)
-5. Cold storage size (7 years, assume 5x compression)
-6. Queue size if downstream stalls for 5 minutes
+| Number | Value | Why it matters |
+|--------|-------|----------------|
+| Steady bandwidth | 500 MB/sec (4 Gbps) | Multiple ingest nodes needed just for NIC, not CPU |
+| Peak bandwidth | 1.5 GB/sec (12 Gbps) | Several machines per region just to accept bytes |
+| Daily volume | 86 billion events, 43 TB raw | Hot tier is petabytes |
+| Hot storage (90 days) | ~3.9 PB | 10-30 node Cassandra cluster |
+| Cold storage (7 years, 5x compression) | ~22 PB on S3 | Standard tier costs ~$500k/month |
+| Queue size on 5-min stall | 300M events, 150 GB | Kafka handles easily, in-memory does not |
 
 <details markdown="1">
-<summary><b>Show: the math</b></summary>
+<summary><b>Show: how the numbers come out</b></summary>
 
-**Steady bandwidth.** 1M events/sec * 500 bytes = 500 MB/sec = **4 Gbps**. A 10G network card maxes out around 80%. You need more than one ingest machine just for network throughput, not for CPU.
+**Steady bandwidth.** 1M events/sec x 500 bytes = 500 MB/sec = 4 Gbps. A 10G NIC maxes out around 80%. You need more than one ingest machine just for network throughput, not for CPU.
 
-**Peak bandwidth.** 3x steady = 1.5 GB/sec = **12 Gbps**. Several machines per region just to accept the bytes.
+**Daily volume.** 1M x 86,400 seconds = 86 billion events per day. At 500 bytes each, that is 43 TB per day raw.
 
-**Daily volume.** 1M * 86,400 seconds = **86 billion events per day**. At 500 bytes each, that is **43 TB per day raw**.
+**Hot storage.** 43 TB x 90 = 3.9 PB. Not one machine. This is a 10-30 node Cassandra cluster with RF=3.
 
-**Hot storage (90 days).** 43 TB * 90 = **about 3.9 PB**. Not one machine. This is a 10 to 30 node Cassandra cluster with RF=3 (three copies of each row).
+**Cold storage.** 43 TB x 365 x 7 / 5 = 22 PB in S3 as Parquet files.
 
-**Cold storage (7 years, 5x compression).** 43 TB * 365 * 7 / 5 = **about 22 PB** in S3 as Parquet files. Standard S3 costs about $500k/month for that. Glacier Deep Archive cuts it to 1/20 the price if you rarely read it.
+**Queue size on 5-minute stall.** 1M events/sec x 300 seconds = 300 million events = 150 GB. Kafka with 7-day disk retention handles this easily. An in-memory queue cannot.
 
-**Queue size on 5-minute stall.** 1M events/sec * 300 seconds = **300 million events** = **150 GB**. Kafka with 7-day disk retention handles this easily. An in-memory queue cannot.
-
-**What this means.** Bandwidth and storage dominate. CPU is not the bottleneck. One Postgres maxes out around 10k-50k writes/sec. We are 20x to 100x past that on a single shard. Almost the whole design exists to *spread* writes across many machines and *batch* small writes into bigger ones.
-
-> Why is this so different from a read-heavy system? Reads can be cached. The same data can be served a million times from one cached copy. Writes cannot. Every write is unique. Every write must hit disk. Caching does not help. You can only batch and spread.
+**The headline.** Bandwidth and storage dominate. CPU is not the bottleneck. One Postgres maxes out around 10k-50k writes/sec. At 1M/sec we are 20x-100x past that on a single shard.
 
 </details>
 
 ---
 
-## Step 3: The write pipeline grows in 4 stages
+## Step 4: The six patterns
 
-Here is how a write path evolves. Each stage handles roughly 10x the throughput of the one before. Fill in the limits.
+Here are the six patterns to know. Each one answers a specific failure of the thing before it.
 
+### Pattern 1: Batching
+
+The simplest win. Instead of writing one event per database call, accumulate events in memory and flush them together.
+
+```mermaid
+flowchart LR
+    subgraph Before["Before: one INSERT per event"]
+        P1([Producer]):::user --> I1[INSERT]:::app --> D1[("DB")]:::db
+        P2([Producer]):::user --> I2[INSERT]:::app --> D1
+        P3([Producer]):::user --> I3[INSERT]:::app --> D1
+    end
+    subgraph After["After: COPY batch"]
+        P4([Producer]):::user --> B["Buffer<br/>(100ms or 1000 events)"]:::app
+        P5([Producer]):::user --> B
+        P6([Producer]):::user --> B
+        B --> C[COPY]:::app --> D2[("DB")]:::db
+    end
+
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef app  fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db   fill:#fed7aa,stroke:#c2410c,color:#7c2d12
 ```
-Stage A:  producer -- INSERT --> Postgres            limit: [ ? ] writes/sec
-                                                     fails because: [ ? ]
 
-Stage B:  producer -- INSERT --> app -- buffer --> Postgres
-                                  (in-memory                limit: [ ? ] writes/sec
-                                   flush every 100ms)       fails because: [ ? ]
+**When to use.** Any time per-write overhead (network round-trip, TLS, fsync) dominates. Typical threshold: when you are above ~1k events/sec and latency starts rising.
 
-Stage C:  producer -- HTTP --> ingest --> [ ? ] --> batch writer -- COPY --> storage
-                                                                              (Postgres
-                                                                               or Cassandra)
-                                  limit: [ ? ] writes/sec
-                                  fails because: [ ? ]
+**What breaks.** If the app crashes, events in the in-memory buffer are lost. At 100ms flush intervals and 10k events/sec, that is up to 1,000 events. For click tracking, fine. For audit, not fine. Fix: move the buffer to a durable queue (Pattern 3).
 
-Stage D:  producer --> regional ingest --> regional Kafka --> stream processor --> [ ? ]
-                                                  (partitioned                  (Flink /
-                                                   by key)                       Spark)
-                                  limit: 1M+ writes/sec
-                                  fails because: [ ? ]
+> **Take this with you.** Batching is the first 10x. It costs nothing but a timer and an array. Use it before reaching for Kafka.
+
+---
+
+### Pattern 2: Append-only log
+
+Stop updating rows in place. Only ever append. This is how Kafka, Cassandra's LSM tree, and every audit log work.
+
+```mermaid
+flowchart TB
+    subgraph MutableTable["Mutable table (UPDATE in place)"]
+        R1["row: {id:1, visits:3}"]:::db
+        R1 --> R2["row: {id:1, visits:4}"]:::db
+        R2 --> R3["row: {id:1, visits:5}"]:::db
+    end
+    subgraph AppendLog["Append-only log"]
+        L1["event: {id:1, visits:3, ts:10:01}"]:::db
+        L2["event: {id:1, visits:4, ts:10:02}"]:::db
+        L3["event: {id:1, visits:5, ts:10:03}"]:::db
+        L1 -.-> L2 -.-> L3
+    end
+
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+```
+
+**When to use.** Audit trails (you need history). Time-series data (events are immutable facts). Any data where you care about what happened, not just the current state.
+
+**What breaks.** You cannot "undo" a row. GDPR deletions need a logical tombstone approach, not a DELETE. Storage grows unboundedly until you add retention and compaction. Reads that want current state must aggregate across all events (expensive without materialized views).
+
+> **Take this with you.** An append-only log is the cheapest write path. Disk is sequential. Sequential writes are 10x-100x faster than random writes on any hardware.
+
+---
+
+### Pattern 3: Queue-based ingestion
+
+Separate the producer's write speed from the storage layer's write speed. Producers fill a durable queue. Storage drains it at its own pace.
+
+```mermaid
+flowchart TB
+    subgraph Producers["Producers"]
+        P1([Web app]):::user
+        P2([Mobile app]):::user
+        P3([Server]):::user
+    end
+
+    subgraph Ingest["Ingest"]
+        GW["API Gateway"]:::edge
+        IS["Ingest Service<br/>(stateless)"]:::app
+    end
+
+    K{{"Kafka<br/>(durable, partitioned<br/>7-day retention)"}}:::queue
+
+    subgraph Consumers["Consumers (independent)"]
+        CW["Hot writer"]:::app
+        AR["Archiver"]:::app
+        FW["Fraud detector"]:::app
+    end
+
+    DB[("Cassandra<br/>hot tier")]:::db
+    S3[("S3 Parquet<br/>cold tier")]:::db
+
+    P1 & P2 & P3 --> GW --> IS --> K
+    K --> CW --> DB
+    K --> AR --> S3
+    K --> FW
+
+    classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge  fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app   fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+```
+
+**When to use.** When storage cannot absorb the ingest rate in real time. When you have multiple consumers (audit archive, fraud detection, analytics) that all need the same events. When a downstream service restart should not cause event loss.
+
+**What breaks.** End-to-end lag jumps from milliseconds to seconds. Events are not queryable until the consumer has flushed them. A stuck consumer builds lag. If lag grows past Kafka's retention window (typically 7 days), events are lost.
+
+> **Take this with you.** The queue is the shock absorber. Producers cannot crush storage. They fill the queue. Storage drains at its own pace.
+
+---
+
+### Pattern 4: LSM trees vs B-trees
+
+Postgres uses a B-tree. Cassandra uses an LSM tree. For write-heavy work, LSM wins. Here is why.
+
+```mermaid
+flowchart TB
+    subgraph BTree["B-tree insert (Postgres)"]
+        BW1["1. Find leaf page<br/>(random disk read)"]:::app
+        BW2["2. Insert + maybe split page<br/>(random disk write)"]:::app
+        BW3["3. Write WAL<br/>(sequential)"]:::app
+        BW4["4. fsync on commit<br/>(slow)"]:::bad
+        BW1 --> BW2 --> BW3 --> BW4
+    end
+
+    subgraph LSM["LSM insert (Cassandra, RocksDB)"]
+        LW1["1. Append to commit log<br/>(sequential)"]:::app
+        LW2["2. Insert into memtable<br/>(in RAM)"]:::app
+        LW3["3. Flush to SSTable<br/>(big sequential write)"]:::app
+        LW4["4. Compact SSTables<br/>(background, off peak)"]:::ok
+        LW1 --> LW2 --> LW3 --> LW4
+    end
+
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef ok  fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+```
+
+**When to use LSM.** Write-heavy work, time-series, logs, telemetry. Cassandra, ScyllaDB, RocksDB, LevelDB, HBase, InfluxDB all use LSM variants. The append-only extreme is Kafka: pure sequential writes to a segment file. No compaction unless you turn it on. This is why Kafka can ingest millions of messages per second per partition on cheap hardware.
+
+**What breaks.** Reads are slower (must check memtable plus several SSTables). Compaction causes write amplification: the same byte may be written 5-10 times over its life. Space amplification: until compaction runs, you have several copies of the same data.
+
+**When B-tree wins.** OLTP with frequent updates to the same rows. Read-heavy workloads. Many secondary indexes. Postgres, MySQL.
+
+> **Take this with you.** LSM turns many random writes into sequential appends. Sequential disk I/O is 10x-100x faster than random I/O. That is the whole trick.
+
+---
+
+### Pattern 5: Sharding and partition keys
+
+One node cannot absorb 1M writes/sec. You spread writes across many nodes by picking a partition key. The choice decides whether load spreads evenly or whether one node gets 10x the traffic of the rest.
+
+```mermaid
+flowchart TD
+    A[Pick a partition strategy] --> B{Time-range reads dominate?}
+    B -->|Yes| C["Time-based<br/>partition = day or hour"]:::ok
+    B -->|No| D{Need even write distribution?}
+    D -->|Yes| E["Hash-based<br/>hash(key) mod N"]:::ok
+    D -->|No| F{Multi-tenant system?}
+    F -->|Yes| G["Tenant-based<br/>partition = tenant_id"]:::ok
+    F -->|No| H["Composite key<br/>combine two of the above"]:::ok
+    C --> I["Cost: hot partition on writes<br/>all writes hit current hour"]:::bad
+    E --> J["Cost: range queries scatter-gather<br/>across all partitions"]:::bad
+    G --> K["Cost: one big tenant kills you<br/>sub-shard big tenants"]:::bad
+
+    classDef ok  fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+```
+
+**When to use.** Any time one node cannot absorb the write rate, or you need to drop old data cheaply (time-based partitions).
+
+**What breaks.** Every partition strategy has a failure mode. Time-based: all writes hit the current partition (hot write node). Hash-based: range queries scatter across all shards. Tenant-based: one big tenant kills the cluster. The fix is usually a composite key that combines two strategies.
+
+For 1M events/sec: Kafka partition key `hash(event_type, tenant_id)`, Cassandra primary key `((tenant_id, day), event_id)`, S3 path `date=YYYY-MM-DD/event_type=X/tenant_id=Y/`.
+
+> **Take this with you.** The partition key is the most important design decision in write-heavy storage. A wrong key gives you a hot node. A hot node negates all the scaling work.
+
+---
+
+### Pattern 6: Event sourcing and tiered storage
+
+Events are facts. Facts do not change. Model the system as an append-only stream of events. Derive current state by replaying them.
+
+```mermaid
+flowchart LR
+    E["Events<br/>(append-only facts)"]:::queue
+
+    subgraph Hot["Hot tier (0-90 days)"]
+        CS[("Cassandra<br/>LSM, RF=3<br/>point reads in 10ms")]:::db
+    end
+
+    subgraph Cold["Cold tier (90 days - 7 years)"]
+        S3[("S3 Parquet<br/>columnar, compressed<br/>queried via Athena")]:::db
+    end
+
+    subgraph Archive["Deep archive (1 year+)"]
+        GL[("S3 Glacier<br/>1/20 the cost<br/>12-48h retrieval")]:::db
+    end
+
+    E --> CS
+    CS -.nightly job.-> S3
+    S3 -.after 1 year.-> GL
+
+    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+```
+
+**When to use.** Audit trails (rebuild history at any point in time). Long retention requirements (SOX 7 years, HIPAA). Any system where "what happened" matters as much as "what is current state."
+
+**What breaks.** Replaying millions of events to rebuild state is slow without snapshotting. GDPR deletions are hard ("right to be forgotten" conflicts with append-only). Storage grows without tiering. Hot queries on 3-year-old data are expensive if everything stays in one tier.
+
+Tiered storage is the standard fix: keep recent events in a fast, queryable store (Cassandra) with a TTL. Nightly archiver moves old partitions to S3 Parquet. Deep archive for anything over a year.
+
+> **Take this with you.** Tiered storage matches the cost of storage to the frequency of access. Hot queries pay hot prices. Cold queries pay cold prices.
+
+---
+
+## Step 5: The write pipeline grows in 4 stages
+
+Every write path starts simple and grows in stages. Each stage handles roughly 10x the throughput of the one before.
+
+```mermaid
+flowchart LR
+    S1["Stage 1<br/>100 events/sec<br/>1 Postgres<br/>simple INSERT"]:::s1
+    S2["Stage 2<br/>10k events/sec<br/>buffer + batch COPY<br/>same Postgres"]:::s2
+    S3["Stage 3<br/>100k events/sec<br/>Kafka + async<br/>Cassandra writer"]:::s3
+    S4["Stage 4<br/>1M+ events/sec<br/>regional ingest<br/>partitioned Kafka<br/>tiered storage"]:::s4
+
+    S1 --> S2 --> S3 --> S4
+
+    classDef s1 fill:#e0f2fe,stroke:#0369a1,color:#0c4a6e
+    classDef s2 fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef s3 fill:#fef3c7,stroke:#a16207,color:#713f12
+    classDef s4 fill:#fce7f3,stroke:#be185d,color:#831843
 ```
 
 <details markdown="1">
-<summary><b>Show: the 4 stages with limits</b></summary>
+<summary><b>Show: what breaks at each stage and why</b></summary>
 
-```
-Stage A:  producer -- INSERT --> Postgres            limit: ~1k writes/sec
-                                                     fails because: every INSERT must
-                                                                    flush the WAL to disk
-                                                                    (fsync). Disk fsync
-                                                                    is slow.
+**Stage 1 to 2 (buffer + batch).** Postgres CPU climbs to 80%. WAL fsync is the bottleneck: every INSERT must flush to disk before returning. Adding a 100ms in-memory buffer and switching to `COPY` gives 10x throughput on the same hardware. The cost: up to 1000 events lost if the app crashes.
 
-Stage B:  producer -- INSERT --> app -- buffer --> Postgres
-                                  (flush 100ms,             limit: ~10k writes/sec
-                                   COPY in batches          fails because: single Postgres
-                                   of 1000)                                still chokes;
-                                                                           buffer is lost
-                                                                           on app crash
+**Stage 2 to 3 (durable queue).** Single Postgres hits I/O ceiling. Vertical scaling is exhausted. The buffer-on-crash problem also grows (100k/sec x 100ms = 10k events lost on crash, which is now unacceptable). Adding Kafka decouples producers from storage. Cassandra's LSM tree handles the write rate that Postgres cannot. Multiple independent consumers read the same topic.
 
-Stage C:  producer -- HTTP --> ingest --> Kafka --> batch writer -- COPY --> Cassandra
-                                                                              (sharded)
-                                  limit: ~100k writes/sec
-                                  fails because: one Cassandra cluster or
-                                                 one Kafka topic hits hot
-                                                 partition limits;
-                                                 consumers fall behind
+**Stage 3 to 4 (partitioning + stream processing).** Single-region Kafka hits NIC and disk limits. One big tenant saturates one Kafka partition and one Cassandra node, hurting others. Cold-tier costs explode if you keep everything in Cassandra. Solution: regional ingest tiers, partitioned topics, sub-sharding for hot tenants, Flink for derived data, S3 Parquet for cold storage.
 
-Stage D:  producer --> regional ingest --> regional Kafka --> Flink --> Cassandra (hot)
-                                                  (partitioned                + S3 Parquet
-                                                   by event_type                (cold)
-                                                   + tenant_id)
-                                  limit: 1M+ writes/sec
-                                  fails because: cross-region replication lag;
-                                                 cold-tier query slowness;
-                                                 bursts past Kafka capacity
-```
-
-**What each transition buys you:**
-
-- **A to B (buffer + batch).** Stops paying fsync cost on every event. One fsync now covers 1000 events. 10x throughput, same hardware. The cost: if the app crashes, you lose the in-memory buffer. About 100ms * 10k events/sec = up to 1000 lost events.
-
-- **B to C (durable queue).** Separates producer speed from storage speed. Producers cannot crush storage. They fill the queue. Storage drains the queue at its own pace. Cassandra's LSM tree absorbs sequential writes far better than Postgres's B-tree (more on that in Step 5). Another 10x. The cost: end-to-end lag jumps from milliseconds to seconds. Events are not queryable until the consumer has flushed them.
-
-- **C to D (partitioning + stream processing).** Scales sideways with no single bottleneck. Each Kafka partition has its own consumer. Each Cassandra node owns a slice of the keys. A stream processor like Flink does extra work like enrichment and routing. Cold tier on S3 Parquet is bottomless and cheap. 10x more, and you can keep going by adding partitions. The cost: strong consistency is gone. Cross-region replication is eventually consistent.
-
-> The discipline: name the limit of stage N *before* you reach for stage N+1. Junior engineers jump straight to stage D. They build the cathedral before they have any worshippers.
+**The discipline.** Name the limit of stage N before reaching for stage N+1. Junior engineers jump to stage 4. They build the cathedral before they have any worshippers.
 
 </details>
 
 ---
 
-## Step 4: Draw the full pipeline
+## Step 6: The full architecture at 1M events/sec
 
-Here is the 1M events/sec design with 5 boxes missing. Fill them in.
+```mermaid
+flowchart TB
+    subgraph Edge["Client edge"]
+        P([Web / Mobile / Server]):::user
+        GW["API Gateway<br/>(TLS, rate limit, back-pressure)"]:::edge
+    end
 
-```
-                                +-------------------+
-   producer apps  --HTTPS-->    |  [ ? ]            |  TLS, load balance,
-   (web, mobile,                |                   |  per-tenant rate limit
-   server)                      +---------+---------+
-                                          |
-                                          v
-                                +-------------------+
-                                |  Ingest Service   |  validate schema,
-                                |  (stateless)      |  assign event_id,
-                                |                   |  pick partition key
-                                +---------+---------+
-                                          |
-                                          v
-                                +-------------------+
-                                |  [ ? ]            |  durable, partitioned,
-                                |                   |  7-day retention,
-                                |                   |  absorbs bursts
-                                +---------+---------+
-                                          |
-                       +------------------+------------------+
-                       |                  |                  |
-                       v                  v                  v
-                +-------------+   +-------------+    +-------------+
-                |  [ ? ]      |   |  archiver   |    |  realtime   |
-                |  (hot       |   |  (writes    |    |  consumer   |
-                |   storage,  |   |   Parquet   |    |  (fraud,    |
-                |   point     |   |   to S3     |    |   alerts)   |
-                |   reads)    |   |   every     |    |             |
-                |             |   |   5 min)    |    |             |
-                +-------------+   +------+------+    +-------------+
-                                         |
-                                         v
-                                +-------------------+
-                                |  [ ? ]            |  cold tier, queried
-                                |                   |  by Athena / Presto
-                                +-------------------+
+    subgraph WritePath["Synchronous write path"]
+        IS["Ingest Service<br/>(validate, stamp, route)"]:::app
+    end
 
-                                +-------------------+
-                                |  [ ? ]            |  every stage reports
-                                |                   |  rate, queue depth,
-                                |                   |  lag, batch size
-                                +-------------------+
+    K{{"Kafka<br/>200 partitions, RF=3<br/>hash(event_type, tenant_id)<br/>7-day retention"}}:::queue
+
+    subgraph Consumers["Async consumers (independent consumer groups)"]
+        HW["Hot writer<br/>(UNLOGGED BATCH<br/>per Cassandra partition)"]:::app
+        AR["Archiver<br/>(buffer 5 min<br/>write Parquet to S3)"]:::app
+        FL["Flink<br/>(rollups, fraud alerts<br/>enrichment)"]:::app
+    end
+
+    CS[("Cassandra<br/>hot tier, RF=3<br/>90-day TTL")]:::db
+    S3[("S3 Parquet<br/>cold tier<br/>date/type/tenant prefix")]:::db
+    AT["Athena / Presto"]:::app
+    OB["Metrics<br/>(Prometheus + Grafana<br/>lag, skew, batch size)"]:::cache
+
+    P --> GW --> IS --> K
+    K --> HW --> CS
+    K --> AR --> S3 --> AT
+    K --> FL
+    IS & K & HW & AR & FL -.metrics.-> OB
+
+    classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge  fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app   fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
 ```
 
-<details markdown="1">
-<summary><b>Show: the full architecture</b></summary>
+Each box, in one line:
 
-```
-                                +----------------------+
-   producer apps  --HTTPS-->    |  Edge LB + WAF +     |  TLS, anycast,
-   (web, mobile,                |  API Gateway         |  per-tenant rate limit,
-   server)                      |                      |  back-pressure
-                                +----------+-----------+    (429 if downstream full)
-                                           |
-                                           v
-                                +----------------------+
-                                |  Ingest Service      |  validate schema,
-                                |  (stateless, N pods) |  assign event_id (ULID),
-                                |                      |  add server timestamp,
-                                |                      |  pick partition key
-                                |                      |  hash(event_type, tenant_id)
-                                +----------+-----------+
-                                           |
-                                           v
-                                +----------------------+
-                                |  Kafka cluster       |  partitioned by
-                                |  (or Kinesis,        |  hash(event_type, tenant_id),
-                                |   Pulsar, NATS)      |  RF=3, 7-day retention,
-                                |                      |  acks=all
-                                +----------+-----------+
-                                           |
-                       +-------------------+-------------------+
-                       |                   |                   |
-                       v                   v                   v
-                +--------------+   +--------------+    +--------------+
-                |  Cassandra   |   |  Archiver    |    |  Flink       |
-                |  hot tier    |   |  (consumes,  |    |  stream      |
-                |  90-day TTL  |   |   buffers    |    |  processor   |
-                |  RF=3        |   |   5 min,     |    |  fraud,      |
-                |  sharded by  |   |   writes     |    |  alerts,     |
-                |  (tenant,    |   |   Parquet)   |    |  rollups     |
-                |   day)       |   |              |    |              |
-                +--------------+   +------+-------+    +--------------+
-                                          |
-                                          v
-                                +----------------------+
-                                |  S3 / GCS Parquet    |  partitioned by
-                                |  + Athena / Presto / |  date=YYYY-MM-DD/
-                                |  BigQuery on top     |  event_type=X/
-                                |                      |  tenant_id=Y/
-                                +----------------------+
+| Box | What it does |
+|-----|--------------|
+| **API Gateway** | Terminates TLS, applies per-tenant rate limits, returns 429 when Kafka is unhealthy (back-pressure). |
+| **Ingest Service** | Stateless. Validates schema, stamps event_id and server timestamp, routes to Kafka partition. Returns 202. |
+| **Kafka** | The shock absorber. Producers fill it. Consumers drain it independently. Buffers 5-minute stalls without affecting producers. |
+| **Hot writer** | Reads Kafka, writes UNLOGGED BATCHes per Cassandra partition. Commits offset after storage ack. |
+| **Archiver** | Reads Kafka (separate consumer group). Buffers 5 minutes or 100k events. Writes one Parquet file to S3. |
+| **Flink** | Derived data: per-minute rollups, anomaly scores, fraud alerts. Reads same Kafka topic as others. |
+| **Cassandra hot tier** | Recent events. Query by `(tenant_id, day)` range. 90-day TTL, auto-deleted by compaction. |
+| **S3 Parquet cold tier** | 7-year archive. Partitioned by date/event_type/tenant_id. Queried by Athena. |
+| **Metrics** | Throughput, consumer lag, batch size, partition skew. Without this, you learn about failures from customer complaints. |
 
-                                +----------------------+
-                                |  Metrics + Logs      |  Prometheus,
-                                |  Prometheus,         |  every stage reports:
-                                |  Grafana,            |  throughput, queue
-                                |  OpenTelemetry       |  depth, lag, skew
-                                +----------------------+
-```
-
-What each piece does, in one line:
-
-- **Edge LB + Gateway.** Several ingest pods needed just to terminate TLS at 12 Gbps. Per-tenant rate limit prevents one noisy tenant from drowning the rest. Back-pressure (429 when Kafka is sick) protects the cluster from cascading failure.
-- **Ingest Service.** Stateless. Validate. Stamp. Route. Put event in Kafka. Return 202 Accepted. That is it.
-- **Kafka.** The shock absorber. Producers fill it. Consumers drain it. If a consumer stalls for 5 minutes, Kafka buffers the backlog without affecting producers.
-- **Cassandra hot tier.** Recent events. Query by key (event_id, or `(tenant_id, day)` range). LSM tree shape: writes are sequential, no read-modify-write per insert.
-- **Archiver.** Reads Kafka. Buffers 5 minutes or 100k events. Writes one big Parquet file to S3. Trades latency for cost.
-- **Flink (stream processor).** Derived data: per-minute rollups, anomaly scores, alerts. Reads the same Kafka topic as the others.
-- **S3 + query layer.** Bottomless storage. Athena/Presto/BigQuery query Parquet without a dedicated cluster.
-- **Observability.** Without metrics on queue depth, batch size, and lag, you learn about problems from customer complaints.
-
-</details>
+> **Take this with you.** Three consumer groups read the same Kafka topic independently. The archiver can fall behind without affecting Cassandra. Flink can crash without affecting the archiver. Kafka is what makes this possible.
 
 ---
 
-## Step 5: The journey of one event (sequence diagram)
-
-Picture a single event going from a phone to disk. It hops through buffer, batch, queue, hot store, then nightly to cold store.
+## Step 7: One event, all the way through
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant P as Producer
     participant B as Local Buffer
     participant I as Ingest Service
     participant K as Kafka
-    participant C as Consumer Pool
-    participant Cs as Cassandra (hot)
+    participant HW as Hot Writer
+    participant Cs as Cassandra
     participant A as Archiver
-    participant S as S3 (cold)
+    participant S as S3
 
     P->>B: emit event
     Note over B: buffer 100ms or 1000 events
@@ -306,12 +444,12 @@ sequenceDiagram
     I->>K: produce (acks=all)
     K-->>I: ack (replicated to ISR)
     I-->>B: 202 Accepted
-    Note over P,I: synchronous slice ends (P99 ~50ms)
+    Note over P,I: sync slice ends (P99 ~50ms)
 
-    K-->>C: poll batch
-    C->>Cs: UNLOGGED BATCH per partition
-    Cs-->>C: ack
-    C->>K: commit offset
+    K-->>HW: poll batch
+    HW->>Cs: UNLOGGED BATCH per partition
+    Cs-->>HW: ack
+    HW->>K: commit offset
 
     K-->>A: poll batch (separate consumer group)
     Note over A: buffer 5 min or 100k events
@@ -320,226 +458,85 @@ sequenceDiagram
     A->>K: commit offset
 ```
 
-End-to-end lag from producer to "queryable in Cassandra" is 1 to 3 seconds, with P99 around 10 seconds. Lag to S3 Parquet is up to 5 to 6 minutes (the archiver's flush window dominates).
+Three details worth pointing at:
 
-The sync part is small. Producer to Kafka ack, P99 about 50 ms. Everything after Kafka happens at its own pace.
-
----
-
-## Step 6: Append-only logs and why LSM beats B-tree here
-
-Postgres uses a B-tree for its primary index. Cassandra uses an LSM tree. RocksDB, ScyllaDB, HBase, and Kafka's log are all LSM-flavored. For write-heavy work, LSM wins. Why?
-
-Define the terms first:
-
-> **B-tree.** A balanced tree on disk. Each node is a page. Inserts find the right leaf page, write into it, and may split the page if it is full. Postgres and MySQL use B-trees.
->
-> **LSM tree.** Log-Structured Merge tree. Optimized for fast writes by appending instead of updating in place. Writes go to an in-memory table (memtable). When it fills, it flushes to disk as a new immutable file (SSTable). Background compaction merges files later.
-
-<details markdown="1">
-<summary><b>Show: B-tree vs LSM for writes</b></summary>
-
-**A B-tree insert (Postgres, MySQL) does 5 things:**
-
-1. Find the leaf page for this key. Often a random disk read if the page is not cached.
-2. Insert the key. If the page is full, split it (write 2 pages instead of 1).
-3. Update parent pages if the split goes up.
-4. Write to WAL (sequential), then update the data page later (often random).
-5. On commit, fsync the WAL to disk.
-
-Random keys are the worst case. Each insert touches a different leaf page. The cache churns. You pay a random read plus a random write per insert. A single Postgres tops out around 1k-10k writes/sec for keyed inserts that do not fit in memory.
-
-**An LSM insert (Cassandra, RocksDB) is simpler:**
-
-1. Append to a commit log (sequential disk write).
-2. Insert into an in-memory memtable (sorted in RAM).
-3. When the memtable fills, flush it as a new SSTable file (one big sequential write).
-4. Compaction merges old SSTables in the background to free space.
-
-> Why is LSM faster? All disk writes are sequential. Append is the fastest thing a disk can do. Sequential disk throughput is 10-100x random disk throughput on spinning disks, and even on SSDs sequential beats random for sustained writes. There is no read-before-write. SSTables are immutable, so no page locks for concurrency. The cost is paid later, when the system is less busy, during compaction.
-
-**What LSM costs:**
-
-- **Read amplification.** A read might check the memtable plus several SSTables. Bloom filters help, but reads are slower than B-tree reads for the same data.
-- **Write amplification.** Compaction rewrites SSTables. The same byte may be written 5-10 times over its life.
-- **Space amplification.** Until compaction runs, you have several copies of the same data.
-
-**LSM wins for:** write-heavy work, time-series, logs, telemetry. Cassandra, ScyllaDB, RocksDB, LevelDB, HBase, BigTable, DynamoDB under the hood, InfluxDB.
-
-**B-tree wins for:** OLTP with frequent updates to the same rows, read-heavy work, lots of secondary indexes. Postgres, MySQL.
-
-**The append-only log extreme is even simpler than LSM.** Kafka is pure append to a segment file. No compaction unless you turn it on. Reads are by offset (O(1) seek). This is why Kafka can ingest millions of messages per second per partition on cheap hardware. The trade-off: you cannot query by arbitrary key. Only by offset or time.
-
-For our 1M events/sec audit pipeline, the storage layers stack up like this:
-
-- **Kafka log.** Pure append. Infinite write throughput per partition until disk fills.
-- **Cassandra hot tier.** LSM. Query by key. 90-day retention.
-- **S3 Parquet cold tier.** Immutable columnar files. Queried by partition.
-
-Each is optimized for write throughput at its scale.
-
-</details>
+1. The 202 goes back to the producer after Kafka ack, not after Cassandra ack. If Kafka has it, the event is safe. Cassandra is just the queryable view.
+2. Hot writer commits the Kafka offset *after* Cassandra ack. At-least-once: crash between write and commit means a replay on restart. Cassandra primary-key dedup makes the replay a no-op.
+3. End-to-end lag to Cassandra is 1-3 seconds, P99 ~10 seconds. Lag to S3 is up to 5-6 minutes (archiver's flush window dominates).
 
 ---
 
-## Step 7: Picking a partition strategy
+## Step 8: Delivery guarantees
 
-You have to pick a partition key for Kafka and a shard key for Cassandra. The choice decides if load spreads evenly or if one partition gets 10x the traffic of the rest.
+At small scale, every event is in one Postgres. One ACID transaction. Either on disk or not. Easy.
 
-Three families. For each, name when it works and when it does not.
-
-| Strategy | How it works | Good for | Fails when |
-|----------|--------------|----------|------------|
-| Time-based | partition = day or hour | [ ? ] | [ ? ] |
-| Hash-based | partition = hash(key) % N | [ ? ] | [ ? ] |
-| Tenant-based | partition = tenant_id | [ ? ] | [ ? ] |
-
-Here is a flowchart to help you pick:
-
-```mermaid
-flowchart TD
-    A[Need to pick partition strategy] --> B{Time-series queries?}
-    B -->|Yes, time-range reads dominate| C[Time-based<br/>partition by hour or day]
-    B -->|No| D{Need even write distribution?}
-    D -->|Yes, no hot keys allowed| E[Hash-based<br/>hash key % N]
-    D -->|No| F{Need per-tenant isolation?}
-    F -->|Yes, noisy tenant cannot hurt others| G[Tenant-based<br/>partition by tenant_id]
-    F -->|No| H[Composite key<br/>combine 2 of the above]
-    C --> I[Cost: hot partition on writes<br/>all writes go to current hour]
-    E --> J[Cost: range queries become<br/>scatter-gather]
-    G --> K[Cost: uneven sizes<br/>one big tenant kills you]
-```
-
-<details markdown="1">
-<summary><b>Show: the 3 partition families filled in</b></summary>
-
-| Strategy | How it works | Good for | Fails when |
-|----------|--------------|----------|------------|
-| **Time-based** | Each hour or day gets its own partition. Files named `events/2026-05-24/...` | Time-range queries ("events from last week"). Cheap to drop old data (delete the directory). Cold-storage archiving (move yesterday to S3 Glacier). Natural fit for Parquet on S3. | **Hot partition on writes.** All writes go to the current hour. Older partitions are cold. The hot one melts. Fix: combine with another key (hour + hash). |
-| **Hash-based** | `partition_id = hash(event_id) % N` or `hash(user_id) % N` | Even write distribution. No hotspots if the key has high cardinality. Easy to scale: add nodes, rebalance. | **Range queries become scatter-gather.** "All events for user X in last hour" hits every partition unless you hash by user_id (then "all events between A and B" is the scatter case). Cannot drop old data without scanning. Adding nodes moves data across the network. |
-| **Tenant-based** | `partition_id = tenant_id` or hash(tenant_id) | Multi-tenant isolation. Noisy tenant contained (one tenant's spike does not hurt others). Easy per-tenant deletion (GDPR). Per-tenant SLAs. | **Uneven sizes.** Your biggest tenant might be 1000x bigger than the median. That tenant's partition is hot. Classic "one big customer" problem. Fix: sub-shard the biggest tenants with a random suffix (`tenant_42_0`, `tenant_42_1`, ..., `tenant_42_15`). |
-
-**The right answer is usually a mix.**
-
-For 1M events/sec audit logging:
-
-- **Kafka partition key:** `hash(event_type, tenant_id)`. Spreads load across partitions while keeping per-key ordering inside a single `(event_type, tenant_id)` stream. Start at 100 partitions, scale to 1000+ as needed. Each partition handles about 10k events/sec at the high end.
-
-- **Cassandra primary key:** `((tenant_id, day), event_id)`. The partition key `(tenant_id, day)` puts all events for a tenant on a given day in one place (cheap range scan). The clustering column `event_id` gives uniqueness and ordering inside the partition. The day component bounds partition size: even a huge tenant only writes one day at a time per partition.
-
-- **S3 Parquet prefix:** `date=YYYY-MM-DD/event_type=X/tenant_id=Y/`. Time-based at the top (cheap to drop old data). Hash-friendly subdirs for query pruning. Athena uses partition pruning to skip whole prefixes when the query filters on date or tenant.
-
-**The hot partition problem in real life:**
-
-Say one tenant's mobile app has a bug. It emits 100k events/sec instead of the normal 100. Their `(event_type, tenant_id)` partition gets 100k/sec. Every other partition gets 100. That partition's Kafka broker pegs CPU. Lag grows. Consumers cannot keep up. Eventually the broker disk fills.
-
-**Fixes, in order:**
-
-1. Detect early with per-partition rate monitoring. Alert on `max(partition_rate) / median(partition_rate) > 10x`.
-2. Sub-shard the hot key by adding a random suffix for that one tenant: `(event_type, tenant_id, random(0..15))`. Load spreads across 16 partitions. Cost: you lose per-key ordering for that tenant during the spike.
-3. Apply a per-tenant rate limit at the ingest tier. Cap any single tenant at 50k events/sec. Excess gets 429. The tenant fixes their bug.
-4. Long term: quota and isolation. Premium tenants get reserved capacity. Long-tail tenants share a pool.
-
-For Cassandra, hot partition = hot row = hot node. Same fixes apply: sub-shard the key, monitor for skew, throttle at ingest.
-
-</details>
-
----
-
-## Step 8: Pick a delivery guarantee
-
-At small scale, every event is in one Postgres. One ACID transaction. Either it is on disk or it is not. Easy.
-
-At 1M events/sec, that promise is gone. You cannot have linearizable writes across a distributed Kafka cluster, Cassandra, and S3 at 10 Gbps without paying huge latency. So you trade.
-
-Three delivery guarantees. Every write-heavy system has to pick one.
-
-- **At-most-once.** Send and forget. If anything fails, the event is lost. Cheapest. Fastest. Lowest latency.
-- **At-least-once.** Wait for ack. Retry on failure. May produce duplicates. Most common in practice.
-- **Exactly-once.** Each event lands in storage exactly once. No duplicates. No losses. Expensive. Slow.
-
-Here is a flowchart to pick:
+At 1M events/sec, that promise is gone. Pick one of three delivery models.
 
 ```mermaid
 flowchart TD
     A[Pick delivery guarantee] --> B{Is it OK to lose events?}
-    B -->|Yes, stats only| C[at-most-once<br/>fire and forget UDP<br/>cheapest, lowest latency]
+    B -->|Yes, stats only| C["At-most-once<br/>fire and forget<br/>cheapest, lowest latency"]:::ok
     B -->|No, never lose| D{Are duplicates OK?}
-    D -->|Yes, consumer can dedupe| E[at-least-once<br/>+ idempotent consumer<br/>most common choice]
-    D -->|No, downstream side effect<br/>cannot be undone| F[exactly-once<br/>Kafka EOS or<br/>transactional outbox]
-    C --> G[Use for: click tracking,<br/>ad impressions, perf traces]
-    E --> H[Use for: audit, billing,<br/>most pipelines]
-    F --> I[Use for: SMS sending,<br/>payment processing]
+    D -->|Yes, consumer can dedupe| E["At-least-once<br/>+ idempotent consumer<br/>most common choice"]:::ok
+    D -->|No, side effect cannot be undone| F["Exactly-once<br/>Kafka EOS or<br/>transactional outbox"]:::ok
+    C --> G["Use for: click tracking<br/>ad impressions, perf traces"]:::app
+    E --> H["Use for: audit, billing<br/>most event pipelines"]:::app
+    F --> I["Use for: SMS sending<br/>payment processing"]:::app
+
+    classDef ok  fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef app fill:#e2e8f0,stroke:#475569,color:#1e293b
 ```
 
 <details markdown="1">
 <summary><b>Show: when each guarantee is right</b></summary>
 
-**At-most-once.** Use when the data is statistical, not transactional. Page views, click tracking, performance traces, ad impressions. Losing 0.1% does not change the answer. Use when latency matters more than completeness.
+**At-most-once.** Producer sends, returns immediately, does not retry. If the broker is down or a packet drops, the event is gone forever. Zero retry cost. No idempotency machinery. Use when the data is statistical: page views, click tracking, performance traces, ad impressions. Losing 0.1% does not change the answer.
 
-> *How it works:* Producer sends, returns immediately, does not retry. If the broker is down or a packet drops, the event is gone forever. Zero retry cost. No idempotency machinery. Cheapest pipeline you can build.
+**At-least-once.** Producer retries on any failure to ack. Network blip? Producer did not see the ack but the broker may have written it. Producer retries. Broker writes a second copy. Event appears twice. Consumer commits offsets after processing.
 
-Do not use for anything where a missing event has user-facing impact (audit, billing, security alerts, orders).
+How to handle duplicates: use `event_id` as the primary key in storage. Second write is a no-op via Cassandra UPSERT or `INSERT ON CONFLICT DO NOTHING` in Postgres. This is what 80% of production pipelines do.
 
-**At-least-once.** The default for almost every modern event pipeline. Use when loss is unacceptable but duplicates can be handled, usually because the consumer is idempotent. Kafka producers with `acks=all` plus commit-after-process at the consumer gives you at-least-once.
+**Exactly-once.** Kafka EOS (Exactly-Once Semantics) via transactional producers and read-committed consumers. Throughput drops 20-40% vs at-least-once. Latency goes up. Use when the downstream effect cannot be deduped (SMS, payment processing).
 
-> *How it works:* Producer retries on any failure to ack. Network blip? Producer did not see the ack but the broker may have written it. Producer retries. Broker writes a second copy. Event appears twice. Consumer commits offsets after processing. If consumer crashes between processing and commit, it reprocesses on restart. Event processed twice.
+The honest take: most "we need exactly-once" requirements are actually "we need at-least-once with idempotent processing." At-least-once is 10x cheaper. Exactly-once is only for side effects you literally cannot deduplicate.
 
-**How to handle the duplicates:**
-
-- **Idempotent consumer.** Use the event's `event_id` as the primary key in storage. Second write is a no-op via `INSERT ON CONFLICT DO NOTHING`, Cassandra's `IF NOT EXISTS`, or dedup at Parquet compaction.
-- **Dedup window.** Keep recent event_ids in a Bloom filter or Redis set. Reject duplicates seen in the last N minutes. Cheap. Probabilistic.
-- **Idempotent producer.** Kafka's idempotent producer (transactional ID + sequence numbers) prevents duplicates inside a producer session.
-
-> Why "back-pressure" matters here: the system tells producers to slow down when consumers cannot keep up. Without back-pressure, producers keep retrying. The retry storm doubles or triples the load. The cluster collapses. Back-pressure usually means returning HTTP 429 with `Retry-After` and letting the producer SDK back off.
-
-This is what 80% of production pipelines do. Acknowledge the duplication risk. Design consumers to be idempotent. Move on.
-
-**Exactly-once.** Use when the downstream effect cannot be deduped and money is involved. Payment processing. Order fulfillment. Inventory deduction. Audit logging *sometimes* claims to need this. In practice, at-least-once with idempotent storage (event_id as primary key) gives you the same result for 10x less cost.
-
-> *How it works in Kafka:* "Kafka EOS" (Exactly-Once Semantics) via transactional producers + read-committed consumers. The producer wraps writes to multiple partitions in a transaction. The consumer only sees committed messages.
-
-**What it costs:** throughput drops 20-40% vs at-least-once. Latency goes up. Operational complexity goes up.
-
-**The transactional outbox pattern** is the non-Kafka version. Producer writes the event to its local DB in the same transaction as the business state change, into an outbox table. A separate process reads the outbox and ships to Kafka with retries. Same idempotent-consumer requirement on the read side.
-
-**The honest take:** most "we need exactly-once" requirements are actually "we need at-least-once with idempotent processing." The latter is much easier and cheaper. Exactly-once is only for side effects that you literally cannot dedupe (like sending an SMS).
-
-**What we pick for the 1M events/sec audit pipeline.** At-least-once. Audit needs durability, so at-most-once is out. Storage is Cassandra keyed by `event_id`, so idempotency is free. Second write is a no-op. Exactly-once via Kafka EOS would cost about 30% throughput and would not help (we already dedupe at storage).
+**What we pick for 1M events/sec audit.** At-least-once. Audit needs durability, so at-most-once is out. Storage is Cassandra keyed by `event_id`, so idempotency is free. Exactly-once via Kafka EOS would cost ~30% throughput and give no additional benefit.
 
 </details>
 
+> **Take this with you.** At-least-once with idempotent storage gives you the same correctness as exactly-once at a tenth of the cost. Most systems should pick this.
+
 ---
 
-## Follow-up questions (10)
+## Follow-up questions
 
 Try answering each in 2 to 4 sentences before reading the solution.
 
 1. **Back-pressure.** Producers are sending 2x the rate Kafka can absorb. Brokers are healthy but disk is at 80%. What does the ingest service do? What does the producer SDK do?
 
-2. **Hot tenant.** One tenant's mobile app has a bug and is sending 200k events/sec when the average is 100. They are saturating one Kafka partition and that partition's broker is at 100% CPU. How do you find them? What do you do in the next 5 minutes vs the next 5 days?
+2. **Hot tenant.** One tenant's mobile app has a bug and is sending 200k events/sec when the average is 100. They are saturating one Kafka partition. How do you find them? What do you do in the next 5 minutes vs the next 5 days?
 
-3. **Clock skew.** Two producers on different machines disagree about "now" by 3 minutes. They both send events with their local timestamps. Your downstream reports show events arriving "in the future." How do you fix it without forcing every producer to NTP-sync to nanosecond precision?
+3. **Clock skew.** Two producers disagree about "now" by 3 minutes. Your downstream reports show events arriving "in the future." How do you fix it without requiring nanosecond-precision NTP everywhere?
 
-4. **Duplicate events.** A producer retried a batch after a broker timeout. The broker had actually committed the first attempt. Now Cassandra has two copies of every event in that batch. Walk me through detection and dedup.
+4. **Duplicate events.** A producer retried after a broker timeout that actually succeeded. Cassandra now has two copies of every event in that batch. Walk through detection and dedup.
 
-5. **Consumer fell behind.** A Cassandra writer consumer has been stuck for 30 minutes due to a bad deploy. Kafka has buffered 1.8 billion events for that consumer group. What happens when you fix the bug and restart? How do you keep it from melting the storage layer when it catches up?
+5. **Consumer fell behind.** A Cassandra writer consumer has been stuck for 30 minutes. Kafka has buffered 1.8 billion events for that consumer group. What happens when you fix the bug and restart? How do you keep it from melting storage?
 
-6. **Schema evolution.** A team added a new field. Old producers send 5 fields, new producers send 6. Cassandra has a fixed table schema. How do you handle the migration without dropping events or breaking old consumers?
+6. **Schema evolution.** A team added a new field. Old producers send 5 fields, new producers send 6. Cassandra has a fixed table schema. How do you handle migration without dropping events or breaking old consumers?
 
 7. **Recent-event reads.** A consumer wants "all events for user U in the last 30 seconds." Your storage path is Kafka, then batched 5 min into Cassandra. The event might still be in Kafka. How do you make the read see both?
 
-8. **A region goes down.** US-East Kafka cluster is offline. Producers there cannot publish. Producers in other regions are fine. What is your DR play? How much data could be lost?
+8. **A region goes down.** US-East Kafka cluster is offline. Producers there cannot publish. What is your DR plan? How much data could be lost?
 
 9. **Cold-tier query cost.** A user wants "every event for tenant X for the past 3 years." Naive Athena query scans 3 PB of Parquet. How do you make this both fast and cheap?
 
-10. **Exactly-once for a side effect.** One downstream consumer sends an SMS for every fraud alert. SMS is not idempotent (the user gets two texts if you send twice). How do you guarantee exactly one SMS without paying Kafka EOS cost on the whole pipeline?
+10. **Exactly-once for a side effect.** One downstream consumer sends an SMS for every fraud alert. SMS is not idempotent (user gets two texts if you send twice). How do you guarantee exactly one SMS without paying Kafka EOS cost on the whole pipeline?
 
 ---
 
 ## Related problems
 
-- **[Approval Management (011)](../011-approval-management/question.md).** The audit log in that design is a write-heavy append-only system. The patterns here (tiered storage, append-only log, batched writes) apply directly.
-- **[Todo List Sharing (013)](../013-todo-list-sharing/question.md).** The change-log sync pipeline for collaborative todo edits is the same shape at smaller scale: every edit is a small append-only event, partitioned by list_id.
+- **[Approval Management (011)](../011-approval-management/question.md).** The audit log in that design is exactly a write-heavy append-only system. The tiered storage and batching patterns here apply directly.
 - **[News Feed (002)](../002-news-feed/question.md).** Timeline write fan-out is the classic write-heavy problem at consumer scale: each post produces N writes (one per follower's timeline).
+- **[Todo List Sharing (013)](../013-todo-list-sharing/question.md).** The change-log sync pipeline for collaborative edits is the same shape at smaller scale: every edit is a small append-only event partitioned by list_id.
 - **[Read-Heavy System Patterns (017)](../017-read-heavy-patterns/question.md).** The mirror image of this problem. Read-heavy is cached. Write-heavy is batched and partitioned.

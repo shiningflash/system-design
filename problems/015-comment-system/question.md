@@ -7,37 +7,21 @@ difficulty: Easy
 solution: solution.md
 ---
 
-## The scene
+## What we are building
 
-You sit down. The interviewer leans forward.
+A comment system lets users post text replies on a piece of content, reply to each other in threads, and vote replies up or down. Think Reddit or YouTube comments. An article gets 50 top-level comments. Each comment can have replies, and those replies can have replies, up to 8 levels deep. The top comment on a viral post might receive 1,000 upvotes in 5 seconds. A moderator needs to hide a spam comment within seconds of it being flagged, not minutes.
 
-> *"We run a news site. Every article has a comment section. People reply to each other, upvote, downvote. Sometimes a comment goes viral and gets 5,000 replies. Sometimes a comment is spam and a moderator removes it. Build the comment system. Think HackerNews or Reddit."*
+That sounds like a CRUD app. It is not. There are five real problems hiding in this product:
 
-That sounds like a CRUD app. It is not.
-
-Comments are the smallest piece of user content you can imagine, and they pack in every hard problem at once:
-
-- Nested data, a reply to a reply to a reply
-- Heavy reads with bursty writes
-- Voting that creates "hot rows" in the database
-- Soft delete that has to keep the thread structure alive
-- Ranking smarter than newest-first
-- A moderation pipeline that has to outrun trolls
-
-If you start with "comments table with a `parent_id`, done," you skip every interesting question. The real ones are:
-
-- How do you fetch a 5,000-node thread without making 5,000 database calls?
-- How do you count 1,000 upvotes in 5 seconds without locking one row for everyone else?
-- How do you delete a comment that has 200 replies without breaking the thread?
-- How does moderation work without a human reading every single comment?
-
-We will walk from a tiny 10-article blog to a viral site doing 1 million comments a day. At every step we name what breaks first, then add the smallest fix.
+1. **Threading model.** Storing a tree so you can fetch 800 nested comments in one query instead of 800 recursive database calls.
+2. **Vote hot-row.** 1,000 concurrent `UPDATE score = score + 1` calls against one database row will serialize behind a lock and melt the database.
+3. **Soft delete with structure.** Deleting a comment that has 200 replies must not orphan those replies. The tree must stay intact.
+4. **Ranking.** Showing comments in "hot" order requires a score that decays with time. Sorting by raw vote count lets old viral comments dominate forever.
+5. **Moderation at scale.** A human cannot review every comment. A confidence-routed pipeline (fast pre-check, async ML classifier, human queue) is the only way to keep spam out without blocking every post.
 
 ---
 
-## Step 1: Picture one comment
-
-Before any boxes, picture what one comment lifecycle looks like. Alice posts. A moderator reviews. The comment either stays visible or gets removed.
+## The lifecycle of one comment
 
 ```mermaid
 stateDiagram-v2
@@ -52,71 +36,47 @@ stateDiagram-v2
     Removed --> [*]
 ```
 
-That is the whole lifecycle. Everything we add later (voting, threading, ranking, shadow-bans) is a detail on top of this state machine.
+A comment spends nearly all its life in `Published`. The moderation transitions happen rarely but must be fast when they do. Everything else (threading, voting, ranking) exists to make the read path work at scale.
 
-> **Take this with you.** A comment system is a state machine for small pieces of text, run millions of times, with one hard read-to-write ratio: 1,000 reads for every write.
-
----
-
-## Step 2: Ask the right questions
-
-In a real interview, sit quietly for two minutes and write down what you want to ask. Not twenty questions. Five good ones.
-
-<details markdown="1">
-<summary><b>Show: 5 questions that change the design</b></summary>
-
-1. **Depth limit.** Can a reply to a reply go forever? Or is there a cap? Reddit caps visible nesting at about 10 levels. HackerNews stops indenting at 8. *Without a cap, one user can reply to themselves 200 times deep and break your fetch query.*
-
-2. **Sort orders.** What sorts does the UI need? Newest, oldest, top, hot, controversial? *Each sort needs its own cache key. "Hot" requires periodic recomputation as time decays the score.*
-
-3. **Moderation model.** Pre-publish review (every comment waits for a mod) or post-publish takedown (every comment goes live, mods react)? Auto-detection? User reports? *Pre-publish is a completely different system from post-publish. Every high-volume site picks post-publish.*
-
-4. **Delete semantics.** When Alice deletes a comment with 50 replies, what happens to the replies? Do they orphan? *Almost always: soft delete with a tombstone so the thread structure survives.*
-
-5. **Real-time updates.** When someone posts a reply, does my screen update live? *Live updates need a WebSocket fan-out, which is a different design entirely.*
-
-The three questions that change the architecture most are depth limit, sort order, and moderation model. If you only ask "how many comments per day," you have already lost the interesting design space.
-
-</details>
+> **Take this with you.** A comment system is a state machine for small text objects, run millions of times, with a 1,000:1 read-to-write ratio. The architecture is built around the read path, not the write path.
 
 ---
 
-## Step 3: How big is this thing?
+## How big this gets
 
-Same product, two very different sites.
+The same product lives at two very different scales.
 
-| Site | Comments/day | Writes/sec | Reads/sec | Storage/year |
-|------|--------------|------------|-----------|--------------|
-| Small blog | 100 | ~0.001 | ~1 | ~7 MB |
-| Viral site | 1,000,000 | ~12 steady, ~50 peak | ~12k steady, ~40k peak | ~250 GB |
+| Input | Small blog | Viral site |
+|-------|-----------|------------|
+| Comments per day | 100 | 1,000,000 |
+| Writes per second (steady) | ~0.001 | ~12 |
+| Writes per second (peak) | ~0.01 | ~50 |
+| Reads per second (peak) | ~1 | ~40,000 |
+| Storage per year | ~7 MB | ~250 GB |
 
 <details markdown="1">
 <summary><b>Show: how the numbers come out</b></summary>
 
 **Small blog:**
-
-- 100 comments/day at 200 bytes each = about 7 MB per year. A laptop handles this.
-- 1,000:1 read-to-write ratio means about 1 read per second.
+- 100 comments/day at ~200 bytes each = about 7 MB per year. One laptop handles this.
+- 1,000:1 read-to-write ratio means roughly 1 read per second.
 
 **Viral site:**
+- 1,000,000 / 86,400 = ~12 writes per second steady. Peak is 3-5x, so 40-60 writes/sec.
+- At 1,000:1 read ratio: ~12,000 reads/sec steady, ~40,000 at peak.
+- 1M comments/day × 365 × 300 bytes = ~110 GB/year for text. Add votes, flags, edit history: ~250 GB/year.
 
-- 1,000,000 / 86,400 = ~12 writes per second steady. Peak is 3-5x: 40-60 writes/sec.
-- At 1,000:1: ~12,000 reads/second steady, ~40,000 at peak.
-- 1M comments/day × 365 × 300 bytes = ~110 GB/year for text alone. Add votes, flags, edit history: ~250 GB/year.
-
-**The number that matters most:** the top 1% of articles get 80% of the comments. In a viral moment, one article drives 1,000 votes per second on a single popular comment row. That "hot row" is the central scaling problem, not average write throughput.
-
-**Reads beat writes 1,000 to 1.** The entire architecture exists to serve the read path fast. Most candidates design for writes and get this exactly backwards.
+The number that matters most: the top 1% of articles get 80% of the traffic. In a viral moment, one article drives 1,000 votes per second on a single comment row. That hot row is the central scaling problem, not average write throughput.
 
 </details>
 
-> **Take this with you.** Steady-state write throughput is small. The architecture is built around the 40,000 reads/second and the burst behavior of one viral comment producing 100x load on one database row.
+> **Take this with you.** Steady-state writes are small. The architecture exists to handle 40,000 reads per second and the burst behavior of one viral comment hammering one database row.
 
 ---
 
-## Step 4: The smallest thing that works
+## The smallest version that works
 
-Forget viral scale. We are a small blog with 10 articles and 100 comments a day. Three boxes. Nothing else.
+A blog with 10 articles and 100 comments a day needs three boxes and nothing else.
 
 ```mermaid
 flowchart LR
@@ -129,23 +89,12 @@ flowchart LR
     classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
 ```
 
-The end-to-end flow is a single table and a handful of endpoints.
+Two endpoints carry the entire product.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Alice
-    participant App
-    participant DB as Postgres
-
-    Alice->>App: POST /comments {article_id, body}
-    App->>DB: INSERT comment (parent_id=NULL)
-    App-->>Alice: 201 Created
-
-    Alice->>App: GET /articles/42/comments
-    App->>DB: SELECT * WHERE article_id=42 ORDER BY path
-    App-->>Alice: rendered tree
-```
+| Endpoint | What it does |
+|----------|--------------|
+| `POST /articles/{id}/comments` | Accept body and optional parent_id, insert row, return 201 |
+| `GET /articles/{id}/comments` | Return the full comment tree in one response |
 
 <details markdown="1">
 <summary><b>Show: the one table</b></summary>
@@ -154,13 +103,13 @@ sequenceDiagram
 CREATE TABLE comments (
     comment_id  BIGINT PRIMARY KEY,
     article_id  BIGINT NOT NULL,
-    parent_id   BIGINT,             -- NULL = top-level
-    path        TEXT NOT NULL,      -- "/123/456/789"
+    parent_id   BIGINT,
+    path        TEXT NOT NULL,          -- "/123/456/789"
     depth       INT NOT NULL,
     author_id   BIGINT,
     body        TEXT NOT NULL,
     score       INT NOT NULL DEFAULT 0,
-    state       SMALLINT NOT NULL DEFAULT 1,  -- 1=published, 5=removed_self
+    state       SMALLINT NOT NULL DEFAULT 1,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -168,166 +117,242 @@ CREATE INDEX idx_comments_article ON comments (article_id, created_at DESC);
 CREATE INDEX idx_comments_path    ON comments (article_id, path text_pattern_ops);
 ```
 
-Two columns do the heavy lifting. `parent_id` keeps inserts simple. `path` makes subtree reads a single index scan instead of a recursive query. They cannot drift apart because `path` is computed from the parent's path at insert time.
+Two columns do the heavy lifting. `parent_id` keeps inserts cheap. `path` makes a full subtree fetch a single index prefix scan instead of a recursive query. They cannot drift because `path` is computed from the parent's path at insert time.
 
 </details>
 
-> **Take this with you.** Always start from the smallest thing that works. The interesting part of the interview is what happens next.
+This handles the blog. The interesting questions start as the product grows.
 
 ---
 
-## Step 5: The first crack - storing the tree
+## Decision 1: how do we store the tree?
 
-The blog grows. One article gets 800 comments. The page takes 4 seconds to load.
+The blog grows. One article gets 800 comments. The page takes 4 seconds. The query is a `WITH RECURSIVE` that joins the table to itself at each nesting level: 8 levels = 8 self-joins.
 
-You look at your database query. It is a recursive `WITH RECURSIVE` that joins the table to itself at each level of nesting. Eight levels deep means eight joins.
-
-This is the tree-storage problem. You need four things to work well:
-
-1. Insert a new comment cheaply. This is the hot write path.
-2. Fetch a whole article's thread in one query. This is the hot read path.
-3. Delete a subtree without orphaning children.
-4. Cap depth to stop abuse.
+Four approaches exist. Each trades insert cost against read cost.
 
 ```mermaid
-flowchart LR
-    subgraph Approaches["Ways to store a tree in a database"]
-        A["Adjacency list<br/>(parent_id only)"]
-        B["Materialized path<br/>(parent_id + path string)"]
-        C["Nested set<br/>(left / right numbers)"]
-        D["Closure table<br/>(ancestor-descendant pairs)"]
+flowchart TB
+    subgraph AL["Adjacency list (parent_id only)"]
+        AL1["Insert: cheap, one write"]
+        AL2["Fetch: recursive query, slow at depth"]
+        AL3["Problem: N levels deep = N self-joins"]:::bad
     end
+    subgraph MP["Materialized path (parent_id + path string)"]
+        MP1["Insert: one extra SELECT for parent path"]
+        MP2["Fetch: single prefix scan WHERE path LIKE '/X/%'"]
+        MP3["Trade-off: 50 bytes/row for the path string"]:::ok
+    end
+    subgraph NS["Nested set (left/right numbers)"]
+        NS1["Fetch: single range query"]
+        NS2["Insert: renumbers every row to the right"]
+        NS3["Problem: comments are insert-heavy. Not viable."]:::bad
+    end
+    subgraph CT["Closure table (ancestor-descendant pairs)"]
+        CT1["Fetch: single join"]
+        CT2["Insert: one row per ancestor, amplified writes"]
+        CT3["Trade-off: fine for read-heavy hierarchies"]:::ok
+    end
+
+    classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef ok fill:#dcfce7,stroke:#15803d,color:#14532d
 ```
 
 <details markdown="1">
-<summary><b>Show: the four approaches compared</b></summary>
-
-**1. Adjacency list.** Each row stores its parent's ID.
-
-- Insert: one write, cheap.
-- Fetch thread: recursive query, 8 joins for depth-8 tree.
-- Delete subtree: find descendants first, then delete.
-
-Works fine at small scale. The recursive query becomes a problem at a few hundred comments per article.
-
-**2. Materialized path.** Each row stores its full ancestor chain, like `/123/456/789`.
-
-- Insert: one extra SELECT to read parent's path. Then build `new_path = parent.path + "/" + own_id`.
-- Fetch thread: `WHERE path LIKE '/123/%'` is a single index range scan. No recursion.
-- Delete subtree: `DELETE WHERE path LIKE '/456/%'` is also one scan.
-- Move subtree: expensive (rewrite every descendant's path). Fine for comments, which almost never move.
-
-**3. Nested set.** Each row gets two numbers. Descendants sit between the parent's numbers.
-
-- Reads are fast.
-- Inserts renumber every row to the right. Comments are insert-heavy. Almost no production system uses this.
-
-**4. Closure table.** A separate table stores every ancestor-descendant pair. A depth-5 comment produces 5 rows in the ancestry table.
-
-- Reads fast via join.
-- Inserts amplify: one comment becomes many rows.
-- Stack Overflow uses this for some hierarchies.
+<summary><b>Show: comparison table</b></summary>
 
 | Approach | Insert | Fetch full thread | Fetch subtree | Extra storage |
 |----------|--------|-------------------|---------------|---------------|
 | Adjacency list | Cheap | Recursive query | Recursive | None |
 | Materialized path | One extra read | Single prefix scan | Single prefix scan | ~50 bytes/row |
-| Nested set | Very expensive | Single range query | Single range query | None |
+| Nested set | Very expensive | Single range | Single range | None |
 | Closure table | Many writes | Single join | Single join | One row per ancestor pair |
 
-**The recommendation:** keep both `parent_id` and `path`. Insert path uses `parent_id`. Read path uses `path`. Each is optimized for its job. The 50-byte path string per row is the right trade.
+Comments are insert-heavy. Nested sets are out. Closure tables amplify writes at scale. Adjacency list breaks at a few hundred comments per article.
+
+The right answer: keep both `parent_id` and `path`. `parent_id` for writes. `path` for reads. 50 bytes per row is the cost; never running a recursive query on the hot read path is the payoff.
 
 </details>
 
-> **Take this with you.** `parent_id` for writes, `path` for reads. The redundancy costs 50 bytes per row. In exchange you never run a recursive query on the hot read path.
+When Alice replies to a comment at `/123/456`, her path becomes `/123/456/789`. Fetching all descendants of comment 456 is:
+
+```sql
+SELECT * FROM comments
+WHERE article_id = 42 AND path LIKE '/123/456/%'
+ORDER BY path;
+```
+
+One index scan. No recursion. Pre-order traversal falls out of the ordering for free.
+
+> **Take this with you.** `parent_id` for writes, `path` for reads. The 50-byte path string per row is the right trade. Never run a recursive query on the hot read path.
 
 ---
 
-## Step 6: Build the architecture, one layer at a time
+## Decision 2: how do we handle vote hot-rows?
 
-We have the data model. Now build the system that surrounds it. Add one layer at a time and say why.
+A comment goes viral. 1,000 users upvote it in 5 seconds.
 
-### v1: just the app and the database
+The naive path hits the same row 1,000 times:
+
+```sql
+UPDATE comments SET score = score + 1 WHERE comment_id = 42;
+```
+
+Every UPDATE takes a row-level lock. The 1,000 updates serialize. The database CPU spikes on one row. Every other comment on the same shard slows down.
+
+The fix: Redis as a buffer between the click and the database.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User
+    participant API
+    participant Redis
+    participant Worker
+    participant DB as Postgres
+
+    User->>API: POST /comments/42/vote {value: 1}
+    API->>Redis: HGET user:7:votes 42
+    API->>Redis: HSET user:7:votes 42 = 1
+    API->>Redis: INCRBY vote_delta:42 +1
+    API-->>User: 200 OK (~5ms)
+
+    Note over Worker,DB: every 5 seconds
+    Worker->>Redis: GETSET vote_delta:42 0
+    Worker->>DB: UPDATE comments SET score = score + 47 WHERE comment_id = 42
+```
+
+Three parts:
+
+1. `INCRBY vote_delta:42 +1` is a memory operation. Returns in under 1ms.
+2. `HSET user:7:votes 42 = 1` tracks the user's current vote. If they switch from down (-1) to up (+1), the delta is +2 not +1, without double-counting.
+3. Every 5 seconds, the worker snapshots all `vote_delta:*` keys and writes one UPDATE per comment. 1,000 votes become one database write.
+
+The hot row disappears. The trade-off: scores lag actual votes by up to 5 seconds. Most users do not notice.
+
+> **Take this with you.** Vote counts, like counts, view counts: anything that aggregates writes to a single row uses this pattern. INCR in Redis, batch flush to the database.
+
+---
+
+## Decision 3: how do we moderate fast without blocking writes?
+
+An ML toxicity classifier takes 100-500ms per comment. A link scanner takes another 200ms. If these run synchronously, Alice waits over half a second before her comment appears. That is not acceptable.
+
+But if nothing runs on the write path, spam posts live unchecked until a human sees it.
+
+The answer is a tiered pipeline:
+
+```mermaid
+flowchart TD
+    Start([New comment posted]) --> Pre["Synchronous pre-check<br/>length · banned phrases<br/>URL allowlist · author reputation<br/>under 50ms"]:::app
+    Pre --> Score{Confidence score}
+    Score -->|"under 0.2"| Pub["Auto-publish<br/>state: published"]:::ok
+    Score -->|"0.2 to 0.7"| PubQ["Publish + queue for<br/>human review"]:::ok
+    Score -->|"0.7 to 0.95"| Hold["Hold pending<br/>only author sees it"]:::bad
+    Score -->|"over 0.95"| Reject["Auto-remove<br/>state: removed_auto"]:::bad
+    Pub --> Async["Async: emit to Kafka"]
+    PubQ --> Async
+    Async --> ML["ML toxicity (100-500ms)"]:::app
+    Async --> Link["Link scanner<br/>(phishing, malware)"]:::app
+    ML -->|flagged| Update["Update state, invalidate cache"]
+    Link -->|flagged| Update
+
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef ok fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+```
+
+The synchronous pre-check runs cheap heuristics in under 50ms. Clear spam is rejected immediately. Obvious-good content is published immediately. The gray zone waits for the async ML classifier, which runs off Kafka after Alice has already seen "201 Created."
+
+The confidence thresholds are tunable. Raise the 0.95 threshold to auto-remove more comments at the cost of more false positives.
+
+**Shadow ban:** a spammer keeps creating accounts. Instead of banning and telling them, shadow-ban. Their comment looks published to them but is invisible to everyone else. The render logic checks: if the requesting user is the comment's author, show it regardless of state.
+
+> **Take this with you.** Pre-publish review does not scale past a few hundred comments per day. Post-publish with fast async takedown is what every high-volume site uses. The synchronous pre-check catches the obvious cases in under 50ms.
+
+---
+
+## Decision 4: how do we paginate large threads?
+
+A thread with 5,000 comments cannot go to the client all at once. Sending it all is ~1.5 MB of JSON plus the tree-assembly time on a cache miss.
+
+Two separate pagination problems need solving:
+
+1. How to page through top-level comments.
+2. How to page through replies under one comment ("load more replies").
 
 ```mermaid
 flowchart TB
-    C([Client]):::user --> CS["Comment Service<br/>(insert, fetch, vote)"]:::app
-    CS --> DB[("Postgres")]:::db
-
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    subgraph Initial["Initial load"]
+        IL1["Top 50 top-level comments by score"]
+        IL2["Each carries first 3 inline replies + reply_count"]
+        IL3["Cursor: (score, comment_id) for hot sort"]
+    end
+    subgraph More["Load more top-level"]
+        ML1["GET /articles/42/comments?sort=hot&cursor=..."]
+        ML2["Next 50 top-level comments"]
+    end
+    subgraph Sub["Load replies under one comment"]
+        SL1["GET /comments/456/replies?cursor=..."]
+        SL2["WHERE article_id=42 AND path LIKE '/123/456/%'"]
+        SL3["Single index range scan via path prefix"]
+    end
+    Initial --> More
+    Initial --> Sub
 ```
 
-This handles the blog fine. The database is bored.
+Cursor-based pagination, not offset. New comments posted while a user is scrolling would shift offset-based results. A cursor on `(score, comment_id)` is stable across inserts.
 
-### v2: separate write and read paths
+> **Take this with you.** The path prefix index that makes tree fetches fast is the same index that makes subtree pagination fast. These two features share one data structure.
 
-Reads beat writes 1,000 to 1. Add a **Read Service** backed by Redis to serve the rendered tree. The Comment Service keeps handling writes. They have different shapes and different scaling needs.
+---
 
-```mermaid
-flowchart TB
-    C([Client]):::user --> GW["API Gateway<br/>(auth, rate limit,<br/>idempotency)"]:::edge
-    GW -->|post / vote| CS["Comment Service"]:::app
-    GW -->|load tree| RS["Read Service<br/>(Redis cache, < 100ms)"]:::app
-    CS --> DB[("Postgres")]:::db
-    RS --> Cache[("Redis")]:::cache
-    RS -.miss.-> DB
+## Decision 5: how do we rank comments?
 
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+Sorting by raw vote count lets old comments dominate forever. The first viral comment stays at the top. New comments cannot break in.
+
+Reddit's "hot" formula applies a log scale to votes and adds a time component:
+
+```
+hot_score = sign(score) × log10(max(|score|, 1)) + seconds_since_epoch / 45000
 ```
 
-### v3: solve the hot-row problem for votes
+Breaking it down:
 
-A comment goes viral. 1,000 users upvote it in 5 seconds. Every `UPDATE comments SET score = score + 1` takes a row-level lock. The 1,000 concurrent updates serialize behind that lock. The database CPU spikes on one row.
+| Factor | Effect |
+|--------|--------|
+| `log10(score)` | Diminishing returns: 10 votes = 1 unit, 100 votes = 2 units |
+| `seconds / 45000` | ~12.5-hour half-life: a 12.5-hour-old comment needs 10x more votes to beat a fresh one |
+| `sign` | Negative scores rank below zero |
 
-Add a **Vote Aggregator**. Votes go to Redis as atomic increments. A background worker batches them into Postgres every 5 seconds. 1,000 votes become one UPDATE.
+The score is computed at read time for small threads. For large threads, pre-compute and store `hot_score` on the row. A background job re-runs the formula every few minutes as time decay changes the sort order even without new votes.
 
-```mermaid
-flowchart TB
-    C([Client]):::user --> GW["API Gateway"]:::edge
-    GW -->|post| CS["Comment Service"]:::app
-    GW -->|vote| VA["Vote Aggregator<br/>(Redis INCR +<br/>batch flush)"]:::cache
-    GW -->|read| RS["Read Service"]:::app
-    CS --> DB[("Postgres")]:::db
-    VA --> Cache[("Redis")]:::cache
-    VA -.flush every 5s.-> DB
-    RS --> Cache
-    RS -.miss.-> DB
+"Controversial" sort: `score = upvotes × downvotes / (upvotes + downvotes)^2`. Comments where both up and down votes are high bubble to the top.
 
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
-```
+> **Take this with you.** Any sort order that involves time decay requires periodic recomputation. A cached tree keyed by `(article_id, sort_order)` needs its own TTL tuned to how often the sort changes.
 
-### v4: moderation, notifications, CDN
+---
 
-Moderation (ML toxicity, link scanning) must not slow down the write path. If the classifier takes 300ms, the user should not wait for it. Add **Kafka**. Everything reactive becomes a consumer.
+## The full architecture
 
 ```mermaid
 flowchart TB
     subgraph Edge["Client edge"]
         C([Web / Mobile / Embed]):::user
         CDN["CDN<br/>(Cloudflare / Fastly)"]:::edge
-        GW["API Gateway"]:::edge
+        GW["API Gateway<br/>(auth · rate limit · idempotency)"]:::edge
     end
 
-    subgraph WritePath["Write path (synchronous)"]
+    subgraph WritePath["Synchronous write path"]
         CS["Comment Service<br/>(stateless pods)"]:::app
-        VA["Vote Aggregator"]:::cache
+        VA["Vote Aggregator<br/>(Redis INCR + batch flush)"]:::cache
     end
 
     DB[("Postgres<br/>comments · votes · flags<br/>edit_history · mod_queue")]:::db
 
     subgraph ReadPath["Read path"]
-        RS["Read Service"]:::app
-        Cache[("Redis")]:::cache
+        RS["Read Service<br/>(tree assembly, sort)"]:::app
+        Cache[("Redis<br/>tree cache per article+sort")]:::cache
     end
 
     K{{"Kafka<br/>comment.created<br/>comment.removed<br/>vote.flushed"}}:::queue
@@ -340,12 +365,12 @@ flowchart TB
 
     C --> CDN
     CDN -.miss.-> GW
-    GW -->|post / vote| CS
+    GW -->|post| CS
     GW -->|vote| VA
     GW -->|read| RS
     CS --> DB
     VA --> Cache
-    VA -.flush.-> DB
+    VA -.flush every 5s.-> DB
     RS --> Cache
     RS -.miss.-> DB
     DB -->|CDC / outbox| K
@@ -362,25 +387,26 @@ flowchart TB
     classDef ext fill:#e9d5ff,stroke:#7e22ce,color:#581c87
 ```
 
-Each box in one line:
+Each component in one line:
 
-| Box | What it does |
-|-----|--------------|
-| **API Gateway** | Auth, per-user rate limit, idempotency key dedup. |
-| **CDN** | Caches rendered comment trees at the edge. 99% of reads stop here. |
-| **Comment Service** | Validates, inserts, emits events. Stateless pods. |
-| **Vote Aggregator** | Redis INCR per click, batch flush to Postgres every 5 seconds. |
-| **Read Service** | Assembles tree, applies sort, fills Redis cache. Falls back to replica on miss. |
-| **Kafka** | Carries events to async consumers without slowing the write path. |
-| **Moderation Pipeline** | ML toxicity + link scan + human review queue. Downstream of Kafka. |
+| Component | Purpose |
+|-----------|---------|
+| CDN | Caches rendered comment trees at the edge. Most reads stop here. |
+| API Gateway | Auth, per-user rate limit, idempotency key dedup. |
+| Comment Service | Validates, inserts, emits events. Stateless pods. |
+| Vote Aggregator | Redis INCR per click, batch flush to Postgres every 5 seconds. |
+| Read Service | Assembles tree, applies sort, fills Redis cache. Falls back to replica on miss. |
+| Postgres | Source of truth. Comments, votes, flags, edit history, mod queue. |
+| Kafka | Carries events to async consumers without touching the write path. |
+| Moderation Pipeline | Async ML toxicity classifier, link scanner, human review queue. |
 
-> **Take this with you.** If the moderation service crashes at 3 a.m., new comments still post. They just get classified a few minutes late. Anything reactive lives after Kafka, not before.
+Notice what is not on the synchronous path: ML classification, notification delivery, search indexing. If the notification service is down at 3 a.m., comments still post.
 
 ---
 
-## Step 7: One comment, all the way through
+## Walk: a comment, end to end
 
-Alice posts a reply. Watch what happens.
+Alice replies to a comment on article 42.
 
 ```mermaid
 sequenceDiagram
@@ -392,9 +418,9 @@ sequenceDiagram
     participant K as Kafka
     participant MOD as Moderation Pipeline
 
-    Alice->>GW: POST /comments {article_id, parent_id, body}
-    GW->>CS: forward (auth ok, idempotency checked)
-    CS->>CS: pre-check (length, banned phrases, author reputation, < 50ms)
+    Alice->>GW: POST /articles/42/comments {parent_id, body}
+    GW->>CS: forward (auth ok, idempotency key checked)
+    CS->>CS: pre-check (length, banned phrases, author rep, < 50ms)
 
     rect rgb(241, 245, 249)
         Note over CS,DB: one database transaction
@@ -403,157 +429,68 @@ sequenceDiagram
         CS->>DB: COMMIT
     end
 
-    CS->>CS: invalidate Redis cache for article
-    CS->>K: emit comment.created
-    CS-->>GW: 201 Created
+    CS->>CS: invalidate Redis cache for article 42
+    CS->>K: emit comment.created (fire and forget)
+    CS-->>GW: 201 Created (~150ms)
     GW-->>Alice: 201 Created
 
     Note over K,MOD: async, after Alice sees success
     K->>MOD: consume comment.created
     MOD->>MOD: ML toxicity (100-500ms)
-    MOD->>MOD: link scanner
     alt score > 0.7
         MOD->>DB: UPDATE state = removed_auto
         MOD->>CS: invalidate cache
     end
 ```
 
-Three details worth pointing at:
+Three things to notice:
 
-1. The comment insert and the `reply_count` increment are in **one transaction**. A crash rolls both back cleanly.
+1. The INSERT and the `reply_count` increment are in one transaction. A crash rolls both back.
 2. The ML classifier runs after Alice has already seen "201 Created." It does not block her.
-3. If the classifier removes the comment after Alice posted it, she sees the tombstone on her next refresh. The write path never waits for moderation.
+3. If the classifier removes the comment, Alice sees the tombstone on her next page refresh. The write path never waited for moderation.
 
 ---
 
-## Step 8: The vote hot-row problem
+## The vote hot-row in depth
 
-A comment goes viral. 1,000 users upvote it in 5 seconds.
+At 1,000 votes per second, even the 5-second batch flush produces a delta of 5,000 on one `UPDATE`. That single write still has to take a row lock.
 
-The naive design hits the same database row 1,000 times:
-
-```sql
-UPDATE comments SET score = score + 1 WHERE comment_id = 42;
-```
-
-Every UPDATE takes a row-level lock. The 1,000 updates serialize. The database CPU spikes. Everything slows down.
-
-The fix uses Redis as a buffer:
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant User
-    participant API
-    participant Redis
-    participant Worker
-    participant DB as Postgres
-
-    User->>API: POST /comments/42/vote {value: 1}
-    API->>Redis: HGET user:7:votes 42 (existing vote)
-    API->>Redis: HSET user:7:votes 42 = 1
-    API->>Redis: INCRBY vote_delta:42 +1
-    API->>User: 200 OK (under 10ms)
-
-    Note over Worker,DB: every 5 seconds
-    Worker->>Redis: GETSET vote_delta:42 0 (snapshot and reset)
-    Worker->>DB: UPDATE comments SET score = score + 47 WHERE comment_id = 42
-```
-
-Three parts:
-
-1. **Redis INCR per click.** `INCRBY vote_delta:42 +1` is a memory operation. Returns in under 1ms.
-2. **User hash for dedup.** `user:7:votes` stores each user's current vote per comment. A user switching from down (-1) to up (+1) produces a delta of +2 without double-counting.
-3. **Batch flush every 5 seconds.** The background worker reads all `vote_delta:*` keys and writes one UPDATE per comment. 1,000 votes become one database write. The hot row disappears.
-
-<details markdown="1">
-<summary><b>Show: the vote dedup logic</b></summary>
-
-```python
-def cast_vote(user_id, comment_id, new_value):
-    key_user  = f"user:{user_id}:votes"
-    key_delta = f"vote_delta:{comment_id}"
-
-    existing = int(redis.hget(key_user, comment_id) or 0)
-    delta = new_value - existing
-
-    if delta != 0:
-        with redis.pipeline() as p:
-            p.incrby(key_delta, delta)
-            if new_value == 0:
-                p.hdel(key_user, comment_id)
-            else:
-                p.hset(key_user, comment_id, new_value)
-            p.execute()
-```
-
-The flush worker:
-
-```python
-def flush_vote_deltas():
-    keys = redis.keys("vote_delta:*")
-    pipeline = redis.pipeline()
-    for k in keys:
-        pipeline.getset(k, 0)       # read and reset atomically
-    deltas = pipeline.execute()
-
-    with db.transaction():
-        for k, d in zip(keys, deltas):
-            d = int(d or 0)
-            if d == 0:
-                continue
-            cid = int(k.split(":")[1])
-            db.execute(
-                "UPDATE comments SET score = score + %s WHERE comment_id = %s",
-                d, cid
-            )
-```
-
-</details>
-
-The trade-off: scores lag actual votes by up to 5 seconds. Most users do not notice. To protect against Redis crash losing the unflushed delta, enable Redis AOF plus a replica, or write votes to Kafka (durable) and have the worker read from Kafka.
-
-> **Take this with you.** Vote counts, like counts, view counts: anything that aggregates writes to a single row uses this pattern. INCR in Redis, batch flush to the database.
-
----
-
-## Step 9: The moderation pipeline
-
-Comments attract spam, hate speech, and scam links. Every high-volume site runs a confidence-routed pipeline. Fast cheap checks on the write path. Slower expensive checks off Kafka.
+The defense works in layers:
 
 ```mermaid
 flowchart TD
-    Start([New comment posted]) --> Pre["Synchronous pre-check<br/>length · banned phrases<br/>URL allowlist · author reputation<br/>under 50ms"]:::app
-    Pre --> Score{Toxicity score}
-    Score -->|under 0.2| Pub["Auto-publish<br/>state: published"]:::ok
-    Score -->|0.2 to 0.7| PubQ["Publish + queue<br/>for human review"]:::ok
-    Score -->|0.7 to 0.95| Hold["Hold pending<br/>only author sees it"]:::bad
-    Score -->|over 0.95| Reject["Auto-remove<br/>state: removed_auto"]:::bad
-    Pub --> Async["Async: emit to Kafka"]
-    PubQ --> Async
-    Async --> ML["ML toxicity (100-500ms)"]:::app
-    Async --> Link["Link scanner<br/>(phishing, malware)"]:::app
-    ML -->|flagged| Up["Update state, invalidate cache"]
-    Link -->|flagged| Up
+    Start([1000 votes/sec on comment 42]) --> Redis{"Redis INCR<br/>(in-memory, no lock)"}
+    Redis -->|"999/sec absorbed"| OK1["~1ms response to user"]:::ok
+    Redis -->|"1 flush / 5 seconds"| Flush["Single UPDATE score += 5000<br/>(row locked ~1ms)"]:::ok
+    Flush -->|"score written to DB"| Cache["Invalidate Redis tree cache<br/>for article 42"]:::ok
+    Cache -->|"next read rebuilds"| RS["Read Service: fetch from<br/>DB replica, repopulate cache"]:::ok
 
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
     classDef ok fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
 ```
 
-The confidence bands let you tune false-positive vs false-negative without changing code. Raising the 0.95 threshold auto-removes more at the cost of more false positives. Raising the 0.7 threshold sends more to human review.
+If Redis fails before a flush: score delta is lost. To prevent this, write votes to Kafka at the same time as Redis. The flush worker reads from Kafka instead of Redis. Kafka is the durable record. Redis is the fast counter.
 
-**Shadow ban.** A spammer keeps creating accounts. Instead of banning and giving them a signal, shadow-ban: their comment looks published to them but is invisible to everyone else. They waste effort posting. The render logic: if the requesting user is the comment's author, show the comment regardless of state.
+```mermaid
+flowchart LR
+    Vote["POST /vote"] --> Redis[("Redis<br/>vote_delta:42")]:::cache
+    Vote --> K{{"Kafka<br/>vote.cast"}}:::queue
+    Worker["Flush Worker"] -->|"reads from"| K
+    Worker -->|"UPDATE score"| DB[("Postgres")]:::db
 
-**User reports** feed the same human queue. A report from a high-reputation user weighs more than one from a new account. Ten reports within an hour auto-hides the comment pending review.
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+```
 
-> **Take this with you.** Pre-publish review does not scale past a few comments per minute. Post-publish with fast async takedown is what every high-volume site does.
+Redis gives you speed. Kafka gives you durability. Together: every vote is fast and nothing is lost if a Redis pod restarts.
+
+> **Take this with you.** The hot-row pattern (INCR in Redis, batch flush to DB) appears everywhere: view counts, like counts, rating aggregates. Learn it once. The Kafka-backed variant adds durability at the cost of slightly more infrastructure.
 
 ---
 
 ## Follow-up questions
 
-Try answering each in 2 to 4 sentences before opening the solution.
+Try answering each in 2-4 sentences before opening the solution.
 
 1. **Soft delete of a popular comment.** A comment with 200 replies is deleted by its author. What happens to the replies? Walk through the data and the UI.
 

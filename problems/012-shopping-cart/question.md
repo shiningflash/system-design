@@ -7,133 +7,104 @@ difficulty: Easy
 solution: solution.md
 ---
 
-## The scene
+## What we are building
 
-You sit down. The interviewer opens a browser tab.
+Alice adds a $79 pair of shoes to her cart on her laptop. An hour later she opens her phone, and the shoes are still there. She clicks Buy, the shoes ship, and her credit card gets charged exactly once.
 
-> *"We sell shoes online. About 500 customers a day today. You know the cart experience: add items, change the count, leave for two hours, come back, and your stuff is still there."*
->
-> *"Build that. And plan for growth."*
+That is the whole product. It sounds like three database rows. The interesting problems are hiding underneath.
 
-They lean back. *"This one sounds easy."*
+Five hard problems show up in every real cart:
 
-That smile is a warning.
+1. **Cross-device sync.** The cart must live on the server, not in a browser cookie. A cookie only works on one device.
+2. **Guest-to-user merge.** Alice browses as a guest, adds 3 items, then logs in. She already had 2 items saved. Now what?
+3. **Inventory race.** The cart says a shoe is in stock. Twenty minutes later, someone else took the last pair. Alice clicks Buy.
+4. **Idempotent checkout.** Alice's phone drops the network mid-checkout. The app retries. She must not get two orders or two charges.
+5. **Abandoned cart cleanup.** Sixty percent of carts are never bought. Ghost carts pile up. Guest cart tokens accumulate in the database forever.
 
-The word **cart** sounds like a checkbox. Three buttons, one table, done in a day. The real questions hide in the gaps:
-
-- Where does the cart actually live? In the browser? On the server? In Redis?
-- A guest adds 3 items, then logs in. They already had 2 items saved. What does the cart show?
-- The cart says "in stock." Twenty minutes later the user clicks Buy. Someone else took the last pair. What now?
-- The cart icon appears on every page. At a million users, that is 350 reads per second. From what?
-
-We will start with a 10-person prototype and add one pressure at a time, watching the design grow.
+We will start with the smallest version that works, then add one piece at a time as each problem appears.
 
 ---
 
-## Step 1: Picture one cart
+## The lifecycle of one cart
 
-Before boxes and arrows, just picture what one cart **is**. Alice adds shoes. She changes her mind. She buys.
+Every cart moves through a small set of states. Picture it once before drawing any architecture.
 
 ```mermaid
 stateDiagram-v2
     direction LR
-    [*] --> Active: Alice adds first item
+    [*] --> Active: first item added
     Active --> Active: add / update / remove item
-    Active --> Merging: Alice logs in (guest → account)
+    Active --> Merging: Alice logs in (guest to account)
     Merging --> Active: merge complete
     Active --> CheckingOut: Alice clicks Checkout
     CheckingOut --> Converted: payment succeeds
-    CheckingOut --> Active: payment fails
-    Active --> Abandoned: no activity for 6h
+    CheckingOut --> Active: payment fails, cart restored
+    Active --> Abandoned: no activity for 6 hours
     Converted --> [*]
     Abandoned --> [*]
 ```
 
-Everything added later (Redis, Kafka, reservations, price drift) is a complication on top of this one diagram.
+Everything else in this design (Redis, Kafka, inventory holds, price drift handling) is a complication on top of this one state machine.
 
-> **Take this with you.** A cart is a small state machine per user. The interesting part is not the state machine. It is what happens between Active and Converted.
-
----
-
-## Step 2: Ask the right questions
-
-In a real interview, write down your questions before drawing anything. Not twenty. Five good ones that change the design.
-
-<details markdown="1">
-<summary><b>Show: 5 questions that change the design</b></summary>
-
-1. **Guests or login only?** Can someone add items without an account? Almost every real shop says yes. This single answer decides whether you need merge logic at login. *Almost always: yes, guests can add.*
-
-2. **How long does a cart live?** One hour? One day? Thirty days? A short cart can live in Redis with a TTL. A thirty-day cart needs Postgres as the source of truth, because Redis is not a durable store.
-
-3. **Multi-device sync?** If Alice adds a shoe on her phone, does she see it on her laptop five minutes later? If yes, the cart must live on the server. A cookie in the browser will not work across devices.
-
-4. **What does "in stock" mean?** Three very different options:
-   - Hold it for Alice for 15 minutes (soft reservation)
-   - Show her the last-known state and re-check at checkout (optimistic)
-   - Accept the order and sort it out later (no check)
-   These three options lead to three different architectures.
-
-5. **Who does the checkout?** Does the cart service complete the purchase, or does it hand off a frozen snapshot to an order service? The answer changes who owns the inventory decrease and the payment call.
-
-A strong candidate also asks: *"Is sending notifications part of this service, or a separate one?"* The cart emits events. A notification service consumes them. Keep those two things apart.
-
-</details>
+> **Take this with you.** A cart is a small state machine per user. The hard part is not the state machine. It is what happens between Active and Converted.
 
 ---
 
-## Step 3: How big is this thing?
+## How big this gets
 
-Same shop, two very different sizes.
+Same product, two very different sizes.
 
-| Company | Visitors/day | Carts/day | Writes/sec | Reads/sec | Active now |
-|---------|--------------|-----------|------------|-----------|------------|
-| Small shop | 500 | 150 | ~0.003 | ~0.06 | ~50 |
-| Big shop (1M users) | 1,000,000 | 300,000 | 7 (peak 21) | 115 (peak 350) | ~25,000 |
+| Input | Small shop (500 DAU) | Big shop (1M DAU) |
+|-------|---------------------|-------------------|
+| Carts per day | 150 | 300,000 |
+| Cart writes per second (peak) | ~0.01 | ~21 |
+| Cart icon reads per second (peak) | ~0.06 | ~350 |
+| Active carts at any moment | ~50 | ~25,000 |
+| Live storage | ~33 MB/year | ~7 GB |
 
 <details markdown="1">
 <summary><b>Show: how the numbers come out</b></summary>
 
-Assume 30% of visitors add at least one item. Average cart: 3 items, edited twice.
+Assume 30% of visitors add at least one item. Average cart has 3 items, edited twice.
 
 **Small shop (500 visitors/day):**
-- Carts: 500 × 30% = 150/day
-- Cart writes: 150 × 2 edits = 300/day → **0.003/sec**
-- Cart icon reads: 500 visitors × 10 page views = 5,000/day → **0.06/sec**
-- Active carts: 150 carts × average life of ~8h / 24h ≈ **50 open at any moment**
-- Storage: 150 × 3 items × 200 bytes ≈ 90 KB/day. One year: ~33 MB.
+- Carts: 500 × 30% = 150 per day
+- Cart writes: 150 × 2 edits = 300/day, so **0.003/sec steady**
+- Cart icon reads: 500 visitors × 10 page views = 5,000/day, so **0.06/sec**
+- Active carts: 150 carts × ~8h average life / 24h = **~50 open at any moment**
+- Storage: 150 carts × 3 items × 200 bytes = ~90 KB/day, ~33 MB/year
 
 **Big shop (1M visitors/day):**
-- Carts: 300,000/day → **3.5/sec** steady, **10/sec** at peak
-- Cart writes: 600,000/day → **7/sec** steady, **21/sec** at peak
-- Cart icon reads: 1M × 10 page views = 10M/day → **115/sec** steady, **350/sec** at peak
-- Active carts: 300,000 × 30-day TTL / 30 ≈ **25,000 open at any moment**
-- Storage: 300k carts × 3 items × 200 bytes ≈ 180 MB/day. One month of live carts: ~5.5 GB.
+- Carts: 1M × 30% = 300,000/day, so **3.5/sec steady**
+- Cart writes: 600,000/day, so **7/sec steady, 21/sec peak**
+- Cart icon reads: 1M × 10 page views = 10M/day, so **115/sec steady, 350/sec peak**
+- Active carts (30-day TTL): 300,000 × 30 days / 30 = **~25,000 open at any moment**
+- Storage: 300K carts × 3 items × 200 bytes = ~180 MB/day, ~7 GB live
 
-**The number that matters:** writes are tiny even at 1M users. A single Postgres handles 20 writes/sec without breathing hard. The real challenge is the cart icon read on every page: 350/sec at peak, with a tight latency requirement. That is the bottleneck.
+The number that matters: writes are tiny even at 1M users. Any database handles 21 writes/sec. The real challenge is the cart icon read on every page: 350/sec with a tight latency target. That single endpoint sets the caching strategy.
 
 | Metric | At 1M users |
 |--------|-------------|
-| Writes/sec | ~21 peak. Any database handles this. |
-| Reads/sec | ~350 peak. This is the real challenge. |
-| Storage | ~7 GB live. Nothing. |
-| Real bottleneck | Cart icon read on every page. Not the buy button. |
+| **Writes/sec (peak)** | ~21. Any database handles this. |
+| **Icon reads/sec (peak)** | ~350. This is the design constraint. |
+| **Active carts in Redis** | ~25,000. About 5 MB as compact hashes. |
+| **Real bottleneck** | Cart icon read on every page, not the buy button. |
 
 </details>
 
-> **Take this with you.** The cart is a read-heavy problem disguised as a write problem. Optimize the cart icon read, not the add-item write.
+> **Take this with you.** The cart is a read-heavy problem disguised as a write problem. Optimize the icon read, not the add-item write.
 
 ---
 
-## Step 4: The smallest thing that works
+## The smallest version that works
 
-Forget scale. We are a 10-person startup. Logged-in only. One Postgres table. One server.
+One Postgres, one app server, logged-in users only.
 
 ```mermaid
 flowchart LR
-    A([Alice]):::user --> API[/"Cart Service<br/>(add, remove, read)"/]:::app
-    API --> DB[("Postgres<br/>carts + cart_items")]:::db
-    API --> INV[/"Catalog<br/>(name, price, stock)"/]:::ext
+    A([Alice]):::user --> CS["Cart Service"]:::app
+    CS --> DB[("Postgres<br/>carts + cart_items")]:::db
+    CS --> Cat["Catalog<br/>(name, price, stock)"]:::ext
 
     classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
     classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
@@ -141,29 +112,13 @@ flowchart LR
     classDef ext fill:#e9d5ff,stroke:#7e22ce,color:#581c87
 ```
 
-Alice adds a shoe. Here is the full sequence.
+Three endpoints carry the full product at this stage.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Alice
-    participant App as Cart Service
-    participant Cat as Catalog
-    participant DB as Postgres
-
-    Alice->>App: POST /cart/items {sku: shoe-blue-42, qty: 1}
-    App->>Cat: price and availability for shoe-blue-42?
-    Cat-->>App: $50, in stock
-
-    rect rgb(241, 245, 249)
-        Note over App,DB: one transaction
-        App->>DB: INSERT cart_items (cart_id, sku, qty=1, snapshot_price=5000)
-        App->>DB: UPDATE carts SET item_count = item_count + 1
-        App->>DB: COMMIT
-    end
-
-    App-->>Alice: 201 Created
-```
+| Endpoint | What it does |
+|----------|--------------|
+| `GET /api/v1/cart` | Return items, quantities, snapshot prices, and live availability |
+| `POST /api/v1/cart/items` | Add an item or increase its quantity |
+| `PATCH /api/v1/cart/items/{sku}` | Update quantity; qty 0 removes the item |
 
 <details markdown="1">
 <summary><b>Show: the two tables</b></summary>
@@ -190,47 +145,63 @@ CREATE TABLE cart_items (
 );
 ```
 
-`item_count` is denormalized on the `carts` row. The cart icon on every page only needs that one number. One row read, no JOIN, no catalog call.
+`item_count` is denormalized on the `carts` row. The cart icon on every page only needs that one number: one row read, no JOIN, no catalog call.
 
-`snapshot_price_cents` records what the price was when Alice added the item. If the price changes tomorrow, the audit trail still shows what she saw.
+`snapshot_price_cents` records what Alice saw when she added the item. If the price changes tomorrow, the audit trail still shows what she was shown.
 
 </details>
 
-> **Take this with you.** Two tables and a stateless service carry the whole product for the first thousand users. The interesting work starts when something breaks.
+This is enough for a hundred users. The interesting question is what breaks first as the system grows.
 
 ---
 
-## Step 5: The first crack
+## Decision 1: where does the cart live for guests?
 
-Everything above works fine for logged-in users. Marketing then asks: *"Can guests add items without signing in? Most competitors do that."*
+Marketing asks: can users browse and add items without creating an account? Almost every real shop says yes. This single answer changes the data model and adds a merge step at login.
 
-You look at your code. You have `user_id` everywhere. For guests there is no user_id yet.
+The fix is a `cart_token`: a random UUID stored in a browser cookie. The cart lives on the server, keyed by that token instead of a user ID. The cookie just points at the row.
 
-The fix: give guests a `cart_token`, a random UUID stored in a browser cookie. The cart lives on the server, keyed by that token instead of a user ID. The cookie just points at the row.
-
-Now a new problem surfaces. Alice builds a guest cart with 3 shoes over 20 minutes. She logs in. She already had 2 shoes saved in her account from last week.
+Now a new problem: Alice builds a guest cart with 3 shoes over 20 minutes. She logs in. She already had 2 shoes saved from last week.
 
 ```mermaid
 flowchart TD
     Login([Alice logs in]) --> BothExist{Both carts exist?}
-    BothExist -- "No guest cart" --> UseAccount[Return account cart]:::ok
+    BothExist -- "No guest cart" --> UseAccount["Return account cart unchanged"]:::ok
     BothExist -- "No account cart" --> Rebind["Rebind guest cart to user_id<br/>(clear cart_token)"]:::ok
-    BothExist -- "Both exist" --> Merge["Merge: for each SKU,<br/>take max(guest qty, account qty)"]:::ok
-    Merge --> Audit["Write carts_merged audit row<br/>Clear guest cookie"]:::ok
+    BothExist -- "Both have items" --> Merge["For each SKU: take max(guest qty, account qty)<br/>Skip discontinued items<br/>Respect size limit"]:::ok
+    Merge --> Audit["Write carts_merged audit row<br/>Delete guest cart<br/>Clear guest cookie"]:::ok
 
     classDef ok fill:#dcfce7,stroke:#15803d,color:#14532d
 ```
 
-The quantity rule matters: if the guest cart has 2 of shoe-A and the account cart has 1, the user almost certainly wants 2, not 3. Summing would surprise them. **Take the max, not the sum.**
+The quantity rule matters. If the guest cart has 2 of shoe-A and the account cart has 1, Alice almost certainly wants 2, not 3. **Take the max, not the sum.**
+
+The merge runs inside a serializable transaction. Alice might double-click Log In. Two concurrent merge calls race. The second finds the guest cart already deleted and returns the account cart unchanged. No duplicate merge.
 
 <details markdown="1">
-<summary><b>Show: the merge in code</b></summary>
+<summary><b>Show: the carts_merged audit table and merge sketch</b></summary>
+
+```sql
+CREATE TABLE carts_merged (
+    merge_id        UUID PRIMARY KEY,
+    user_id         BIGINT NOT NULL,
+    anonymous_token UUID,
+    anonymous_items JSONB NOT NULL,
+    account_items   JSONB NOT NULL,
+    merged_items    JSONB NOT NULL,
+    rule_applied    TEXT NOT NULL,
+    trimmed_items   JSONB,
+    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+Every merge writes a row here regardless of outcome: rebind, full merge, or no-op. When Alice emails support "my cart is wrong after I logged in," you have the answer. The data is cheap to store. The audit is irreplaceable.
 
 ```python
 def merge_carts(anonymous_token, user_id):
     with db.transaction(isolation="serializable"):
         anon_cart = db.fetch_cart(cart_token=anonymous_token, lock=True)
-        user_cart = db.fetch_cart(user_id=user_id, lock=True)
+        user_cart  = db.fetch_cart(user_id=user_id, lock=True)
 
         if anon_cart is None:
             return user_cart
@@ -240,7 +211,7 @@ def merge_carts(anonymous_token, user_id):
             audit_merge(user_id, anonymous_token, rule="rebind")
             return db.fetch_cart(user_id=user_id)
 
-        merged = {item.sku: item.copy() for item in user_cart.items}
+        merged  = {item.sku: item.copy() for item in user_cart.items}
         trimmed = []
         for item in anon_cart.items:
             if not catalog.is_available(item.sku):
@@ -262,89 +233,174 @@ def merge_carts(anonymous_token, user_id):
         return db.fetch_cart(user_id=user_id)
 ```
 
-Four things that look small but are not:
-
-1. **Serializable isolation.** Alice double-clicks Log In. Two merge calls race. The second finds the guest cart already deleted and does nothing. No duplicate merge.
-2. **Audit always written.** Whether rebind, merge, or no-op, write a row to `carts_merged`. When Alice emails support "my cart is wrong after I logged in," you have the answer.
-3. **Discontinued items skipped silently.** Show a banner: "Some guest cart items are no longer available."
-4. **Cookie cleared after merge.** The response sets `Set-Cookie: cart_token=; Max-Age=0`. Otherwise the next page load tries to merge again.
-
 </details>
 
-> **Take this with you.** The merge on login is where most cart designs break. Max-qty rule, one transaction, audit row, clear the cookie.
+> **Take this with you.** The merge on login is where most cart designs break. Max-qty rule, one serializable transaction, audit row, clear the cookie.
 
 ---
 
-## Step 6: Build the architecture, one layer at a time
+## Decision 2: how do we handle the inventory race?
 
-We have a guest-capable cart with merge. Now grow it. Add **one layer at a time**, one reason per layer.
-
-### v1: just the service
+Alice adds a shoe to her cart at 2 PM. At 2:20 PM she clicks Buy. Someone else took the last pair at 2:15 PM. Three approaches handle this. None is perfect.
 
 ```mermaid
-flowchart TB
-    C([Alice]):::user --> CS["Cart Service"]:::app
-    CS --> DB[("Postgres")]:::db
-    CS --> Cat["Catalog<br/>(price, stock)"]:::ext
+flowchart TD
+    Add([Alice clicks Add to Cart]) --> A{Which approach?}
 
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-    classDef ext fill:#e9d5ff,stroke:#7e22ce,color:#581c87
+    A --> Opt["A. Optimistic<br/>Show last-known state.<br/>Re-check at checkout."]
+    A --> Res["B. Soft reservation<br/>Place a 15-min hold on add.<br/>Expire if cart abandoned."]
+    A --> None["C. No check<br/>Accept everything.<br/>Sort it out later."]
+
+    Opt --> OptBad["1-3% of checkouts<br/>hit sold-out surprise at the last step"]:::bad
+    Res --> ResBad["Ghost carts hold inventory for 15 min.<br/>Hot items look sold out to real buyers."]:::bad
+    None --> NoneBad["'Sorry, cannot ship.<br/>Here is your refund.' email."]:::bad
+
+    classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
 ```
 
-Fine for 100 users.
+<details markdown="1">
+<summary><b>Show: comparison table and recommendation</b></summary>
 
-### v2: inventory is a separate team
+| Approach | Normal case | Failure mode | Build cost | Right for |
+|----------|-------------|--------------|------------|-----------|
+| **A. Optimistic** | Works fine. Checkout re-checks. | 1-3% of checkouts find item gone at the last step. | Low. | Default for most shops. |
+| **B. Soft reservation** | User never sees a sold-out surprise mid-checkout. | Ghost carts hold inventory for 15 min. Hot items show as sold out to real buyers. | High. Inventory needs hold, release, and TTL expiry logic. | Concert tickets, limited sneaker drops. |
+| **C. No check** | Always accepts. Fast. | "Cannot ship, here is your refund." | Near zero. | Pre-orders, print-on-demand. |
 
-The catalog now splits into two: a Catalog service (name, image, price) and an Inventory service (stock level). Different teams own them. The cart reads from both in parallel on every cart page load.
+**Default: optimistic. Reservation only for SKUs explicitly flagged `requires_reservation=true`.**
+
+Industry cart abandonment is 60-70%. If every add-to-cart held inventory for 15 minutes, ghost carts would make real inventory look empty. That is right for a Taylor Swift ticket sale. Wrong for shoes.
+
+Division of responsibility:
+- **Cart service:** read-only availability check on add. Show what we believe. No writes to inventory.
+- **Order service:** authoritative `try_reserve(sku, qty)` at checkout. If it fails, no order, no charge.
+
+The cart's job is to show good information. The order service's job is to make the buy real.
+
+</details>
+
+> **Take this with you.** The cart shows what is probably true. The Order Service makes it actually true. Never put the inventory guarantee in the cart.
+
+---
+
+## Decision 3: how do we make checkout idempotent?
+
+Alice's phone drops the connection mid-checkout. The app retries. Without idempotency, the cart service processes the checkout twice and charges her twice.
+
+The fix is an `Idempotency-Key` header on every mutating request: a UUID the client generates once per logical operation. The server records the key and the result. If the same key arrives again, it returns the recorded result without re-processing.
 
 ```mermaid
-flowchart TB
-    C([Alice]):::user --> GW["API Gateway<br/>(auth, rate limit,<br/>cart_token cookie)"]:::edge
-    GW --> CS["Cart Service"]:::app
-    CS --> DB[("Postgres")]:::db
-    CS --> Cat["Catalog Service"]:::ext
-    CS --> Inv["Inventory Service"]:::ext
+sequenceDiagram
+    autonumber
+    participant Phone as Alice's phone
+    participant GW as API Gateway
+    participant CS as Cart Service
+    participant DB as Postgres
 
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-    classDef ext fill:#e9d5ff,stroke:#7e22ce,color:#581c87
+    Phone->>GW: POST /checkout Idempotency-Key: abc-123
+    GW->>CS: forward
+
+    rect rgb(241, 245, 249)
+        Note over CS,DB: check-then-act, one transaction
+        CS->>DB: SELECT FROM idempotency_keys WHERE key='abc-123'
+        DB-->>CS: not found
+        CS->>DB: INSERT idempotency_keys (key, status='processing')
+        CS->>DB: frozen snapshot of cart
+        CS->>DB: COMMIT
+    end
+
+    Note over CS: hand snapshot to Order Service (async)
+    CS-->>Phone: 202 Accepted, order_id: ord-789
+
+    Note over Phone: network drops here
+
+    Phone->>GW: POST /checkout Idempotency-Key: abc-123 (retry)
+    GW->>CS: forward
+    CS->>DB: SELECT FROM idempotency_keys WHERE key='abc-123'
+    DB-->>CS: found, status='processing', order_id=ord-789
+    CS-->>Phone: 202 Accepted, order_id: ord-789 (same response)
 ```
 
-### v3: the cart icon read starts hurting
+The cart does not clear until the Order Service emits a `cart.converted` event. Payment failure emits `cart.checkout_failed`, holds release, and the cart is intact for editing.
 
-Cart icon reads at 350/sec show up in slow query logs. Add Redis. Active carts live as a hash per user. The cart service writes through to Postgres and caches in Redis. Icon reads hit Redis first.
+> **Take this with you.** Idempotency keys plus a frozen snapshot. The key catches retries. The snapshot decouples cart state from payment outcome.
+
+---
+
+## Decision 4: how do we serve the cart icon fast?
+
+The cart icon appears on every page. At 1M users, that is 350 icon reads per second. Each read only needs one number: how many items are in Alice's cart.
+
+The naive path is a `SELECT COUNT(*) FROM cart_items WHERE cart_id = ?`. At 350/sec this starts showing up in slow query logs within a few weeks of launch.
+
+Two things fix this. First, denormalize `item_count` onto the `carts` row and keep it updated in the same transaction as item changes. Second, cache the whole cart hash in Redis so icon reads never touch Postgres.
 
 ```mermaid
 flowchart TB
-    C([Alice]):::user --> GW["API Gateway"]:::edge
-    GW -->|writes| CS["Cart Service<br/>(stateless pods)"]:::app
-    GW -->|icon read| CS
-    CS --> R[("Redis<br/>cart:user:{uid}")]:::cache
-    CS -.miss.-> DB[("Postgres")]:::db
-    CS --> Cat["Catalog"]:::ext
-    CS --> Inv["Inventory"]:::ext
+    Alice([Alice]):::user --> GW["API Gateway"]:::edge
+    GW -->|"GET /cart/icon (~350/sec)"| CS["Cart Service"]:::app
+    CS -->|"HGET cart:user:{uid} item_count (~95% hit)"| R[("Redis<br/>cart:user:{uid}<br/>~5 MB for 25K active carts")]:::cache
+    CS -.miss.-> DB[("Postgres<br/>item_count on carts row")]:::db
+    R -->|"~20 ms"| GW
+    DB -->|"~40 ms, repopulates Redis"| GW
 
     classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
     classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
     classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
     classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
     classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
-    classDef ext fill:#e9d5ff,stroke:#7e22ce,color:#581c87
 ```
 
-### v4: downstream teams want cart events
+Redis holds the compact cart: SKU, qty, snapshot price. One HGET returns the count. Catalog and inventory results are not stored in Redis; they change too fast and are fetched fresh on each full cart page load.
 
-Marketing wants abandoned-cart emails. Analytics wants the funnel. Fraud wants to see add patterns. These should not slow the write path. Add Kafka. Cart events flow out; consumers subscribe.
+> **Take this with you.** Denormalize `item_count`. Cache it in Redis. One field read, no JOIN, no catalog call. That is how the icon stays under 20 ms.
+
+---
+
+## Decision 5: how do we clean up abandoned carts?
+
+60-70% of carts are never purchased. Guest carts accumulate with no user to notify. At 1M users, that is 180,000 abandoned carts per day with no automatic cleanup.
+
+Two separate problems: finding carts to email, and deleting dead rows.
+
+**Finding carts to email:** a nightly job queries carts where `status = 'active'` and `updated_at` is exactly 6 hours old, within a narrow window.
+
+```mermaid
+flowchart LR
+    Job(["Abandonment job<br/>(runs every 15 min)"]):::app
+    DB[("Postgres<br/>idx on status, updated_at")]:::db
+    K{{"Kafka<br/>cart.abandoned"}}:::queue
+    Email["Notification Service<br/>(email)"]:::app
+    Dedup[("cart_abandonment_emails<br/>(dedup table)")]:::db
+
+    Job -->|"SELECT carts where updated_at in [6h, 6h15m) ago"| DB
+    DB -->|"matching cart_ids"| Job
+    Job -->|"emit cart.abandoned"| K
+    K --> Email
+    Email --> Dedup
+
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+```
+
+The narrow time window means the query only touches carts that just crossed the threshold. The partial index on `(status, updated_at)` makes it fast regardless of total cart count.
+
+**Deleting dead rows:** guest carts get `expires_at = NOW() + 30 days`, refreshed on every activity. A nightly GC job deletes rows where `expires_at < NOW()` and `status != 'converted'`. Converted carts stay for the order audit trail.
+
+> **Take this with you.** Narrow time windows, not full scans. Emit events to Kafka, do not email directly from the job. Dedup on delivery, not on send.
+
+---
+
+## The full architecture
+
+Putting the five decisions together.
 
 ```mermaid
 flowchart TB
     subgraph Edge["Client edge"]
         C([Web / Mobile]):::user
-        GW["API Gateway"]:::edge
+        GW["API Gateway<br/>(auth · cart_token · rate limit)"]:::edge
     end
 
     subgraph WritePath["Synchronous write path"]
@@ -354,13 +410,15 @@ flowchart TB
     end
 
     DB[("Postgres<br/>carts · cart_items · carts_merged")]:::db
-    R[("Redis<br/>active carts")]:::cache
-    K{{"Kafka<br/>cart.* events"}}:::queue
+    R[("Redis<br/>cart:user:{uid}<br/>~5 MB active")]:::cache
+
+    K{{"Kafka<br/>cart.item.added · cart.merged<br/>cart.abandoned · cart.converted"}}:::queue
 
     subgraph Consumers["Async consumers"]
-        AB["Abandoned cart<br/>emails"]:::app
-        AN["Analytics<br/>(ClickHouse)"]:::ext
+        AB["Abandoned cart emails"]:::app
+        AN[("Analytics<br/>(ClickHouse)")]:::db
         FR["Fraud check"]:::app
+        ORD["Order Service"]:::app
     end
 
     C --> GW
@@ -373,6 +431,7 @@ flowchart TB
     K --> AB
     K --> AN
     K --> FR
+    K --> ORD
 
     classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
     classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
@@ -383,26 +442,25 @@ flowchart TB
     classDef ext fill:#e9d5ff,stroke:#7e22ce,color:#581c87
 ```
 
-Each box, in one line:
+Each component in one sentence:
 
-| Box | What it does |
-|-----|--------------|
-| **API Gateway** | Authenticates the caller, hands out `cart_token` cookies for guests. |
-| **Cart Service** | Stateless. Owns merge logic, size limits, price snapshot. |
-| **Catalog Service** | Returns name, image, current price for each SKU. |
-| **Inventory Service** | Returns stock availability. Cart reads it; never writes to it. |
-| **Postgres** | Source of truth. Durable. Small (7 GB at 1M users). |
-| **Redis** | Fast cache for active carts. The icon read lives here. |
-| **Kafka** | Carries cart events to any team that wants them. |
-| **Abandoned cart, Analytics, Fraud** | Consumers. Not on the write path. If one dies, carts still work. |
-
-> **Take this with you.** If the abandoned-cart emailer dies at 3 a.m., new add-to-carts still flow. Emails just queue up. Anything reactive lives after Kafka, not before.
+| Component | Purpose |
+|-----------|---------|
+| API Gateway | Auth, cart_token cookie issuance, rate limiting per IP and user. |
+| Cart Service | Stateless. Owns merge logic, size limits, price snapshot, idempotency check. |
+| Catalog Service | Name, image, current price per SKU. Called on cart page load, in parallel with Inventory. |
+| Inventory Service | Stock availability. Cart reads it. Never writes to it. |
+| Postgres | Source of truth. Three tables: `carts`, `cart_items`, `carts_merged`. |
+| Redis | Fast cache for active carts. Icon read lives here (~5 MB for 25K active carts). |
+| Kafka | Carries cart events to downstream teams. Abandonment, analytics, fraud, order service. |
+| Order Service | Authoritative inventory reserve + payment. Cart does not clear until Order Service confirms. |
+| Analytics, Fraud, Emails | Downstream consumers. If any dies, cart adds and reads still work. |
 
 ---
 
-## Step 7: One add-to-cart, end to end
+## Walk: add to cart, end to end
 
-Alice adds a shoe. Watch what happens.
+Alice adds a shoe on her laptop.
 
 ```mermaid
 sequenceDiagram
@@ -416,132 +474,132 @@ sequenceDiagram
     participant R as Redis
     participant K as Kafka
 
-    Alice->>GW: POST /cart/items {sku: shoe-blue-42, qty: 1}
-    GW->>CS: forward (auth ok, idempotency checked)
-    CS->>Cat: price and name for shoe-blue-42?
-    CS->>Inv: is shoe-blue-42 available?
-    Note over CS,Inv: catalog and inventory called in parallel
-    Cat-->>CS: $50, Blue Runner Size 42
+    Alice->>GW: POST /cart/items {sku: shoe-blue-42, qty: 1}<br/>Idempotency-Key: f3a1-...
+    GW->>CS: forward (auth ok, key not seen before)
+    CS->>Cat: price + name for shoe-blue-42?
+    CS->>Inv: is shoe-blue-42 in stock?
+    Note over CS,Inv: parallel calls (~30 ms each)
+    Cat-->>CS: $79, Blue Runner Size 42
     Inv-->>CS: in stock
 
     rect rgb(241, 245, 249)
         Note over CS,DB: one transaction
         CS->>DB: INSERT cart_items ON CONFLICT DO UPDATE qty
-        CS->>DB: UPDATE carts SET item_count = item_count + 1
+        CS->>DB: UPDATE carts SET item_count = item_count + 1, updated_at = NOW()
         CS->>DB: COMMIT
     end
 
-    CS->>R: HSET cart:user:42 shoe-blue-42 {qty:1, price:5000}
-    CS->>K: emit cart.item.added
-    CS-->>GW: 201 Created
-    GW-->>Alice: 201 Created
+    CS->>R: HSET cart:user:42 shoe-blue-42 {qty:1, price:7900} (~2 ms)
+    CS->>K: emit cart.item.added (fire and forget)
+    CS-->>Alice: 201 Created (~80 ms total)
 ```
 
-Three details worth naming:
+Three details worth noting:
 
-1. Catalog and inventory are called **in parallel**. Total latency is `max(catalog, inventory)`, not the sum. Free speedup.
-2. The DB write and the `item_count` update are **one transaction**. Crashes mid-write roll back cleanly.
-3. Redis is written **after** the commit. If Redis fails, Postgres has the truth.
+1. Catalog and Inventory are called in parallel. Total latency is `max(catalog, inventory)`, not the sum.
+2. The DB write and the `item_count` update are one transaction. A crash mid-write rolls back cleanly.
+3. Redis is written after the commit. If Redis fails, Postgres has the truth and repopulates on the next read.
 
 ---
 
-## Step 8: Inventory check at checkout
+## Walk: cross-device sync
 
-The cart tells Alice a shoe is in stock when she adds it. Twenty minutes later she clicks Buy. The shoe is gone. Someone else took the last pair.
+Alice adds shoes on her laptop at 2 PM. She opens her phone at 3 PM.
 
-Three approaches. None is perfect.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Laptop as Alice's laptop
+    participant Phone as Alice's phone
+    participant CS as Cart Service
+    participant R as Redis
+    participant DB as Postgres
+
+    Laptop->>CS: POST /cart/items {sku: shoe-blue-42}
+    CS->>DB: INSERT cart_items, UPDATE item_count
+    CS->>R: HSET cart:user:42 shoe-blue-42 {qty:1}
+    CS-->>Laptop: 201 Created
+
+    Note over Phone: 1 hour later
+
+    Phone->>CS: GET /cart (Authorization: Bearer <token>)
+    CS->>R: HGETALL cart:user:42
+    R-->>CS: shoe-blue-42 {qty:1, price:7900} (~5 ms)
+    CS->>CS: hydrate with catalog names and live availability
+    CS-->>Phone: 200 {items: [{sku: shoe-blue-42, name: Blue Runner, qty: 1, price: $79}]}
+```
+
+The cart is keyed by `user_id`, not by device. Any device with a valid session token reads the same cart. No sync protocol needed.
+
+---
+
+## The hard sub-problem: inventory hold timing
+
+When a soft reservation is used (flagged SKUs like limited drops), the hold timer creates a cascading problem.
 
 ```mermaid
 flowchart TD
-    Add([Alice clicks Add to Cart]) --> A{Which approach?}
+    Add([Alice adds shoe to cart<br/>Inventory hold placed: 15 min]) --> T1{15 min pass<br/>without checkout}
+    T1 -- "Hold expires" --> Released["Inventory released<br/>Another buyer can take it"]:::ok
+    T1 -- "Alice checks out at 14:59" --> HoldActive{Hold still valid?}
+    HoldActive -- Yes --> Convert["Order Service converts hold to purchase"]:::ok
+    HoldActive -- "Race: hold just expired" --> SoldOut["Checkout fails: sold out<br/>Show error to Alice"]:::bad
 
-    A --> Opt["A. Optimistic<br/>Show last-known state.<br/>Re-check at checkout."]
-    A --> Res["B. Soft reservation<br/>Place a 15-min hold on add.<br/>Expire if cart abandoned."]
-    A --> None["C. No check<br/>Accept everything.<br/>Sort it out in the warehouse."]
+    Released --> AnotherBuyer["Bob adds shoe<br/>Gets a fresh 15-min hold"]:::ok
+    AnotherBuyer --> BobChecksOut["Bob checks out<br/>Hold converts to purchase"]:::ok
 
-    Opt --> OptBad["1-3% of checkouts<br/>hit sold-out surprise"]:::bad
-    Res --> ResBad["Ghost carts make hot items<br/>look sold out to real buyers"]:::bad
-    None --> NoneBad["'Sorry, cannot ship'<br/>emails destroy trust"]:::bad
-
+    classDef ok fill:#dcfce7,stroke:#15803d,color:#14532d
     classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
 ```
 
-<details markdown="1">
-<summary><b>Show: comparison table and recommendation</b></summary>
+The race at the bottom (hold just expired while checkout is in flight) is unavoidable. The mitigation is a grace window: the Order Service attempts the reserve even if the hold shows as expired within the last 30 seconds. If the inventory count still has availability, the purchase goes through.
 
-| Approach | Normal case | Failure mode | Cost to build | Right for |
-|----------|-------------|--------------|---------------|-----------|
-| **A. Optimistic** | Works. Checkout re-checks. | 1-3% of checkouts find the item gone last-second. | Low. | Default for most shops. |
-| **B. Soft reservation** | User never sees "sold out" mid-checkout. | Ghost carts hold inventory. Hot items show "sold out" to real buyers. | High. Inventory needs hold/release/expiry logic. | Concert tickets, limited sneaker drops. |
-| **C. No check** | Always accepts. | "Cannot ship, here is your refund." | Near zero. | Pre-orders, print-on-demand. |
+| Hold timer | Trade-off |
+|------------|-----------|
+| 5 minutes | Fewer ghost holds. More sold-out surprises at checkout. |
+| 15 minutes | Standard for limited drops. Significant ghost hold problem at high abandonment. |
+| 30 minutes | Feels safe for the user. Ghost holds lock out real buyers for half an hour. |
 
-**Recommendation: optimistic by default. Reservation only for explicitly flagged SKUs.**
+For most shops: skip holds entirely. Use optimistic inventory. Reserve only at checkout, inside the Order Service, as an atomic step with payment.
 
-Industry abandonment rates are 60-70%. If every add-to-cart held inventory for 15 minutes, ghost carts would make real inventory look empty. That is right for a Taylor Swift concert. Wrong for shoes.
-
-The division of responsibility:
-- **On add to cart:** read-only inventory check. Show the user what we believe. No writes.
-- **On cart page load:** re-read, cached for ~30 seconds.
-- **On checkout:** the Order Service does the authoritative `try_reserve(sku, qty)`. If it fails, no order and no charge.
-
-The cart's job is to show good information. The Order Service's job is to make the buy real.
-
-</details>
-
-> **Take this with you.** The cart shows what is probably true. The Order Service makes it actually true. Never conflate the two.
-
----
-
-## Step 9: Price drift
-
-Alice added shoe-blue-42 at $50 last Tuesday. Today the price is $55. She goes to checkout.
-
-What does she pay? What does she see?
-
-The rule most shops use:
-
-- Show the **current price** in the cart, with a small note: "was $50 when added."
-- Charge the current price at checkout.
-- If the difference passes a threshold (10% or $5, whichever is smaller), **require the user to confirm** before payment.
-
-Why confirm? EU consumer law requires it. And a silent $10 price bump on a $50 item is a bad surprise that generates chargebacks.
-
-The `snapshot_price_cents` column on `cart_items` stores what Alice saw when she added. The current price comes from the Catalog service on every read. The UI shows both. Analytics keeps both. The checkout confirmation captures both in the order record.
-
-> **Take this with you.** Snapshot price is for trust and audit. Current price is what gets charged. Show both.
+> **Take this with you.** Hold timers solve one problem (surprise at checkout) and create another (ghost holds blocking real buyers). Keep them short and scope them to SKUs that genuinely need them.
 
 ---
 
 ## Follow-up questions
 
-Try to answer each in 2 or 3 sentences before opening the solution.
+Try answering each in 2 or 3 sentences before opening the solution.
 
 1. **Bots stuff a cart with 10,000 items.** What goes wrong? How do you stop it?
 
 2. **Phone-to-laptop sync delay.** Alice adds a shoe on her phone. She opens her laptop 5 seconds later. The cart shows the old state. How long is acceptable? How do you fix it?
 
-3. **Redis goes down mid-day.** All active carts are in Redis. What does the user see? How do you recover quietly?
+3. **Redis goes down mid-day.** All active carts are cached in Redis. What does Alice see? How do you recover without losing any carts?
 
-4. **Price went up.** Alice added a shoe at $50 last week. Today it is $55. What does she pay? What does she see?
+4. **Price went up.** Alice added a shoe at $79 last week. Today it is $89. What does she pay? What does she see at checkout?
 
-5. **Abandoned cart emails.** You want to email shoppers 6 hours after their last activity. How do you find those carts without scanning every cart every minute?
+5. **Abandoned cart emails.** You want to email shoppers 6 hours after their last activity. How do you find those carts without scanning every active cart every minute?
 
-6. **Anonymous carts pile up.** When do you delete them? What happens if a user comes back after 90 days with the old cookie?
+6. **Anonymous carts pile up.** When do you delete them? What happens if a user returns after 90 days with the same old cookie?
 
-7. **Two people share an account.** Both log in from different cities. Both add items at the same time. What happens?
+7. **Two people share one account.** Both log in from different cities and add items at the same time. What happens?
 
-8. **Currency switch.** Alice adds a shoe priced in USD. She switches the site to EUR. What happens to her cart?
+8. **Currency switch.** Alice adds a shoe priced in USD. She switches the site to EUR. What happens to the snapshot price?
 
 9. **Item becomes restricted.** Alice added a legal item. A new regulation restricts shipping it to her state. She goes to checkout. What does the system do?
 
-10. **Save for later.** Alice wants to move an item from her cart to a wishlist. Is this the cart's job? Where does the wishlist live?
+10. **Save for later.** Alice wants to move an item from her cart to a wishlist. Is this the cart service's job? Where does the wishlist live?
+
+11. **Checkout race.** Two sessions for the same user both hit checkout within 100 ms of each other (browser tab dupe, mobile + desktop). What prevents a double order?
+
+12. **Cart grows to 200 items.** When do you enforce a size limit? Where does the limit live?
 
 ---
 
 ## Related problems
 
-- **[Approval Management (011)](../011-approval-management/question.md).** Same patterns: state per user, event stream on changes, audit table on merge. The `carts_merged` table is the same idea as the approval audit log.
-- **[Coupon Redemption (014)](../014-coupon-redemption/question.md).** The cart holds a coupon code. The coupon service decides if it is valid. Same service boundary as inventory.
+- **[Approval Management (011)](../011-approval-management/question.md).** Same patterns: state per user, event stream on changes, audit table on transitions.
+- **[Coupon Redemption (014)](../014-coupon-redemption/question.md).** The cart holds a coupon code. The coupon service decides validity. Same service boundary as inventory.
 - **[Read-Heavy System Patterns (017)](../017-read-heavy-patterns/question.md).** The cart icon read on every page is a classic read-heavy load. The Redis-plus-DB pattern applies directly.
-- **[Write-Heavy System Patterns (018)](../018-write-heavy-patterns/question.md).** The Kafka event stream for analytics is write-heavy at scale.
-- **[Help Desk Ticketing (019)](../019-helpdesk-ticketing/question.md).** "My cart is wrong" support tickets need the `carts_merged` audit table to answer.
+- **[Write-Heavy System Patterns (018)](../018-write-heavy-patterns/question.md).** The Kafka event stream for analytics is the write-heavy pattern at scale.
+- **[Help Desk Ticketing (019)](../019-helpdesk-ticketing/question.md).** "My cart is wrong after login" support tickets need the `carts_merged` audit table to answer.

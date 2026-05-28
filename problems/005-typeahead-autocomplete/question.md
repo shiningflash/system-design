@@ -7,110 +7,86 @@ difficulty: Medium
 solution: solution.md
 ---
 
-## The scene
+## What we are building
 
-You sit down. The interviewer pulls up the Google homepage and types one letter into the search box.
+Alice types "new yo" into the Google search box. Before she finishes, a dropdown appears: "new york weather", "new york times", "new yorker". She picks one and never types the last three letters.
 
-> *"See that dropdown? Ten suggestions, basically instant. Design the system that powers it."*
->
-> *"One constraint: if the suggestions show up after the user types the next letter, the box feels broken. It has to feel instant."*
+That dropdown is typeahead autocomplete. Every keystroke sends a request. The suggestions must appear before the next keystroke, so the budget is around 100ms end to end, including the network trip. At Google's scale that is 2 million such requests per second.
 
-That is the question. It sounds small. It is not.
+There are four hard problems hiding in this product:
 
-Three hard things stack on top of each other:
+1. **The 100ms budget.** A database query takes 5 to 50ms. With network overhead, a database alone cannot fit inside the budget. The lookup must come from memory.
+2. **Trie size at scale.** Storing the top 10 suggestions for every possible prefix takes roughly 90 GB. That does not fit on one machine.
+3. **Top-N ranking.** For the prefix "fa" there are thousands of matching queries. "facade" comes before "facebook" alphabetically. The system has to know that "facebook" should win.
+4. **Hot prefix handling.** The prefix "y" is typed by billions of users. At peak, one shard might see 400,000 requests per second.
 
-- Every keystroke is a request. A user typing "facebook" sends 8 requests. The whole world types a lot.
-- The answer has to come back in under 100ms. That includes the trip across the internet.
-- The suggestions need to be smart. Not alphabetical. For the prefix "fa", "facebook" has to beat "facade".
-
-We will start with the smallest thing that works for a tiny app, then add pressure one piece at a time.
+We will start with the smallest thing that works, then add pressure one layer at a time.
 
 ---
 
-## Step 1: Picture one request
+## The lifecycle of one keystroke
 
-Before any boxes, picture what one typeahead request actually is.
-
-Alice types "f". The box shows ten suggestions. She types "fa". The box updates instantly. She clicks "facebook". Done.
+Every suggestion request takes one of two paths: it hits a cache, or it falls through to the trie.
 
 ```mermaid
 stateDiagram-v2
     direction LR
     [*] --> Keystroke: Alice types a letter
-    Keystroke --> CacheHit: prefix is cached
+    Keystroke --> CacheHit: prefix cached at CDN or Redis
     Keystroke --> TrieLookup: cache miss
     CacheHit --> Suggestions: return top 10
     TrieLookup --> Suggestions: walk trie, return top 10
     Suggestions --> [*]: shown in < 100ms
 ```
 
-That is the whole product. Every letter triggers one of those two paths. Everything we add later (ranking, hot shards, edge caches, trending) is a refinement on top of this.
+A keystroke spends microseconds in the trie itself. Almost all of the 100ms budget is network. The design goal is to eliminate as many network hops as possible for the most common prefixes.
 
-> **Take this with you.** A typeahead is a ranked-prefix-lookup, served from memory, behind a cache. Speed is the whole design.
+> **Take this with you.** A typeahead is a ranked prefix lookup served from memory, behind a cache. Speed is the whole design.
 
 ---
 
-## Step 2: Ask the right questions
+## How big this gets
 
-In a real interview, sit for two minutes and write down what you want to ask. Not twenty questions. Five good ones.
+| Input | Tiny startup | Google scale |
+|-------|-------------|--------------|
+| Active users | 1,000 | 1 billion |
+| Searches per day | 10,000 | 5 billion |
+| Keystrokes per search | ~10 | ~10 |
+| Suggest requests per second (steady) | ~1 | ~580,000 |
+| Suggest requests per second (peak) | ~5 | ~2,000,000 |
+| Latency target P99 end-to-end | < 300ms | < 100ms |
 
 <details markdown="1">
-<summary><b>Show: 5 questions that change the design</b></summary>
+<summary><b>Show: the derived numbers at Google scale</b></summary>
 
-1. **How fast?** What is the latency budget per keystroke? Google's bar is 100ms end to end, including the network trip. *If the budget is 300ms you can use a database. Under 100ms the answer must already be in memory.*
-2. **How many users?** A typical answer for a global product is 5 billion searches per day. Each search is about 10 keystrokes. That is 50 billion suggest requests per day.
-3. **Personalized?** Should each user see their own suggestions, or does every user see the same list for the same prefix? *Personalization roughly doubles the system.*
-4. **How fresh?** If a celebrity trend starts right now, must it appear in 5 minutes? An hour? Tomorrow? *Hourly is easy. Sub-minute is genuinely hard.*
-5. **Typos?** Should "gogle" suggest "google"? *This is a separate layer on top of the trie.*
+| Metric | Value | How |
+|--------|-------|-----|
+| Requests per second, steady | ~580,000 | 5B × 10 / 86,400 |
+| Requests per second, peak | ~2,000,000 | ~3.5x steady |
+| Top 10 million queries cover | ~95% of traffic | Zipf distribution |
+| Trie memory for top 10M queries | ~90 GB | ~9 KB per query node chain |
+| Hot working set in Redis | ~5 GB | top prefixes per locale |
 
-The latency budget is the question that decides everything else. Without that number you could just use a database and go home.
+Three observations:
+
+1. The 95/5 split is what makes caching so powerful. Cache the answer for "y" once and a billion requests get it for free.
+2. At 580,000 requests per second, a database query averaging 10ms can serve at most 100 requests per second per core. This is why the lookup must come from memory.
+3. 90 GB does not fit on one machine with headroom for the OS and other processes. Sharding by first letter is the natural split.
 
 </details>
 
----
-
-## Step 3: How big is this thing?
-
-Same product, two very different scales.
-
-| Company | Users | Requests/second | Trie size | Cache needed |
-|---------|-------|-----------------|-----------|--------------|
-| Tiny startup | 1,000 | ~1 | A few MB | No |
-| Google | 1 billion | 580k steady, 2M peak | ~90 GB | Absolutely |
-
-<details markdown="1">
-<summary><b>Show: how the numbers come out</b></summary>
-
-**Tiny startup (1,000 users):**
-- 1,000 users x 10 searches/day x 10 keystrokes = 100,000 requests/day.
-- That is about 1 per second. Tiny. A single database handles it.
-
-**Google scale (1 billion users):**
-- 5 billion searches/day x 10 keystrokes = 50 billion suggest requests/day.
-- 50B / 86,400 = ~580,000 per second. Peak is 3x that: ~2 million per second.
-- The top 10 million queries cover 95% of all traffic (Zipf distribution).
-- Storing those 10 million queries in a trie, with the top 10 precomputed at every node, takes roughly **90 GB**.
-
-**What the math tells you:**
-
-At Google scale a database query takes 5 to 50ms. The budget for the whole round-trip is 100ms. That means the lookup itself has to be microseconds. Everything in the read path must be in memory.
-
-Also: the same handful of prefixes appear over and over. "y" is typed by billions of users. If you cache the answer for "y" once, billions of requests get it free. When 95% of traffic hits 5% of the data, your job is making sure that 95% never reaches the slow path.
-
-</details>
+> **Take this with you.** When 95% of traffic falls on 5% of prefixes, cache layering is not an optimization. It is the design.
 
 ---
 
-## Step 4: The smallest thing that works
+## The smallest version that works
 
-Forget Google. We are a tiny startup. One use case: search a product catalog of 50,000 items. 1,000 users. 1 request per second.
-
-Three boxes. Nothing else.
+Forget Google. A startup with 1,000 users searching a product catalog needs none of this complexity.
 
 ```mermaid
 flowchart LR
     A([Alice]):::user --> API[/"Suggest API"/]:::app
-    API --> DB[("Postgres<br/>pg_trgm index")]:::db
+    API --> DB[("Postgres\npg_trgm index")]:::db
     DB -.top 10.-> API
     API -.suggestions.-> A
 
@@ -119,20 +95,11 @@ flowchart LR
     classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
 ```
 
-One table, one GIN index on the text column. Lookups come back in 5 to 20ms. Good enough for 1,000 users.
+One table, one GIN index on the query column. Lookups come back in 5 to 20ms. One endpoint:
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Alice
-    participant API as Suggest API
-    participant DB as Postgres
-
-    Alice->>API: GET /suggest?q=face
-    API->>DB: SELECT ... WHERE query LIKE 'face%' LIMIT 10
-    DB-->>API: [facebook, facebook login, face id, ...]
-    API-->>Alice: top 10 suggestions
-```
+| Endpoint | What it does |
+|----------|--------------|
+| `GET /suggest?q=new+yo&locale=en-US` | Return the top 10 matching queries |
 
 <details markdown="1">
 <summary><b>Show: the Postgres query</b></summary>
@@ -147,128 +114,171 @@ SELECT query, score
  LIMIT 10;
 ```
 
-This works up to maybe 100,000 users. Above that, the 20ms latency starts to show on fast typers, and you have outgrown this approach.
+This works up to around 100,000 users. Above that, 20ms per query starts to show on fast typers.
 
 </details>
 
-> **Take this with you.** Always start from the smallest thing that works. The interesting part of the interview is what happens next.
+This is enough for the first few months. The interesting question is what breaks first as usage grows.
 
 ---
 
-## Step 5: The first crack
+## Decision 1: what data structure stores the prefixes?
 
-At 100,000 users, two things break at once:
+At 100,000 users the Postgres prefix query hits 50ms P99. That is already half the budget with no network time counted. The same handful of prefixes appear millions of times per day. Running the same query billions of times is wasteful.
 
-- The Postgres prefix query now takes 50ms P99. That is already half the budget, with network time not counted.
-- The same handful of prefixes ("y", "fa", "go") show up millions of times per day. You are running the same query billions of times.
+Two options:
 
-The fix for the second problem is obvious: **cache**. The fix for the first requires a different data structure.
+```mermaid
+flowchart TB
+    subgraph A["Option A: Hash map of every prefix"]
+        A1["f -> [facebook, fashion, fast food...]"]
+        A2["fa -> [facebook, fashion, face id...]"]
+        A3["fac -> [facebook, face id, face mask...]"]
+        A4["Problem: no shared storage. Each prefix<br/>stores its own copy. ~150 GB total."]:::bad
+    end
+    subgraph B["Option B: Trie with precomputed top-N"]
+        B1["Root -> f -> a -> c -> e -> b -> o -> o -> k"]
+        B2["Each node stores its own top 10 list."]
+        B3["Lookup: walk K letters, return saved list.<br/>Microseconds. No sorting at read time."]:::ok
+    end
 
-You need something that answers "what are the top 10 suggestions for prefix X" in microseconds, not milliseconds. The answer is a **trie**.
+    classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef ok fill:#dcfce7,stroke:#15803d,color:#14532d
+```
+
+The trie wins because it shares prefixes. "facebook", "fashion", and "fast food" all share the "f" and "fa" nodes. The critical trick: precompute the top 10 at every node during the build. A lookup for "fa" is just: walk root -> f -> a, return the saved list. No subtree traversal, no sorting, constant time.
+
+Without precomputing top-N, a lookup for "f" would require walking millions of child nodes, collecting every query, sorting by score, then taking the top 10. That takes seconds.
 
 ```mermaid
 flowchart LR
-    subgraph Trie["Trie node for 'fa'"]
-        N["fa\ntop_10: [facebook, fashion,\nfast food, face id, ...]"]
+    subgraph Node["Trie node at 'fa'"]
+        N1["children: {c: ..., s: ..., t: ...}"]
+        N2["top_10: [facebook, fashion, fast food,\nface id, fasting, facade, facts, ...]"]
     end
-    subgraph Walk["To look up 'fa'"]
-        W1[start at root] --> W2[follow 'f'] --> W3[follow 'a'] --> W4[return top_10]
+    subgraph Build["How it gets there"]
+        B1["Build inserts every query"] --> B2["Propagate upward:<br/>each node collects top 10<br/>from all children"]
     end
 ```
 
-Walking to a node takes microseconds, no matter how many queries are in the trie. That is the whole trick.
+Build is slow (30 minutes on a Spark cluster). Reads are constant time. That trade is worth it when reads outnumber builds by a billion to one.
 
-<details markdown="1">
-<summary><b>Show: why the trie beats a hash map</b></summary>
-
-A hash map stores every prefix pointing to its top 10 list: `"f" -> [...]`, `"fa" -> [...]`, `"fac" -> [...]`. It works but does not share anything. Every prefix stores its own copy. For 100 million queries, that grows to about 150 GB.
-
-A trie shares prefixes. "facebook", "fashion", and "fast food" all share the "f" and "fa" nodes. Memory drops to about 90 GB.
-
-The deeper trick: the trie stores the **top 10 precomputed at every node**. So a lookup for "fa" is just: walk root -> f -> a, return the saved list. No subtree traversal. No sorting. Constant time.
-
-Without precomputing the top 10 at every node, a lookup for "f" would require walking millions of child nodes, collecting every query, sorting by score, then taking the top 10. That would take seconds.
-
-We trade build-time work (compute the top 10 at every node when building the trie) for read-time speed (constant lookup forever after). Builds happen once a day. Reads happen 2 million times per second. That is the right trade.
-
-</details>
-
-> **Take this with you.** Precomputing the top 10 at every node is the central trick. Build is slow. Read is constant. That trade is worth it when reads outnumber builds by a billion to one.
+> **Take this with you.** Precomputing the top 10 at every node is the central trick. The trie does not search at read time. It returns a pre-built list.
 
 ---
 
-## Step 6: Build the architecture, one layer at a time
+## Decision 2: where does the trie live?
 
-We have a trie that answers lookups in microseconds. Now build the system around it.
-
-### v1: just the trie
+The trie is 90 GB. Two options:
 
 ```mermaid
 flowchart TB
-    A([Alice]):::user --> API["Suggest API<br/>(stateless)"]:::app
-    API --> T["Trie Service<br/>(in-memory, sharded by first letter)"]:::app
+    subgraph A["Option A: One machine"]
+        A1["Single 128 GB machine"]
+        A2["Problem: one machine handles 580K req/s at peak.<br/>CPU melts. Single point of failure."]:::bad
+    end
+    subgraph B["Option B: Shard by first letter"]
+        B1["'f' shard: facebook, fashion, face..."]
+        B2["'y' shard: youtube, yahoo, yelp..."]
+        B3["'n' shard: netflix, new york, nba..."]
+        B4["~26 primary shards, 3 replicas each.<br/>Hot letters get more replicas."]:::ok
+    end
 
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef ok fill:#dcfce7,stroke:#15803d,color:#14532d
 ```
 
-This is fine for a few thousand users.
+Sharding by first letter is natural: the Suggest API reads the first character of the prefix and routes to the right shard. Each shard holds roughly 3 to 5 GB of trie data and handles a fraction of total traffic.
 
-### v2: the same prefix gets asked a million times a day
+The "y" shard is still hot because "youtube" and "yahoo" dominate. The fix is more replicas for hot shards, not a different sharding scheme. We will revisit this in the hot prefix section.
 
-Add a regional Redis cache in front of the trie. "youtube" is typed by millions of users. Cache the result once.
+> **Take this with you.** Shard by first letter. Each shard is an in-memory trie that handles one slice of the prefix space. Hot letters get more replicas.
+
+---
+
+## Decision 3: how do we keep the trie fresh?
+
+The trie is built once per day from 90 days of search logs. Two problems:
+
+1. Building takes 30 to 45 minutes. We cannot mutate the live trie while building.
+2. A celebrity trend starts at 2 PM. The daily rebuild ran at midnight. Users expect it to appear within minutes, not tomorrow.
 
 ```mermaid
 flowchart TB
-    A([Alice]):::user --> API["Suggest API"]:::app
-    API --> Cache[("Regional Redis<br/>TTL 60s")]:::cache
-    Cache -.miss.-> T["Trie Service"]:::app
+    subgraph Daily["Daily full rebuild"]
+        L[("Query logs\n90 days")] --> Spark["Spark job\n30-45 min"]
+        Spark --> S3[("S3: versioned\ntrie snapshots")]
+        S3 -.pull new version.-> T["Trie Service shards"]
+        T --> Swap["Atomic pointer swap\n(validate first, then swap)"]
+    end
+    subgraph Delta["Delta pipeline: every 5 min"]
+        K{{"Kafka\nlast 1 hour"}} --> Trend["Trending scorer\nvelocity threshold"]
+        Trend --> DL["Delta file in S3\n(thousands of entries)"]
+        DL -.merge at lookup.-> T
+    end
 
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
     classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+    class L,S3 db
+    class Spark,Trend,T db
+    class K queue
 ```
 
-### v3: users in Paris, Tokyo, and São Paulo
+The atomic swap: the Trie Service downloads the new snapshot in the background, validates it (size sanity check, spot-check popular prefixes, confirm at least 90% of yesterday's top suggestions are still present), then swaps a pointer in one CPU instruction. Readers see either the old or new trie, never a mix.
 
-The network trip from Paris to your US data center is 80ms. That is the whole budget. Add a CDN at the edge. Popular prefixes like "y" and "fa" never leave the edge server.
+The delta layer is tiny (a few thousand entries) and adds about 1 microsecond per lookup.
 
-```mermaid
-flowchart TB
-    A([Alice]):::user --> CDN["CDN<br/>(edge cache, TTL 60-600s)"]:::edge
-    CDN -.miss.-> LB["Load Balancer"]:::edge
-    LB --> API["Suggest API<br/>(stateless pods)"]:::app
-    API --> Cache[("Regional Redis")]:::cache
-    Cache -.miss.-> T["Trie Service"]:::app
+> **Take this with you.** Never mutate the live trie. Build offline, validate, swap atomically. Delta handles freshness in between.
 
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
-```
+---
 
-### v4: where does the trie come from?
+## Decision 4: how do we rank the suggestions?
 
-The trie is built offline from search logs. Add the build pipeline and object storage for the trie snapshots.
+For "fa" there are thousands of matching queries. Which ten appear?
+
+Alphabetical order is wrong. "facade" beats "facebook" alphabetically. Frequency alone is wrong. "facebook ipo 2012" has more lifetime searches than "facebook layoffs 2026" but not right now.
+
+Six signals feed the score:
+
+| Signal | What it captures |
+|--------|-----------------|
+| Total frequency | Lifetime search volume. The baseline. |
+| Recent frequency | Last 7 days weighted more than last 90. "facebook layoffs 2026" beats "facebook ipo 2012" today. |
+| Click-through rate | When shown, did users click it? High CTR = genuinely useful. |
+| Trending velocity | Spike in the last hour. Catches breaking news before the daily rebuild. |
+| Personalization | Queries the user has searched before get a boost (logged-in users only). |
+| Safety penalty | Harmful queries are dropped or demoted. |
+
+The trie stores the **global** top 10 at each node. Personalization happens at the Suggest API, not inside the trie. Storing a personalized trie per user would mean billions of tries at 3 GB each, which is not feasible. Instead, the API fetches the user's top-100 recent queries (5 KB per user in Redis), boosts any prefix matches, re-ranks, and returns the top 10.
+
+> **Take this with you.** Ranking is half the product. A trie with bad ranking gives alphabetical suggestions and a useless box.
+
+---
+
+## The full architecture
+
+Putting the four decisions together:
 
 ```mermaid
 flowchart TB
     subgraph Edge["Client edge"]
         A([Web / Mobile]):::user
-        CDN["CDN<br/>(~80% hit rate)"]:::edge
+        CDN["CDN\n(~80% hit rate, TTL 60-600s)"]:::edge
     end
 
-    subgraph ReadPath["Read path"]
-        LB["Load Balancer"]:::edge
-        API["Suggest API<br/>(stateless)"]:::app
-        Cache[("Regional Redis<br/>(~15% hit rate)")]:::cache
-        T["Trie Service<br/>(sharded by first letter,<br/>3 replicas each)"]:::app
+    subgraph ReadPath["Read path (per region)"]
+        LB["Load Balancer\n(anycast, nearest region)"]:::edge
+        API["Suggest API\n(stateless pods)"]:::app
+        Cache[("Regional Redis\n(~15% hit rate, TTL 60s)")]:::cache
+        T["Trie Service\n(sharded by first letter,\n3-10 replicas per shard)"]:::app
+        P[("Personalization\nRedis\n(user history, 5 KB/user)")]:::cache
     end
 
-    subgraph Build["Build path (offline)"]
-        Logs[("Query Logs<br/>S3 Parquet")]:::db
-        Builder["Trie Builder<br/>(Spark, daily)"]:::app
-        Store[("Object Storage<br/>S3 trie snapshots")  ]:::db
+    subgraph BuildPath["Build path (offline, global)"]
+        Logs[("Query Logs\nS3 Parquet, 30d hot")]:::db
+        Builder["Trie Builder\n(Spark, daily + 5-min delta)"]:::app
+        Store[("Object Storage\nS3 trie snapshots,\nversioned per locale/shard)"]:::db
     end
 
     A --> CDN
@@ -276,9 +286,10 @@ flowchart TB
     LB --> API
     API --> Cache
     Cache -.miss.-> T
+    API -.logged-in.-> P
     T -.pulls new version.-> Store
-    Builder --> Store
     Logs --> Builder
+    Builder --> Store
 
     classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
     classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
@@ -287,25 +298,25 @@ flowchart TB
     classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
 ```
 
-Each box, in one line:
+Each component in one line:
 
-| Box | What it does |
-|-----|--------------|
-| **CDN** | Caches responses for popular prefixes close to the user. Absorbs ~80% of traffic. |
-| **Suggest API** | Stateless. Routes by region, handles personalization, picks the right trie shard. |
-| **Regional Redis** | Warm cache for prefixes that miss the CDN but are still common in the region. |
-| **Trie Service** | The lookup. In-memory trie, sharded by first letter, 3 replicas per shard. |
-| **Trie Builder** | Spark job. Reads search logs, scores queries, builds trie files, uploads to S3. |
-| **Object Storage** | Holds versioned trie snapshot files. Trie Service downloads new versions from here. |
-| **Query Logs** | Every past search. Parquet files in S3. 30 days hot, 5 years cold. |
-
-> **Take this with you.** CDN hits ~80%. Redis hits ~15%. The trie sees the remaining 5%. Without that layering, the trie would melt under load.
+| Component | Purpose |
+|-----------|---------|
+| CDN | Caches responses for popular prefixes at the edge. Absorbs ~80% of traffic. |
+| Load Balancer | Anycast routes to nearest region. |
+| Suggest API | Stateless. Routes to the right trie shard, blends personalization, enforces safety blacklist. |
+| Regional Redis | Hot cache for prefixes that miss the CDN but are still common per region. ~15% hit rate. |
+| Trie Service | In-memory trie sharded by first letter. 3 to 10 replicas per shard. Read-only at runtime. |
+| Personalization Redis | Per-user top-100 recent queries. 5 KB per user. Used to boost personal results. |
+| Trie Builder | Spark job. Reads logs, scores queries, builds trie files, uploads to S3. |
+| Object Storage | Versioned trie snapshot files. Trie Service downloads new versions from here. |
+| Query Logs | Every past search. Parquet files in S3. 30 days hot, 5 years cold. |
 
 ---
 
-## Step 7: One keystroke, all the way through
+## Walk: one keystroke, end to end
 
-Alice is in London. She types "fac" into the Google search box. Watch what happens.
+Alice is in London. She types "new yo" into the search box. The sixth keystroke sends a request.
 
 ```mermaid
 sequenceDiagram
@@ -314,124 +325,81 @@ sequenceDiagram
     participant CDN as CDN (London edge)
     participant API as Suggest API
     participant R as Regional Redis
-    participant T as Trie shard (f)
+    participant T as Trie shard (n)
+    participant P as Personalization Redis
 
-    Alice->>CDN: GET /suggest?q=fac&locale=en-GB
-    CDN->>API: cache miss for "fac"
-    API->>R: GET prefix:fac:en-GB
-    R-->>API: miss
-
-    rect rgb(241, 245, 249)
-        Note over API,T: trie lookup (microseconds)
-        API->>T: lookup("fac", locale=en-GB)
-        T-->>API: top 10 global suggestions
+    Note over Alice: types "new yo"
+    Alice->>CDN: GET /suggest?q=new+yo&locale=en-GB (~2ms to edge)
+    alt CDN hit (~80%)
+        CDN-->>Alice: top 10 suggestions (~10ms total)
+    else CDN miss (~20%)
+        CDN->>API: forward (already ~15ms spent)
+        API->>R: GET prefix:new+yo:en-GB
+        alt Redis hit (~15% of total)
+            R-->>API: top 10 (~3ms)
+        else Redis miss (~5% of total)
+            rect rgb(241, 245, 249)
+                Note over API,T: trie lookup (microseconds)
+                API->>T: lookup("new yo", locale=en-GB)
+                T-->>API: global top 10
+            end
+            API->>P: user history for "new"
+            P-->>API: 0 personal matches
+            API->>R: SET prefix:new+yo:en-GB (TTL 60s + jitter)
+        end
+        API-->>CDN: top 10 + Cache-Control: public, max-age=60
+        CDN-->>Alice: top 10 suggestions (~50-80ms total)
     end
-
-    API->>R: SET prefix:fac:en-GB (TTL 60s)
-    API-->>CDN: top 10 + Cache-Control headers
-    CDN-->>Alice: top 10 suggestions
 ```
 
-Three things worth pointing out:
+Target latencies:
 
-1. The trie lookup itself takes microseconds. The 50-80ms P99 is almost entirely network round-trips.
-2. The result is stored in Redis after the first miss. The next user who types "fac" in the same region gets the cached answer.
-3. CDN caches the result too, with `Cache-Control: public, max-age=60`. The user after that gets it at the edge.
+| Path | P99 |
+|------|-----|
+| CDN hit (~80% of requests) | ~10ms |
+| Regional Redis hit (~15%) | ~30ms |
+| Trie Service hit (~5%) | ~50-80ms |
+| End-to-end budget | 100ms |
+
+The trie lookup itself takes 50 microseconds. The 50ms for the slow path is almost entirely TCP and TLS. Getting fast means getting closer to the user, not making the trie faster.
 
 ---
 
-## Step 8: How do you rank the suggestions?
+## The hot prefix problem
 
-For the prefix "fa" there are thousands of matching queries. Which ten win?
-
-Alphabetical order is wrong. "facade" would beat "facebook". You need a score.
-
-<details markdown="1">
-<summary><b>Show: the ranking signals</b></summary>
-
-Six signals, in rough order of importance:
-
-1. **Total frequency.** How often this query has been searched, ever. The baseline.
-2. **Recent frequency.** Searches from the last 7 days count more than searches from 90 days ago. This is why "facebook layoffs 2026" can beat "facebook ipo 2012" today even if the older query has more lifetime clicks.
-3. **Click-through rate.** When this suggestion was shown, did users click it? High CTR means the suggestion is genuinely useful.
-4. **Trending.** A sudden spike in the last hour. Catches breaking news before the daily rebuild captures it.
-5. **Personalization.** Queries the user has searched before get a boost, for logged-in users only.
-6. **Safety.** Hateful or banned queries get dropped or pushed to the bottom.
-
-A simple weighted formula:
-
-```
-score = w1 * log(total_frequency)
-      + w2 * recent_frequency
-      + w3 * click_through_rate
-      + w4 * trending_score
-      + w5 * personalization_match
-      - w6 * safety_penalty
-```
-
-The trie stores the **global** top 10 at each node. Personalization happens at the Suggest API layer, not inside the trie. Storing a personalized trie per user would mean billions of tries, each ~3 GB. Impossible. Instead, the trie gives you the global best 10, and the API boosts any matches from the user's recent history.
-
-</details>
-
-> **Take this with you.** Ranking is half the product. A trie with bad ranking gives alphabetical suggestions and a useless box.
-
----
-
-## Step 9: How do you build the trie?
-
-The trie does not appear by magic. A Spark job builds it from 90 days of search logs. Then the Trie Service swaps in the new version without downtime.
-
-<details markdown="1">
-<summary><b>Show: the build pipeline and atomic swap</b></summary>
-
-**The build (runs daily at 00:00 UTC):**
+The prefix "y" is typed by hundreds of millions of users per day. At 2 million requests per second fleet-wide, the "y" shard alone might receive 400,000 requests per second. Other shards are fine. This one is on fire.
 
 ```mermaid
-flowchart LR
-    A[("Query logs<br/>last 90 days")] --> B["Filter + clean<br/>(drop bots, PII,<br/>too short or long)"]
-    B --> C["Aggregate<br/>(count by query + locale,<br/>compute CTR)"]
-    C --> D["Score<br/>(apply ranking formula,<br/>safety filter)"]
-    D --> E["Build trie<br/>(insert every query,<br/>then propagate top 10<br/>up to every node)"]
-    E --> F["Shard by first letter"]
-    F --> G[("Upload to S3<br/>versioned files")]
+flowchart TD
+    Start([400K req/s for prefix 'y']) --> CDN{"CDN hit?"}
+    CDN -->|"~95% for single-letter prefixes\n(10-min TTL)"| OK1["302 from edge\n~20K req/s reach origin"]:::ok
+    CDN -->|"5% miss"| InProc{"In-process\nLRU hit?"}
+    InProc -->|"~70% of misses"| OK2["serve from pod memory\n~6K req/s reach Redis"]:::ok
+    InProc -->|"30% miss"| Replica{"Redis hit?"}
+    Replica -->|"~90%"| OK3["serve from Redis\n~600 req/s reach trie"]:::ok
+    Replica -->|"10% miss"| Shards["10 'y' shard replicas\n~60 req/s per replica"]:::ok
 
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-    class A,G db
+    classDef ok fill:#dcfce7,stroke:#15803d,color:#14532d
 ```
 
-**The atomic swap:**
+Four fixes, used together:
 
-1. Trie Service shards poll S3 for new versions every minute.
-2. When a new version appears, the shard downloads it in the background.
-3. The shard validates: size is sane, popular prefixes still look right, at least 90% of last version's top-10 prefixes are still present.
-4. If validation passes, the shard swaps a pointer in one CPU instruction. Old trie becomes new trie atomically.
-5. Reads in flight see either the old or new trie. Never a mix.
-6. The old trie is freed after a short grace period.
+1. **Aggressive CDN TTL for short prefixes.** "y" returns nearly the same answer for 10 minutes. Cache it that long at the edge. 400,000 per second drops to ~20,000 at origin.
+2. **In-process LRU on the Suggest API.** Each pod keeps a small LRU (1,000 entries, 10-second TTL). Absorbs flash spikes before they hit Redis.
+3. **More replicas for hot shards.** The "y" shard gets 10 replicas instead of 3.
+4. **Finer sharding.** Split the "y" shard into "ya", "ye", "yi", "yo", "yu". Five shards share the load.
 
-**What about trending queries between builds?**
+Cache layer math at 2M peak requests per second:
 
-A celebrity passes away at 2:00 PM. The daily rebuild ran at 00:45 AM. You do not want to wait until tomorrow.
+| Layer | Hit rate | Requests absorbed |
+|-------|----------|------------------|
+| CDN | ~80% | 1,600,000/s |
+| Regional Redis | ~15% | 300,000/s |
+| Trie Service | ~5% | ~100,000/s across ~150 shards |
 
-A **delta pipeline** runs every 5 to 15 minutes. It reads the last hour of logs from Kafka (not S3, too slow), finds queries with trending velocity above threshold, and writes a small delta file. Trie Service shards load the delta and merge it into results at lookup time. The delta layer is tiny, a few thousand entries at most.
+100,000 requests per second across 150 shards is ~700 per shard. A 16 GB machine handles tens of thousands per second. Without caching, the trie alone would need to absorb 2,000,000 per second.
 
-</details>
-
-> **Take this with you.** Never mutate a live trie. Build offline, validate, then swap atomically. The delta pipeline handles freshness in between.
-
----
-
-## Step 10: The hot shard problem
-
-The trie is sharded by first letter. The "y" shard handles "youtube" and "yahoo". The "f" shard handles "facebook". Both are enormous.
-
-At 2 million requests per second, the "y" shard alone might see 400,000 requests per second. Four fixes, used together:
-
-1. **Aggressive CDN caching for single-letter prefixes.** "y" returns nearly the same answer every time and changes slowly. Cache it for 10 minutes at the edge. Now 400,000 per second drops to ~5,000 reaching your origin.
-2. **More replicas for hot shards.** The "y" shard gets 10 replicas instead of 3.
-3. **In-process LRU on the Suggest API.** Each pod keeps a small LRU (1,000 entries, 10-second TTL). Absorbs flash spikes before they reach Redis.
-4. **Finer sharding for hot letters.** Split the "y" shard into "ya", "ye", "yi", "yo", "yu". Five shards share the load.
-
-> **Take this with you.** Hot shard problems appear in every sharded system. The fix is always the same: cache higher up, add replicas, split the hot key.
+> **Take this with you.** Hot shard problems appear in every sharded system. The fix is always: cache higher up, add replicas, split the hot key.
 
 ---
 
@@ -439,9 +407,9 @@ At 2 million requests per second, the "y" shard alone might see 400,000 requests
 
 Try answering each in 2 or 3 sentences before opening the solution.
 
-1. **Typos.** A user types "facbook" instead of "facebook". The trie returns nothing because "facb" has no children. How do you still suggest "facebook"?
+1. **Typos.** Alice types "facbook" instead of "facebook". The trie returns nothing because "facb" has no children. How do you still suggest "facebook"?
 
-2. **Sub-minute trending.** A celebrity passes away at 2:00 PM. By 2:05 PM the world is searching their name. The daily rebuild ran at 00:45 AM. How quickly can you make their name appear as a suggestion?
+2. **Sub-minute trending.** A celebrity passes away at 2:00 PM. By 2:05 PM the world is searching their name. The daily rebuild ran at midnight. How quickly can you make their name appear as a suggestion?
 
 3. **Hot shard failure.** The "y" shard loses one of its three replicas. What happens? How do you protect against a cascade?
 
@@ -449,7 +417,7 @@ Try answering each in 2 or 3 sentences before opening the solution.
 
 5. **Bad suggestion goes live.** The trie shows something hateful for the prefix "j". The safety filter missed it. How do you remove it within 5 minutes globally?
 
-6. **Multilingual user.** A French user sometimes searches in English. When they type "b", they want French suggestions but also want French-language "BBC" to appear. How do you mix two language tries?
+6. **Multilingual user.** A French user sometimes searches in English. When they type "b", they want French suggestions but also want "BBC" to appear. How do you mix two language tries?
 
 7. **Brand new query.** A new query starts trending but is not in the trie yet. Without waiting for tomorrow's rebuild, how do you make it appear?
 
@@ -465,7 +433,7 @@ Try answering each in 2 or 3 sentences before opening the solution.
 
 13. **Mobile clients.** Mobile networks add 100 to 300ms of latency on their own. The 100ms budget is gone before the request reaches your data center. What can you do?
 
-14. **Bot traffic.** A bot sends 100,000 requests per second for nonsense prefixes. It does not affect user latency directly, but it is polluting your query logs and skewing rankings. How do you detect and filter it?
+14. **Bot traffic.** A bot sends 100,000 requests per second for nonsense prefixes. It pollutes your query logs and skews rankings. How do you detect and filter it?
 
 15. **A/B testing ranking.** Product wants to test a new ranking formula on 1% of users. How do you do this without rebuilding two whole tries?
 

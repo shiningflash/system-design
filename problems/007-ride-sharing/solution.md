@@ -1,30 +1,26 @@
 ## Solution: Design Uber / Lyft (Ride Sharing)
 
-### The short version
+### What this system is
 
-Ride sharing is three problems wearing the same coat.
+Ride sharing is three problems in one. A real-time location index that tracks ~1M moving drivers at 475,000+ pings per second. A matching pipeline that turns a rider's tap into an assigned driver in under 2 seconds. A ride state machine that survives 20-25 minutes of dropped connections, retries, and backgrounded apps without charging anyone for a ride that never happened.
 
-First, a **map index** that tracks ~1M moving drivers in real time, with 475,000+ location pings per second. Second, a **matching pipeline** that turns a rider's tap into an assigned driver in under 2 seconds. Third, a **ride state machine** that survives 15-25 minutes of cancellations, dropped packets, and backgrounded apps without charging anyone for a ride that never happened.
+The architecture splits cleanly along those three concerns. Location pings flow through a stateful Driver Gateway into a Redis cluster keyed by H3 hexagonal cells, overwrite-in-place, never queried for history. The Matching Service is stateless: it reads from the Redis index, applies filters, scores candidates by real road-network ETA from a separate Routing Service. Ride records live in Postgres sharded by city, with on-trip path history streamed to Kafka and S3 for fraud and dispute resolution.
 
-The design splits cleanly. Location pings flow through a stateful Driver Gateway into a Redis cluster keyed by H3 hexagonal cells. That index is overwrite-in-place. We never query it for history. The Matching Service is stateless: it reads from the Redis index, applies filters, scores candidates using real road-network ETAs from a separate Routing Service. Ride records live in Postgres sharded by city, with per-trip path history streamed to Kafka and S3 for fraud and dispute resolution.
-
-The interesting work is in the seams. The Driver Gateway must be stateful (it holds a WebSocket per driver), which makes deploys harder. The matching service can be greedy or batched. Batched gives 5-15% better global ETA but adds a 500ms hold. The state machine has cancellation, no-show, and reconnect transitions that must all be idempotent because a flaky network delivers every event at least twice.
+The interesting work is in the seams. The Driver Gateway must be stateful (it holds a WebSocket per driver), which makes deploys harder. The state machine has cancellation, no-show, and reconnect transitions that all must be idempotent because a flaky network delivers every event at least twice.
 
 ---
 
 ### 1. The two questions that matter most
 
-If you only get to ask two clarifying questions, ask these.
+**What is in scope?** Matching only, or also payments, surge, ETA prediction, in-ride chat, driver onboarding? A reasonable slice: rider requests, system finds a driver, both sides see live updates until pickup, mention surge briefly, skip payments. Without scoping this first, you can spend the whole interview designing a payments system.
 
-**What is in scope?** Matching only, or also payments, surge, ETA prediction, in-ride chat, driver onboarding? A reasonable slice: rider requests, system finds a driver, both sides see live updates until pickup, mention surge briefly, skip payments. Without scoping this first, you spend the interview designing a payments system.
-
-**How big is the hottest single city?** Uber global has ~1M online drivers at peak, but the single-city number shapes one shard. NYC can have 50,000 online drivers on a busy Friday night. That number is the shard size target and it answers whether Postgres with PostGIS (fine for a small city) or Redis with H3 cells (required for NYC at peak) is the right location store.
+**How big is the hottest single city?** Uber global has ~1M online drivers at peak, but the single-city number shapes one shard. NYC can have 50,000 online drivers on a busy Friday night. That number is the shard size target and it determines whether Postgres with PostGIS (fine for 500 drivers) or Redis with H3 cells (required for NYC at peak) is the right location store.
 
 Everything else follows from those two answers.
 
 ---
 
-### 2. The math, in plain numbers
+### 2. The math
 
 | Metric | Value |
 |--------|-------|
@@ -33,8 +29,8 @@ Everything else follows from those two answers.
 | Location pings/sec, sustained | ~475,000 |
 | Location pings/sec, peak | ~1,000,000 |
 | Active trips globally at any moment | ~1,000,000 |
-| Active trips, top city (NYC) at peak | 50,000 to 100,000 |
-| Durable trip-path storage per day | ~2 TB compressed |
+| Active trips, NYC at peak | 50,000 to 100,000 |
+| Durable trip-path storage per day | ~2 TB (on-trip only, compressed) |
 | Current-location storage (all online drivers) | ~200 MB |
 
 The most important observation: location ingest dwarfs every other workload by a factor of 50. Keep it on its own infrastructure so it does not bleed into matching latency or trip-state writes.
@@ -52,7 +48,7 @@ Idempotency-Key: <uuid>
 
 {
   "pickup":  { "lat": 40.7580, "lng": -73.9855, "address": "Times Sq" },
-  "dropoff": { "lat": 40.7411, "lng": -74.0048, "address": "Chelsea" },
+  "dropoff": { "lat": 40.6413, "lng": -73.7781, "address": "JFK Airport" },
   "vehicle_class": "uberx",
   "payment_method_id": "pm_abc"
 }
@@ -62,16 +58,18 @@ Idempotency-Key: <uuid>
 |--------|---------|
 | **202 Accepted** | Ride created in `requested` state. Matching in progress. |
 | **200 OK** | Idempotency replay. Same ride returned. |
-| **400 Bad Request** | Bad input. Pickup outside service area. |
+| **400 Bad Request** | Bad input or pickup outside service area. |
 | **402 Payment Required** | Payment method invalid or expired. |
 | **409 Conflict** | Rider already has an active ride. |
 | **503 Service Unavailable** | No drivers found after timeout. |
 
 Small but load-bearing choices:
 
-- **202, not 201.** The ride exists but is not yet matched. The client subscribes to a WebSocket channel for state updates. Do not return 201; the resource is not complete yet.
-- **Idempotency-Key is required.** Mobile retries on timeout. Without it, you bill people twice. The server stores `(idempotency_key, ride_id)` for 24 hours.
-- **The fare is a range.** `fare_min` and `fare_max`. Final fare depends on actual trip time and any waiting time.
+| Choice | Reason |
+|--------|--------|
+| 202, not 201 | The ride exists but is not yet matched. The resource is not complete. |
+| Idempotency-Key required | Mobile retries on timeout. Without it, retries create duplicate rides and double charges. |
+| Fare is a range | `fare_min` and `fare_max`. Final fare depends on actual trip time and any waiting time. |
 
 **Driver accepts.**
 
@@ -79,7 +77,7 @@ Small but load-bearing choices:
 POST /api/v1/rides/{ride_id}/accept
 Authorization: Bearer <driver_token>
 
-{ "driver_eta_seconds": 180 }
+{ "driver_eta_seconds": 240 }
 ```
 
 | Status | Meaning |
@@ -88,7 +86,7 @@ Authorization: Bearer <driver_token>
 | **409 Conflict** | Already accepted by another driver, or wrong state. |
 | **410 Gone** | Rider cancelled or offer timed out. |
 
-**Location pings (driver side).** Not REST. Sent over the persistent WebSocket as a compact binary frame. About 46 bytes vs ~200 bytes for the JSON equivalent. At 475,000 pings/sec, the bandwidth savings are material.
+**Location pings (driver side).** Not REST. Sent over the persistent WebSocket as a compact binary frame, about 46 bytes vs ~200 bytes for JSON. At 475,000 pings/sec, the bandwidth saving is material.
 
 ---
 
@@ -123,6 +121,7 @@ erDiagram
         timestamptz requested_at
         timestamptz matched_at
         uuid idempotency_key
+        numeric surge_mult
     }
     ride_events {
         bigint event_id
@@ -138,12 +137,12 @@ erDiagram
 
 ```sql
 CREATE TABLE rides (
-    ride_id          BIGINT PRIMARY KEY,        -- Snowflake-style ID
+    ride_id          BIGINT PRIMARY KEY,
     rider_id         BIGINT NOT NULL,
-    driver_id        BIGINT,                    -- NULL until matched
-    city_id          INT NOT NULL,              -- shard key
-    state            SMALLINT NOT NULL,         -- 1=requested, 2=matched, 3=driver_arriving,
-                                               --   4=in_progress, 5=completed, 6=cancelled, 7=no_show
+    driver_id        BIGINT,
+    city_id          INT NOT NULL,
+    state            SMALLINT NOT NULL,      -- 1=requested 2=matched 3=driver_arriving
+                                            --   4=in_progress 5=completed 6=cancelled 7=no_show
     pickup_lat       DOUBLE PRECISION NOT NULL,
     pickup_lng       DOUBLE PRECISION NOT NULL,
     dropoff_lat      DOUBLE PRECISION NOT NULL,
@@ -160,7 +159,6 @@ CREATE TABLE rides (
     idempotency_key  UUID
 );
 
--- Partial indexes keep these small after rides complete.
 CREATE UNIQUE INDEX idx_idempotency ON rides (rider_id, idempotency_key);
 CREATE INDEX idx_rider_active  ON rides (rider_id)  WHERE state IN (1,2,3,4);
 CREATE INDEX idx_driver_active ON rides (driver_id) WHERE state IN (3,4);
@@ -175,36 +173,36 @@ CREATE TABLE ride_events (
 CREATE INDEX idx_events_ride ON ride_events (ride_id, occurred_at);
 ```
 
-The partial index on `driver_id` for active states is the guard against double-assignment. If the Matching Service tries to write `driver_id=Priya` to two different rides with state in (3,4), the second write violates the partial unique index. Belt and suspenders alongside the Redis `SET NX` claim.
+The partial index on `driver_id` for active states is the database-layer guard against double-assignment. If Matching tries to write `driver_id=Priya` to two different rides in state (3,4), the second write violates this index. Belt and suspenders alongside the Redis `SET NX` claim.
 
 </details>
 
 **The Driver Location Index (Redis, not SQL).**
 
 ```
-driver:{driver_id}          HASH    fields: lat, lng, h3_r9, h3_r6,
-                                            status, vehicle_class, last_update_ts
+driver:{driver_id}          HASH    lat, lng, h3_r9, h3_r6, status,
+                                    vehicle_class, last_update_ts
                                     TTL: 30s (refreshed on every ping)
 
-cell:{h3_r9}                SET     members: driver_ids currently in this cell
-                                    (no TTL; entries swept by TTL expiry of driver keys)
+cell:{h3_r9}                SET     driver IDs in this cell
+                                    (no TTL; entries swept by driver key expiry)
 
-driver_inflight:{driver_id} STRING  value: ride_id of active dispatch claim
-                                    TTL: 30s (safety net; cleared on accept or timeout)
+driver_inflight:{driver_id} STRING  ride_id of active dispatch claim
+                                    TTL: 30s (cleared on accept or timeout)
 
-surge:{h3_r8}               STRING  value: multiplier (e.g. "2.1")
+surge:{h3_r8}               STRING  multiplier, e.g. "2.1"
                                     TTL: 30s (refreshed by Surge Service every 10s)
 ```
 
-Sharded by `h3_r6` (coarse cells, ~6km across). All drivers in one metro neighborhood land on the same Redis shard. ~20 shards at peak. ~5 GB per shard.
+Sharded by `h3_r6` (coarse cells, ~6km across). All drivers in one neighborhood land on the same Redis shard. ~20 shards at peak. ~5 GB per shard.
 
 ---
 
 ### 5. H3 indexing and the matching loop
 
-**Why H3 resolution 9.** Cells are ~174m across, ~0.1 sq km. A dense city has 10-50 available drivers per cell at peak. A `kRing(cell, 1)` query covers the cell plus its 6 neighbors, a ~500m radius. That is the right scale for "drivers close enough to arrive in a few minutes." If no match in the 1-ring (common in suburbs), expand to ring 2, 3, 5. Cap at ring 5.
+**Why H3 resolution 9.** Cells are ~174m across, ~0.1 sq km. A dense city has 10-50 available drivers per cell at peak. A `kRing(cell, 1)` call covers 7 cells, a ~500m radius. Most matches happen within ring 1. If not (suburbs), expand to ring 2, 3, 5. Cap at ring 5.
 
-**Why hexagons beat squares.** Every neighbor of a hexagon is the same distance away. With a square grid, diagonal neighbors are 1.41x farther than edge neighbors. When you are searching "drivers near a pickup," hexagons give you clean, symmetric results without compensation in code.
+**Why hexagons beat squares.** Every neighbor of a hexagon is equidistant. With a square grid, diagonal neighbors are 1.41x farther than edge neighbors. Searching "drivers near a pickup" with hexagons gives symmetric results and no distance-compensation code.
 
 <details markdown="1">
 <summary><b>Show: the matching loop</b></summary>
@@ -228,15 +226,15 @@ def match(ride):
         if not candidates:
             continue
 
-        candidates = sorted(candidates, key=lambda d: haversine(d, ride.pickup))[:20]
+        candidates = sorted(candidates, key=lambda d: haversine(d, ride.pickup))[:50]
         etas = routing_service.batch_eta(
-            origins=[(c.lat, c.lng) for c in candidates],
+            origins=[(c.lat, c.lng) for c in candidates[:20]],
             destination=(ride.pickup_lat, ride.pickup_lng),
             timeout_ms=300,
         )
 
         scored = sorted(
-            zip(etas, candidates),
+            zip(etas, candidates[:20]),
             key=lambda t: t[0] + rating_penalty(t[1].rating) + idle_bonus(t[1])
         )
 
@@ -257,7 +255,7 @@ else
 end
 ```
 
-`SET NX EX 30` means "set only if not exists, expire in 30 seconds." Two racing requests for the same driver: one returns 1 (won), the other returns 0 (try next-best). The 30-second expiry is a safety net. If the Matching Service crashes before dispatching, the lock auto-releases and the driver becomes claimable again.
+`SET NX EX 30`: set only if not exists, expire in 30 seconds. Two racing requests for the same driver: one returns 1 (won), the other returns 0 (try next). The 30-second expiry is a safety net: if Matching crashes before dispatching, the lock releases and the driver becomes claimable again.
 
 </details>
 
@@ -282,12 +280,12 @@ stateDiagram-v2
     no_show --> [*]
 ```
 
-Four invariants you cannot break:
+Four invariants:
 
-1. **Every transition is idempotent.** `POST /accept` called twice leaves the state unchanged. `matched_at` is set only on the first transition.
+1. **Every transition is idempotent.** `POST /accept` called twice leaves the state unchanged.
 2. **No backward transitions.** Once `in_progress`, the only exits are `completed` or `cancelled`.
-3. **One driver per ride. One ride per driver.** The Redis `driver_inflight` key and the partial unique index on `rides.driver_id` both enforce this. Two locks, two layers.
-4. **Cancel reason is required.** `rider_cancelled`, `driver_cancelled`, `system_no_drivers`, `no_show`, `fraud`. Drives billing and the refund decision.
+3. **One driver per ride. One active ride per driver.** Redis `driver_inflight` key plus the partial unique index on `rides.driver_id`. Two locks, two layers.
+4. **Cancel reason is required.** `rider_cancelled`, `driver_cancelled`, `system_no_drivers`, `no_show`, `fraud`. This drives the billing and refund decision.
 
 Transitions are conditional SQL updates:
 
@@ -320,7 +318,7 @@ flowchart TB
         Surge["Surge Service"]:::app
     end
 
-    LI[("Redis<br/>Location Index<br/>sharded by H3 r6")]:::cache
+    LI[("Redis<br/>Location Index<br/>H3 r9, sharded by r6")]:::cache
     DB[("Postgres<br/>rides · drivers<br/>sharded by city_id")]:::db
 
     K{{"Kafka<br/>ride.* events<br/>trip.location.pings"}}:::queue
@@ -335,12 +333,12 @@ flowchart TB
     GW2 -->|create/accept| RS
     RS --> DB
     RS --> MS
-    RS -.quote.-> Surge
+    RS -.surge quote.-> Surge
     MS --> LI
     MS --> Route
     DGW --> LI
     DGW -.on-trip pings.-> K
-    DB -->|CDC / outbox| K
+    DB -->|CDC outbox| K
     K --> Notif
     K --> TH
     Surge --> LI
@@ -356,15 +354,15 @@ flowchart TB
 
 Five things to notice:
 
-- The Driver Gateway is **stateful**. A WebSocket is a connection. Sticky routing by `driver_id` plus a Redis session table (`gateway_session:{driver_id} -> pod_id`) lets the Matching Service push dispatch offers by looking up which pod holds each driver.
-- The Matching Service is **stateless**. It owns no connections. Reads Redis, calls Routing, claims via `SET NX`, tells the gateway to push. Easy to scale horizontally.
-- The Routing Service is **isolated**. Road-network ETA is CPU-heavy and spiky. Isolation means a routing slowdown does not crash matching. Matching times out at 300ms and falls back to straight-line distance.
-- The Trips DB is **sharded by city**. Cities are natural blast-radius boundaries. A NYC database failure does not affect London.
-- Notifications and path history live **after Kafka**. If the Notification Service crashes, rides still get matched and completed. Push messages queue up and deliver when it recovers.
+- The Driver Gateway is **stateful**. A WebSocket is a connection. Sticky routing by `driver_id` plus a Redis session table (`gateway_session:{driver_id} -> pod_id`) lets Matching push dispatch offers by looking up which pod holds each driver.
+- The Matching Service is **stateless**. It reads Redis, calls Routing, claims via `SET NX`, tells the gateway to push. Easy to scale horizontally.
+- The Routing Service is **isolated**. Road-network ETA is CPU-heavy. A routing slowdown does not crash matching. Matching times out at 300ms and falls back to haversine.
+- The Trips DB is **sharded by city**. NYC going down does not affect London.
+- Notifications and path history live **after Kafka**. If the Notification Service crashes at 3am, rides still get matched and completed. Push messages queue up and deliver when it recovers.
 
 ---
 
-### 8. A request, end to end
+### 8. A request, traced
 
 ```mermaid
 sequenceDiagram
@@ -383,17 +381,17 @@ sequenceDiagram
     RS->>Redis: active ride for Omar? (no)
 
     rect rgb(241, 245, 249)
-        Note over RS,Redis: synchronous write path
-        RS->>RS: INSERT ride (state=requested)
+        Note over RS,Redis: synchronous write path (~200ms total)
+        RS->>RS: INSERT ride, state=requested
         RS->>MS: find driver near Times Sq
-        MS->>Redis: SUNION cell + kRing(1)
+        MS->>Redis: SUNION cell + kRing(1), 7 H3 r9 cells
         Redis-->>MS: ~30 candidate IDs
         MS->>Redis: bulk lookup attrs, filter to ~15
-        MS->>Route: batch ETA for top 20
+        MS->>Route: batch ETA, top 20 (~300ms timeout)
         Route-->>MS: ETAs
         MS->>MS: score, pick Priya
-        MS->>Redis: SET driver_inflight:priya NX EX 30
-        Redis-->>MS: won
+        MS->>Redis: SET driver_inflight:priya ride_id NX EX 30
+        Redis-->>MS: 1 (won)
     end
 
     MS->>DGW: push offer to Priya's pod
@@ -403,7 +401,7 @@ sequenceDiagram
 
     Priya->>GW2: POST /rides/{id}/accept
     GW2->>RS: driver accepting
-    RS->>RS: UPDATE ride: requested -> matched, driver=Priya
+    RS->>RS: UPDATE ride: state 1 to 2, driver=Priya WHERE state=1
     RS-->>Omar: WebSocket: "Priya is on her way"
     RS->>Redis: DEL driver_inflight:priya
 ```
@@ -413,8 +411,8 @@ Target latencies:
 | Operation | P99 target |
 |-----------|------------|
 | Create ride (202 back to Omar) | ~200ms (bottleneck: SUNION + Routing call) |
-| Driver accept (matched state) | ~150ms |
-| Dashboard / ride status read | ~50ms |
+| Driver accept (state transitions to matched) | ~150ms |
+| Ride status read | ~50ms |
 
 ---
 
@@ -422,10 +420,10 @@ Target latencies:
 
 ```mermaid
 flowchart LR
-    S1["Stage 1<br/>500 drivers<br/>1 city<br/>Postgres + PostGIS<br/>~$300/mo"]:::s1
-    S2["Stage 2<br/>5,000 drivers<br/>3 cities<br/>Redis + H3 cells<br/>~$2k/mo"]:::s2
-    S3["Stage 3<br/>50,000+ drivers<br/>global<br/>+ Kafka · ClickHouse<br/>+ city sharding<br/>~$50k/mo"]:::s3
-    S4["Stage 4<br/>1M+ drivers<br/>multi-region<br/>+ edge matching<br/>+ GDPR isolation"]:::s4
+    S1["Stage 1<br/>500 drivers, 1 city<br/>Postgres + PostGIS<br/>~$300/mo"]:::s1
+    S2["Stage 2<br/>5,000 drivers, 3 cities<br/>Redis + H3 cells<br/>~$2k/mo"]:::s2
+    S3["Stage 3<br/>50,000+ drivers, global<br/>+ Kafka · ClickHouse<br/>+ city sharding<br/>~$50k/mo"]:::s3
+    S4["Stage 4<br/>1M+ drivers, multi-region<br/>+ edge matching<br/>+ GDPR isolation"]:::s4
 
     S1 --> S2 --> S3 --> S4
 
@@ -437,73 +435,60 @@ flowchart LR
 
 #### Stage 1: 500 drivers, one city
 
-One Postgres with the PostGIS extension. Driver locations stored in a table with a GiST spatial index. One app instance. Notifications via SendGrid inline. About $300/month.
+One Postgres with PostGIS. Driver locations in a table with a GiST spatial index. One app instance. Notifications inline. About $300/month. Ships in a weekend.
 
-This works because you see 50 ride requests per hour. PostGIS is loafing. Anything more is over-engineering.
+This works because you see 50 ride requests per hour. PostGIS is loafing.
 
 #### Stage 2: 5,000 drivers, 3 cities
 
-PostGIS location table cannot keep up with ~1,250 pings/sec. Move location to Redis with the H3 cell-sets pattern. Add a dedicated Driver Gateway for WebSocket connections. Add a standalone Matching Service. Notifications consume a small Kafka topic instead of inline HTTP calls. About $2k/month.
+PostGIS cannot keep up with ~1,250 pings/sec. Move location to Redis with H3 cell sets. Add a dedicated Driver Gateway for WebSocket connections. Add a standalone Matching Service. Notifications consume a small Kafka topic instead of inline HTTP calls. About $2k/month.
 
 Still one Postgres for ride records. Still one Routing instance.
 
 #### Stage 3: 50,000+ drivers, global
 
-Several things break at once:
+Several things break at once: airport H3 cells become Redis hot keys; the Routing Service cannot keep up at peak; one global Matching Service has cross-region latency; the single Postgres cannot handle writes from dozens of cities.
 
-- Airport H3 cells become Redis hot keys.
-- The Routing Service cannot keep up with synchronous ETA calls at peak.
-- One global Matching Service has cross-region latency.
-- The single Postgres for ride records cannot handle writes from dozens of cities.
+Fixes in order:
 
-Fixes, in order:
+1. In-process cache on Matching for cell reads (1-second TTL). Cuts Redis load on hot cells by 10-100x.
+2. Matching Service replicated per city-region.
+3. Postgres sharded by `city_id`. Each region runs its own primary plus read replicas.
+4. Routing Service scaled independently with a circuit-breaker and haversine fallback.
+5. Trip path history streamed to Kafka then S3 and ClickHouse.
 
-- In-process cache on Matching Service for cell reads (1-second TTL). Cuts Redis load on hot cells by 10-100x.
-- Matching Service replicated per city. Each city-region has its own instance.
-- Postgres sharded by `city_id`. Each region runs its own primary plus read replicas.
-- Routing Service scaled independently. Circuit-breaker with haversine fallback.
-- Trip path history streamed to Kafka, then S3 and ClickHouse. Audit queries run on ClickHouse, not on the primary DB.
-
-Cost around $50k/month.
+Cost ~$50k/month.
 
 #### Stage 4: 1M+ drivers, multi-region
 
-New problems:
+New problems: a region failure takes down all rides in that region; EU operations require EU rider data to stay in EU; GDPR isolation becomes a hard requirement.
 
-- A region failure (`us-east-1` down) takes down all NYC rides.
-- EU operations open. GDPR requires EU rider data to stay in EU.
-- Cross-region drivers (US driver near a border, EU event city) need to be handled.
-
-Multi-region everything. Each region runs its full stack: Gateway, Redis, Matching, Trips DB, Kafka. The rider's home region (from profile) decides where the ride record lives. A US driver in a EU region is routed to the EU region's Driver Gateway. The EU region owns the trip.
-
-For within-region reliability: Trips DB replicated across AZs. A single AZ failure is invisible to riders. A full region failure (rare) cancels in-progress rides with refunds and redirects new traffic via DNS failover.
+Each region runs its full stack: Gateway, Redis, Matching, Trips DB, Kafka. The rider's home region decides where the ride record lives. A full region failure triggers DNS failover for new traffic and auto-cancel with refund for in-progress rides.
 
 The architecture has not fundamentally changed since Stage 3. You added regions and GDPR isolation. The core data model is the same one written in Stage 1.
 
 ---
 
-### 10. The four hard sub-problems
-
-Same architecture. Four situations that each stress a different component.
+### 10. Four hard sub-problems
 
 | Situation | What stresses the system | The fix |
 |-----------|--------------------------|---------|
-| **Airport pickup at 5pm** | One H3 cell has 200 available drivers. SUNION returns 200 IDs. Routing call for all 200 would be slow. | Pre-filter by haversine to top 50 before fetching attributes. Cap Routing call at top 20. In-process cache for cell membership. |
-| **Concert lets out, 5,000 requests in 10 minutes** | Demand spike in a small area. Matching races. Surge computation lags. | Batch matching with dispatch window (500ms hold). Surge Service updates every 10 seconds with smoothing to avoid 1x to 5x jumps. |
-| **Driver connectivity drops mid-trip** | Ride is `in_progress`. No pings arriving. Rider sees no movement. | State machine does not care about pings. Rider app shows "GPS lost" after 30 seconds of stale location. Driver app queues pings locally and replays on reconnect with original timestamps. |
-| **Driver just dropped off a rider, heading home** | Available status, but moving away from request area. Haversine makes them look close. | Use Routing Service ETA (road-network, direction-aware) not haversine as the final score. A driver heading away is farther by ETA even if close by straight line. |
+| **Airport pickup at 5pm** | One H3 cell has 200 available drivers. SUNION returns 200 IDs. Routing for all 200 would be slow. | Pre-filter by haversine to top 50 before fetching attributes. Cap Routing at top 20. In-process cache for cell membership. |
+| **Concert lets out, 5,000 requests in 10 minutes** | Demand spike in a small area. Matching races. Surge computation lags. | Batch matching with 500ms dispatch window. Surge Service updates every 10 seconds with smoothing. |
+| **Driver connectivity drops mid-trip** | Ride is `in_progress`. No pings arriving. Omar sees no movement. | State machine does not care about pings. Omar's app shows "GPS lost" after 30 seconds. Driver app queues pings locally and replays on reconnect with original timestamps. |
+| **Driver just dropped off a rider, heading home** | Available status but moving away from request area. Haversine makes them look close. | Use Routing Service ETA (road-network, direction-aware) not haversine for final score. A driver heading away ranks lower by ETA even if close by straight line. |
 
 ---
 
 ### 11. Reliability
 
-**Driver Gateway pod crash.** All drivers on that pod disconnect. Apps retry with exponential backoff plus jitter (start 1s, max 30s). Within ~10 seconds, a healthy pod absorbs them. During the reconnection window, those drivers are not matchable. In-progress rides on those drivers are not affected: ride state lives in Postgres, not the Gateway.
+**Driver Gateway pod crash.** All drivers on that pod disconnect. Apps retry with exponential backoff plus jitter (start 1s, max 30s). Within ~10 seconds a healthy pod absorbs them. During the reconnection window, those drivers are not matchable. In-progress rides on those drivers are unaffected: ride state lives in Postgres, not the Gateway.
 
-**Driver app loses connectivity mid-trip.** WebSocket drops. The trip stays `in_progress`. No event has transitioned it. After 15 minutes with no pings during an `in_progress` ride, ops gets an alert. They review and either mark `completed` with a partial-path fare or `cancelled` with refund. The fare is computed from the dropoff event, not from pings, so lost connectivity does not by itself invalidate the trip.
+**Driver loses connectivity mid-trip.** The trip stays `in_progress`. No event has transitioned it. After 15 minutes with no pings during an `in_progress` ride, ops gets an alert. The fare is computed from the End Trip event, not from pings, so lost connectivity does not by itself invalidate the trip.
 
-**Redis cluster loss.** Catastrophic for matching. AZ replication handles most failures in ~30 seconds. During that window, matching is degraded (rides queue). On full cluster loss, location pings buffer in Gateway memory for up to 60 seconds. After that, drivers appear offline and riders see "no drivers available."
+**Redis cluster loss.** Catastrophic for matching. AZ replication handles most failures in ~30 seconds. On full cluster loss, location pings buffer in Gateway memory for up to 60 seconds. After that, drivers appear offline and riders see "no drivers available."
 
-**Routing Service slow or down.** Match path falls back to haversine for scoring. Quality drops (a driver across a river may rank too high) but the system functions. A circuit breaker trips after sustained Routing failures and switches all matches to haversine for a 30-second cooldown before probing again. Rider-facing ETA display becomes "a few minutes" instead of a specific number.
+**Routing Service slow or down.** Match path falls back to haversine. Quality drops but the system functions. A circuit breaker trips after sustained failures and switches all matches to haversine for a 30-second cooldown before probing again.
 
 **Trips DB primary failure.** Failover to replica (~30 seconds). During the window, new ride requests in that city return 503. In-progress rides cannot transition state. Other cities are fully functional.
 
@@ -514,14 +499,14 @@ Same architecture. Four situations that each stress a different component.
 | Metric | Why it matters |
 |--------|----------------|
 | `match.latency.p99` by city | Headline SLO. >2s for 5 min is a page. |
-| `match.success_rate` by city | % of requests that get a driver before timeout. |
+| `match.success_rate` by city | Percent of requests that find a driver before timeout. |
 | `match.no_drivers_rate` | >5% in a city means a supply problem. |
-| `dispatch.accept_rate` | % of offers accepted. <40% means drivers gaming the system or bad match quality. |
-| `location.ingest_rate` by region | Should track `drivers_online × (0.25 + 0.3 × 0.75)`. |
+| `dispatch.accept_rate` | Percent of offers accepted. <40% means drivers gaming the system or bad match quality. |
+| `location.ingest_rate` by region | Should track `drivers_online × 0.475`. |
 | `location.stale_driver_count` | Drivers with last update >30s. Spikes mean a Gateway problem. |
-| `redis.hot_cell.ops` for airports, stations | Should stay below shard CPU capacity. |
+| `redis.hot_cell.ops` for airports | Should stay below shard CPU capacity. |
 | `routing.latency.p99` | Feeds directly into match latency. |
-| `state_machine.illegal_transitions` | Should be near zero. Nonzero means a client bug or replay attack. |
+| `state_machine.illegal_transitions` | Should be near zero. Any nonzero value means a client bug or replay attack. |
 | `trip.in_progress_no_pings.count` | Trips with no ping in 60s. Possible fraud or network failure. |
 
 Page on: match P99 >2s for 5 min in any top-20 city. Match success rate <90% for 5 min. Gateway disconnect rate >5%/min. Trips DB unavailable.
@@ -537,7 +522,7 @@ Ticket on: dispatch accept rate <40%. Hot cell ops >80% of shard capacity. Illeg
 The Matching Service holds a soft claim via `driver_inflight:{driver_id}` with a 30-second TTL. When dispatch times out at 15 seconds:
 
 - Gateway tells Matching "no answer."
-- Matching releases the claim (`DEL driver_inflight`) and increments a per-driver `ignored_count`.
+- Matching releases the claim and increments a per-driver `ignored_count`.
 - Matching re-runs, excluding this driver for the next 5 minutes.
 - Omar's UI keeps showing "finding your driver." State stays `requested`. No fee.
 
@@ -545,34 +530,19 @@ If a driver ignores 3 offers in a row, their status flips to `offline` automatic
 
 **2. Driver loses connectivity mid-trip.**
 
-The ride is in `in_progress`. The state machine does not care about the WebSocket connection. It cares only about state-change events.
+The ride is in `in_progress`. The state machine does not care about the WebSocket connection, only about state-change events.
 
-- Gateway marks the driver `connection_lost` in the session table but does not change ride state.
-- After 30 seconds, Omar's app shows a "GPS lost" overlay.
-- Priya's app queues location samples locally (up to ~10 minutes).
-- When Priya reconnects, the Gateway accepts the queued samples. They are timestamped; out-of-order is handled. Path history backfills.
-- If she never reconnects: after 15 minutes during `in_progress`, ops gets an alert and manually resolves.
-
-The fare is computed from Priya's `End Trip` event, not from GPS pings. Lost connectivity does not invalidate the trip.
+Gateway marks the driver `connection_lost` in the session table but does not change ride state. After 30 seconds, Omar's app shows a "GPS lost" overlay. Priya's app queues location samples locally (up to ~10 minutes). When she reconnects, the Gateway accepts the queued samples, timestamped and replayed in order. If she never reconnects: after 15 minutes during `in_progress`, ops gets an alert and manually resolves. The fare is computed from the End Trip event, not GPS pings.
 
 **3. Two riders, one best driver.**
 
-Omar and a second rider, let's say Yui, both request at almost the same time. Priya is the best match for both.
+Omar and Yui both request at almost the same time. Priya is the best match for both. Both Matching Service instances attempt `SET driver_inflight:priya NX EX 30`. One wins at t=200ms. The other gets `0` at t=210ms and moves to the next-best candidate.
 
-Both Matching Service instances attempt `SET driver_inflight:priya NX EX 30`. One wins. Say Omar's request wins at t=200ms. Yui's request gets `0` back at t=210ms.
-
-Yui's Matching Service moves to the next-best candidate. If Yui has other good options nearby, she barely notices. If the area is sparse, she waits 1-2 more seconds while Matching expands to ring 2.
-
-The Redis `SET NX` is the first layer of mutual exclusion. The partial unique index on `rides.driver_id` for active states is the second layer. Belt and suspenders.
+The Redis `SET NX` is the first layer. The partial unique index on `rides.driver_id` for active states is the second layer. Belt and suspenders.
 
 **4. Hot cell: airport at rush hour.**
 
-JFK has 200 available drivers in two H3 cells. Scoring all 200 on every request is wasteful.
-
-Two costs to bound:
-
-- The SUNION returns up to 200 IDs.
-- Routing needs real road-network ETA for each one.
+Two costs to bound: the SUNION returns up to 200 IDs, and Routing needs real ETA for each one.
 
 Fix: pre-filter by haversine (cheap, in-process) to the 50 nearest before fetching full attributes. After filtering on status and vehicle class, pass only the top 20 to Routing. The hot cell adds a few milliseconds of in-process work, not a Routing round-trip per candidate.
 
@@ -586,37 +556,31 @@ Mitigations in order:
 
 1. In-process cache on Matching (1-second TTL). Cuts hot-cell reads by 10-100x. This alone often fixes it.
 2. Read replicas of the hot shard. Matching round-robins reads across them.
-3. Sub-shard the hot cell. Replace `cell:{h3}` with `cell:{h3}:bucket{0..15}` keyed by `hash(driver_id) mod 16`. Reads become a 16-way SUNION (still fast). Writes distribute across 16 keys.
+3. Sub-shard the hot cell: replace `cell:{h3}` with `cell:{h3}:bucket{0..15}` keyed by `hash(driver_id) mod 16`. Reads become a 16-way SUNION (still fast). Writes distribute across 16 keys.
 4. Pin known hot cells (airports, stadiums) to a dedicated high-resource shard at provisioning.
 
 Most deployments need only steps 1 and 2.
 
 **6. Region failure.**
 
-In-progress trips in the failed region cannot transition state (the Trips DB is unavailable). Riders on those trips see "service interrupted" and are auto-cancelled with a full refund.
-
-Riders in unaffected cities are fully functional. City sharding by design gives independent blast radii: NYC going down does not affect London, Tokyo, or anywhere else.
+In-progress trips in the failed region cannot transition state. Riders on those trips see "service interrupted" and are auto-cancelled with a full refund. Riders in unaffected cities are fully functional. City sharding gives independent blast radii by design.
 
 For within-region reliability: the Trips DB is replicated across AZs. A single AZ failure is invisible. A full region failure triggers DNS-based failover for new traffic, plus the auto-cancel path for in-progress rides.
 
 **7. Driver heading away from pickup.**
 
-The driver has `status=AVAILABLE` but is driving home after dropping off a rider. Haversine distance says she is 300m away. Her road-network ETA is actually 8 minutes because she would need to make a U-turn.
+The driver has `status=AVAILABLE` but is driving home. Haversine says she is 300m away. Her road-network ETA is 8 minutes because she needs to make a U-turn.
 
-The fix: always use the Routing Service for final scoring, not haversine. Road-network ETA is direction-aware. It factors in the U-turn, one-way streets, and current heading. A driver heading away ranks lower on ETA even if close by straight line.
-
-The haversine pre-filter (to narrow 200 candidates to 50 before calling Routing) is acceptable for the coarse sort. The final score always uses road-network ETA.
+The fix: always use the Routing Service for final scoring, not haversine. Road-network ETA is direction-aware and factors in the U-turn, one-way streets, and current heading. Haversine for the coarse pre-filter (narrow 200 to 50) is fine. The final score always uses road ETA.
 
 **8. Fraud: fake GPS locations.**
 
-A driver submits fake coordinates to appear in a high-surge area without going there.
-
 Detection without adding latency to the ingest path:
 
-- **Plausibility check at the Gateway.** If a driver jumps more than 1km between two pings 4 seconds apart (maximum realistic speed: ~900 km/h at 1km in 4s), flag the ping. Real cars do not teleport. Sub-millisecond check.
-- **Road-path check.** For on-trip drivers, the path should follow roads. A path that cuts through buildings is suspicious. Run this as a nightly batch job against Trip History in ClickHouse.
+- **Plausibility check at the Gateway.** If a driver moves more than 1km between two pings 4 seconds apart (that is 900 km/h), flag the ping. Sub-millisecond check. Real cars do not teleport.
+- **Road-path check.** For on-trip drivers, the path should follow roads. A path cutting through buildings is suspicious. Run this as a nightly batch against Trip History in ClickHouse.
 - **Device attestation.** Google Play Integrity and Apple DeviceCheck verify the location came from a real device, not a mock-location app. Bake into the WebSocket handshake. Flagged devices receive lower matching priority.
-- **Surge-zone teleportation.** A driver appearing in a high-surge cell with no recent path leading there gets flagged.
+- **Surge-zone teleportation.** A driver appearing in a high-surge cell with no path leading there gets flagged.
 
 None of these sit in the synchronous match path. Fraud is mostly an async detection problem.
 
@@ -632,48 +596,44 @@ except (TimeoutError, ServiceUnavailable):
     metrics.inc("matching.routing_fallback")
 ```
 
-Quality drops because haversine ignores road network. A driver across a river or park may rank too high. But the system functions and most urban grid matches remain acceptable.
+Quality drops because haversine ignores the road network. A driver across a river may rank too high. But the system keeps functioning and most urban grid matches stay acceptable.
 
-A circuit breaker trips after sustained failures and switches all Matching to haversine for a 30-second cooldown before probing again.
-
-For rider-facing ETA display: fall back to "a few minutes" instead of a specific number. A wrong number is worse than a vague one.
+A circuit breaker trips after sustained failures and switches all Matching to haversine for a 30-second cooldown. For rider-facing ETA display: fall back to "a few minutes" instead of a specific number. A wrong number is worse than a vague one.
 
 **10. Bulk cancel: storm in Manhattan.**
 
-Ops wants to cancel all in-progress and matched rides in Manhattan and refund riders.
+Ops calls `POST /admin/bulk_cancel` with a city and bounding-box filter. The service iterates over rides in that box with state in (2, 3, 4), transitions each to `cancelled` with `cancel_reason=system_event`, and enqueues refund events to Kafka.
 
-Backend approach: `POST /admin/bulk_cancel` with a city and bounding-box filter. The service iterates over rides in that box with state in (2, 3, 4), transitions each to `cancelled` with `cancel_reason=system_event`, and enqueues refund events to Kafka.
-
-Risks to call out:
+Risks:
 
 - Serial iteration at 50,000 active trips is slow. Run it as a background job with a progress key in Redis. Do not block the API thread.
-- Some rides will have just completed or been cancelled by the rider between the query and the update. The conditional `WHERE state IN (2,3,4)` handles that safely.
-- Downstream: the refund consumer must be idempotent. If the bulk cancel job crashes halfway and replays, the refund consumer must not double-refund.
-- Notify drivers too. Drivers with active dispatch offers should receive "ride cancelled" over their WebSocket immediately, not just through a Kafka event that might lag.
+- Some rides will have just completed between the query and the update. The conditional `WHERE state IN (2,3,4)` handles that safely.
+- The refund consumer must be idempotent. If the bulk cancel job crashes halfway and replays, the consumer must not double-refund.
+- Notify drivers too. Drivers with active dispatch offers should receive "ride cancelled" over their WebSocket immediately, not through a Kafka event that might lag.
 
 ---
 
 ### 14. Trade-offs worth saying out loud
 
-**Greedy match vs. batch match.** Greedy is simpler, faster, and locally optimal. Batch with a 500ms dispatch window gives 5-15% better global ETA in dense areas. Ship greedy first. Add batched matching as an experiment per-city with a tunable window.
+**Greedy match vs. batch match.** Greedy is simpler, faster, and locally optimal. Batch with a 500ms dispatch window gives 5-15% better global ETA in dense areas. Ship greedy first. Add batched matching as a per-city experiment with a tunable window.
 
 **Why H3 and not geohash.** Hexagonal neighbor uniformity matters when most matches are within 1-2 rings. Geohash neighbors have non-uniform distance, requiring more rings to cover the same physical radius. H3 also has `compact`/`uncompact` for multi-resolution queries.
 
-**Why a stateful Driver Gateway.** "Stateless" is right for most services, but a WebSocket is a connection. The alternative (long-polling) costs 3-5x more bandwidth and battery. Stateful with sticky routing and a session table is the right answer here.
+**Why a stateful Driver Gateway.** The alternative (long-polling) costs 3-5x more bandwidth and battery. Stateful with sticky routing and a session table is correct here. "Stateless" is right for most services, but a WebSocket is a connection.
 
-**Why not Postgres for driver locations.** 475,000 overwrite-in-place operations per second to a relational table is very painful. Redis handles this at < 1ms per operation. Location is "current truth, not historical truth." Treating it as a cache, not a record, is the right model.
+**Why not Postgres for driver locations.** 475,000 overwrite-in-place operations per second on a relational table is very painful. Redis handles this at under 1ms per operation. Location is "current truth, not historical truth." Treating it as a cache, not a record, is the right model.
 
-**Why separate the Routing Service.** Road-network ETA computation is CPU-intensive and has a different scaling profile than matching. If Routing slows down during a sporting event, you want it to degrade in isolation, not take matching down with it. The haversine fallback is acceptable at degraded quality.
+**Why separate the Routing Service.** Road-network ETA is CPU-intensive with a different scaling profile than matching. If Routing slows down during a sporting event, it degrades in isolation, not taking matching down with it.
 
 ---
 
 ### 15. Common mistakes
 
-**"Store driver locations in Postgres with a GiST index."** Fine for v1 at 500 drivers. Falls over at 25,000+ drivers with sustained writes. Identify it as the toy answer and graduate to Redis + H3 at scale. The strongest answers say "v1 uses PostGIS, here is the signal that tells us to switch."
+**"Store driver locations in Postgres with a GiST index."** Fine for v1 at 500 drivers. Falls over at 25,000+ drivers with sustained writes. The strongest answers say "v1 uses PostGIS; here is the signal that tells us to switch."
 
-**"Use haversine for scoring."** Acceptable as a fallback or pre-filter. As the primary score, it ignores the road network and ranks drivers on the wrong side of rivers, parks, or one-way streets. The interviewer is checking whether you know Routing is a separate layer.
+**"Use haversine for scoring."** Acceptable as a pre-filter. As the primary score, it ignores the road network and ranks drivers on the wrong side of rivers or one-way streets. The Routing Service is a separate layer and the interview is checking whether you know that.
 
-**No state machine.** A design that describes matching but never names the ride states (`requested`, `matched`, `driver_arriving`, `in_progress`, `completed`, `cancelled`, `no_show`) is incomplete. The state machine is where most production bugs and billing errors live.
+**No state machine.** A design that describes matching but never names ride states is incomplete. The state machine is where most production bugs and billing errors live.
 
 **Ignoring idempotency.** Network retries on `POST /rides` cause duplicate rides and double charges. Idempotency keys are required, not optional. This is the single most common production incident in ride-sharing systems.
 
@@ -681,8 +641,8 @@ Risks to call out:
 
 **Treating Routing as a free function call.** It is the heaviest dependency in the match path. Bounding its concurrency, timeout, and fallback is essential. Weak answers call Routing and never discuss what happens when it is slow.
 
-**Forgetting cancellation.** Half the state machine is cancel paths. Happy path only leaves the interviewer to infer the rest. Call out driver no-response, rider cancel, driver cancel, and system cancel explicitly.
+**Forgetting cancellation.** Half the state machine is cancel paths. Happy-path only leaves the interviewer to infer the rest. Call out driver no-response, rider cancel, driver cancel, and system cancel explicitly.
 
-**Confusing match latency with acceptance latency.** Matching takes <200ms. Driver acceptance takes 3-15 seconds. The 2-second P99 SLO is for "from rider tap until the offer is dispatched to the driver's phone," not "until the driver taps Accept." Be explicit about which one you are measuring.
+**Confusing match latency with acceptance latency.** Matching takes under 200ms. Driver acceptance takes 3-15 seconds. The 2-second P99 SLO is for "from rider tap until the offer reaches the driver's phone," not "until the driver taps Accept." Be explicit about which one you are measuring.
 
-**Over-engineering multi-region.** Cities are independent. You do not need a globally-distributed multi-master location index. Per-region, per-city sharding is the right model. A NYC driver cannot pick up a Tokyo rider anyway.
+**Over-engineering multi-region.** Cities are independent. A globally distributed multi-master location index is not needed. Per-region, per-city sharding is correct. A NYC driver cannot pick up a Tokyo rider anyway.

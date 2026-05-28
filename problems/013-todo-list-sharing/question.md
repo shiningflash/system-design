@@ -7,162 +7,106 @@ difficulty: Easy
 solution: solution.md
 ---
 
-## The scene
+## What we are building
 
-You sit down. The interviewer smiles and says:
+Alice creates a grocery list and shares it with Bob and Carol. All three can open the list on their phones or laptops. When Alice adds "oat milk," Bob and Carol see it within a second, without refreshing the page. When Bob checks off "eggs," Alice sees the checkmark appear on her screen. Either of them can add items, check things off, or rename entries at any time.
 
-> *"Everyone has used Todoist or a notes app with a shared list. Build one. Users make lists. They add items. They check things off. And here is the fun part: any list can be shared with other people. When Alice adds an item, Bob, who is also on that list, should see it on his phone within a second or two. Build that."*
+That is the whole product. Shared state, multiple writers, near-real-time propagation.
 
-They wait.
+The problem looks like a CRUD app. It is not. Five hard problems are hiding in the description:
 
-It sounds like a simple CRUD app. It is not.
+1. **Concurrent edits.** Alice renames an item at the same moment Bob does. One of them has to win. Which one, and how?
+2. **Offline writes.** Carol's phone loses signal for 30 minutes. She adds three items while offline. When she reconnects, those changes need to reach the server safely, without creating duplicates.
+3. **Share permissions.** Bob is an editor. Can Bob invite Dave? If Alice revokes Bob, does Dave lose access too? What if Bob has the app open when Alice revokes him?
+4. **Sync protocol.** The server pushes ops to subscribers. If a subscriber misses a message (reconnect, crash), how does it catch up without fetching the entire list?
+5. **Conflict resolution.** Two offline clients diverge for an hour. When both reconnect, whose version of item #42 is correct?
 
-Three hard problems are hiding in that description:
-
-- How do you push a change to other devices in near real-time without melting your servers?
-- What happens when Alice and Bob edit the same item title at the same moment?
-- What does "access" mean when a list gets re-shared?
-
-Most people jump straight to *"I'll use WebSockets."* That is the right tool but the wrong place to start. The right place is to understand what kind of collaboration you are actually building. A list that refreshes every 10 seconds is a completely different system from one where Alice's keystrokes appear on Bob's screen as she types.
-
-We will walk this from 10 users to 1 million, adding one layer at a time.
+We will solve each one in turn, starting from the simplest thing that ships.
 
 ---
 
-## Step 1: Picture one shared edit
+## The lifecycle of one op
 
-Before any boxes, just picture the smallest thing that needs to happen. Alice makes a change. Bob sees it.
+Before drawing any boxes, picture a single edit traveling through the system.
 
 ```mermaid
 stateDiagram-v2
     direction LR
-    [*] --> ItemExists: list is shared
-    ItemExists --> Edited: Alice changes title
-    Edited --> Saved: server accepts, assigns seq=512
-    Saved --> Delivered: published to Redis channel
-    Delivered --> Visible: Bob's device receives and applies
-    Visible --> [*]
+    [*] --> Pending: Alice edits item title
+    Pending --> Accepted: server assigns seq=512
+    Accepted --> Persisted: written to Postgres + change_log
+    Persisted --> Broadcast: published to Redis pub/sub
+    Broadcast --> Applied: Bob's device receives, applies
+    Applied --> [*]
 ```
 
-That is the whole product, in one picture. Everything we add later (conflict resolution, offline sync, permissions) is a complication on top of this.
+Every feature in this design either produces one of these transitions or handles what happens when one fails.
 
-> **Take this with you.** A shared todo list is not a chat app and not a document editor. It is closer to a shared spreadsheet where each item is a row. That framing keeps the design grounded.
+> **Take this with you.** A shared list is an append-only log of ops, not just a table of current item state. The log is what powers real-time delivery, offline catch-up, and conflict resolution. Design the log first.
 
 ---
 
-## Step 2: Ask the right questions
+## How big this gets
 
-In a real interview, sit quietly for two minutes. Write down what you want to ask. Not twenty questions. Five good ones.
+| Input | Value |
+|-------|-------|
+| Daily active users | 1 million |
+| Ops per user per day (adds, edits, checks) | ~30 |
+| Average list members | 5 |
+| Concurrent WebSocket connections at peak | ~200,000 |
+| Op log retention | 30 days hot, 2 years cold |
+
+From these we can derive the hard numbers.
 
 <details markdown="1">
-<summary><b>Show: 5 questions that change the design</b></summary>
+<summary><b>Show: the derived numbers</b></summary>
 
-1. **How real-time is real-time?** Is a 2-second delay okay, or do we need sub-100ms like Google Docs where you see each keystroke? *This one answer drives 60% of the design. Two seconds means polling works. Sub-second means WebSocket. Sub-100ms co-editing means CRDT.*
+| Metric | Value | How |
+|--------|-------|-----|
+| Writes per second, steady | ~350 | 1M × 30 / 86,400 |
+| Writes per second, peak | ~1,000 | 3x steady |
+| Fan-out deliveries per second | ~4,000 | 1k writes × 4 other members |
+| Op log storage, 30 days | ~60 GB | 1M × 30 ops × 200 bytes × 30 days |
+| Current state storage | ~4 GB | 1M users × 20 lists × 100 items × 200 bytes |
 
-2. **Can a person you invited re-share with someone else?** *Changes the permission model from a flat list of users to a tree with `granted_by` chains. Also affects what happens when you revoke someone.*
+What the numbers tell us:
 
-3. **Is offline support a first-class feature?** *If yes, the client needs a local op queue on disk and the server must accept out-of-order ops with client-side IDs. If no, every write requires a live connection and the whole design gets simpler.*
-
-4. **What roles?** Viewer, editor, admin? *Two roles cover 90% of cases. Three cover nearly everything.*
-
-5. **How long is the history kept?** Can Bob undo a deletion from last week? Or just the last 30 seconds? *Affects how long you keep the op log and what your compaction policy looks like.*
-
-A strong candidate also names what is out of scope: rich-text editing inside items, file attachments, calendar sync, sub-tasks. Each one would double the scope.
+- **Write rate is not the bottleneck.** 1,000 writes/sec is a light day for Postgres. Throughput is not the hard part.
+- **200k concurrent WebSockets cannot live on one machine.** At roughly 50k sockets per Go or Node.js pod, you need 4 to 8 pods, plus a way for a write on pod A to reach a subscriber on pod B.
+- **Fan-out volume is moderate.** 4,000 deliveries/sec is comfortable for Redis pub/sub. The fan-out becomes interesting only for lists with thousands of subscribers (a shared "company announcements" list).
+- **Op log dominates storage.** The 30-day window caps it at 60 GB per million users. A nightly job archives older ops to S3 and prunes.
 
 </details>
 
----
-
-## Step 3: How big is this thing?
-
-Same product, two very different companies.
-
-| Scale | Writes/sec (peak) | Reads/sec (peak) | Concurrent WebSocket | Storage, 2 years |
-|-------|-------------------|------------------|----------------------|------------------|
-| 10k DAU | 10 | 15 | ~2,000 | 40 MB state + ~60 GB op log |
-| 1M DAU | 1,000 | 1,500 | ~200,000 | 4 GB state + ~6.5 TB op log |
-
-<details markdown="1">
-<summary><b>Show: how the numbers come out</b></summary>
-
-Assume each daily active user adds or checks off 30 items per day, opens the app 15 times, and holds one WebSocket open when active. About 20% of users are active at peak.
-
-**At 10k DAU:**
-
-- Writes: 10k × 30 = 300k/day = ~3.5/sec average, **10/sec peak**. Tiny.
-- Reads: 10k × 15 opens × 3 lists per session = 450k/day = ~5/sec average, **15/sec peak**. Tiny.
-- WS connections: 20% of 10k = **2,000**. One 4 GB server handles that easily.
-- Storage: 10k users × 20 lists × 100 items × ~200 bytes = **40 MB** for current state.
-- Fan-out: each write to a 5-person list pushes to 4 other devices. At 10 writes/sec that is **40 deliveries/sec**. Trivial.
-
-**At 1M DAU:**
-
-- Writes: 1M × 30 = 30M/day = **~350/sec average, 1,000/sec peak**. Still fine for one Postgres on beefy hardware.
-- Reads: 1M × 15 × 3 = 45M/day = **~520/sec average, 1,500/sec peak**.
-- WS connections: 20% of 1M = **200,000 open sockets**. A typical Node.js or Go server handles ~50k per box. You need 4 to 8 boxes.
-- Storage: 1M users × 20 × 100 × 200 bytes = **4 GB** for current state. The op log at 30 ops/user/day × 200 bytes × 1M users × 730 days ≈ **4.4 TB** if you kept everything. You will compact it.
-- Fan-out: 1k writes/sec × 4 collaborators = **4,000 deliveries/sec**, spread across many WS pods.
-
-**What the math is telling you:**
-
-Write throughput is not the problem. Even at 1M users, 1k writes/sec is a light day for Postgres.
-
-The hard problems are:
-
-- **Connection count.** 200k open sockets cannot live on one machine.
-- **Fan-out across pods.** Alice's write lands on pod A but Bob's connection lives on pod B. Pod A needs a way to tell pod B. Redis pub/sub is what solves this.
-- **Op log storage.** Keep 30 days of ops per list. Clients offline longer than 30 days refetch full state. This caps the log at roughly **60 GB** per million DAU.
-
-</details>
-
-> **Take this with you.** Write rate is not the bottleneck. The two hard numbers are concurrent socket count and fan-out delivery.
+> **Take this with you.** Connection count and cross-pod fan-out are the two design constraints that matter. Write rate is not.
 
 ---
 
-## Step 4: The smallest thing that works
+## The smallest version that works
 
-Forget the million-user case. We have a 10-person team. One list. Two people sharing it. No offline, no reconnect, no Redis.
-
-Three boxes. Nothing else.
+Forget the million-user case. Two colleagues share one list. One server, one database, no real-time push.
 
 ```mermaid
 flowchart LR
-    A([Alice]):::user --> API[/"API Service<br/>(write + read)"/]:::app
-    API --> DB[("Postgres<br/>lists + items<br/>+ change_log")]:::db
-    DB -.email.-> B([Bob]):::user
-    B --> API2[/"API Service<br/>(poll every 10s)"/]:::app
-    API2 --> DB
+    A([Alice]):::user --> API["API Service"]:::app
+    B([Bob]):::user --> API
+    API --> DB[("Postgres<br/>lists · items · change_log")]:::db
 
-    classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef app   fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef app  fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db   fill:#fed7aa,stroke:#c2410c,color:#7c2d12
 ```
 
-Bob just polls. Every 10 seconds he calls `GET /lists/L/changes?since_seq=X`. If nothing changed, he gets an empty array. If Alice added an item, he gets the op.
+Bob polls `GET /lists/L/changes?since_seq=X` every 10 seconds. If nothing changed, he gets an empty array. If Alice added an item, he gets the op. Latency is up to 10 seconds, which is fine for a small team at first.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Alice
-    participant API
-    participant DB as Postgres
-    participant Bob
+Two endpoints carry the core product. One for writes, one for catch-up reads.
 
-    Alice->>API: PATCH /lists/L/items/42 (title="Buy oat milk")
+| Endpoint | What it does |
+|----------|--------------|
+| `PATCH /lists/{id}/items/{item_id}` | Write an op; returns `{seq: N}` |
+| `GET /lists/{id}/changes?since_seq=N` | Replay ops after N; returns ordered list |
 
-    rect rgb(241, 245, 249)
-        Note over API,DB: one database transaction
-        API->>DB: SELECT next_seq FOR UPDATE -> 512
-        API->>DB: UPDATE list_items SET title=..., last_seq=512
-        API->>DB: INSERT change_log (seq=512, op=edit_item, ...)
-        API->>DB: COMMIT
-    end
-
-    API-->>Alice: 200 OK {seq: 512}
-    Bob->>API: GET /lists/L/changes?since_seq=511
-    API-->>Bob: [{seq:512, op:edit_item, ...}]
-    Bob->>Bob: apply op, update screen
-```
+Every write carries a `Client-Op-Id` header. It is a UUID the client generates when the user makes the edit. If the same ID arrives twice (mobile retry), the server returns the original result without applying the op again.
 
 <details markdown="1">
 <summary><b>Show: the five tables</b></summary>
@@ -222,96 +166,215 @@ CREATE UNIQUE INDEX idx_change_log_idem
     ON change_log (list_id, client_op_id) WHERE client_op_id IS NOT NULL;
 ```
 
-The `change_log` is the spine. It powers real-time delivery, reconnect catch-up, undo, and offline sync. Every other feature builds on it.
-
 </details>
 
-> **Take this with you.** Always start from the smallest thing that works. The interesting part of the interview is what happens next.
+This ships in a week and handles a small team without any real-time infrastructure.
 
 ---
 
-## Step 5: The first crack
+## Decision 1: how do we push edits to other devices?
 
-Ten seconds is fine for a shopping list. But the product manager has just demoed the app and says: *"Users complain that when someone checks an item off, the other person doesn't see it immediately. Can we make it instant?"*
+Polling at 10 seconds feels slow once users are actively collaborating. Dropping to 2 seconds makes it feel live, but 200k users polling every 2 seconds is 100k requests/sec returning "nothing new." That burns battery and server capacity.
 
-You look at the polling code. 10-second lag is baked into the protocol. You could drop it to 2 seconds, but then Bob's phone is hammering the server 30 times a minute. At 1M users that is 500,000 requests per second, most returning "nothing new." Wasteful.
-
-The fix is to flip the relationship. Instead of Bob asking *"anything new?"* every few seconds, the server tells Bob the moment something changes. That is what WebSocket is for.
+The better model: the server tells devices when something changes, instead of devices asking repeatedly.
 
 ```mermaid
 flowchart LR
-    subgraph Before["Before: polling"]
-        B1([Bob]) -->|every 10s: anything new?| S1["API"]
-        S1 -->|usually: no| B1
+    subgraph Before["Polling"]
+        B1([Bob]) -->|"every 10s: anything new?"| S1["API"]
+        S1 -->|"mostly: no"| B1
     end
-    subgraph After["After: WebSocket"]
-        S2["API"] -->|only when something changes| B2([Bob])
+    subgraph After["WebSocket push"]
+        S2["API"] -->|"only when something changes"| B2([Bob])
     end
 ```
 
-The change is conceptually small. In practice it introduces a new problem: Alice and Bob might be connected to different servers. When Alice writes, how does Bob's server find out?
+WebSocket is the right tool. One persistent TCP connection per client. The server writes to it the moment an op is committed. Bob sees the change within 200 to 300 ms of Alice pressing Enter.
 
-> **Take this with you.** Polling is not lazy design. At small scale it is cheaper and simpler than WebSocket. Switch when the polling cost (battery on mobile, wasted server work) outweighs the engineering cost.
+The next problem: at 200k concurrent sockets you need multiple WS pods. When Alice's write lands on pod A, Bob's connection lives on pod B. Pod A has to signal pod B.
 
----
-
-## Step 6: Build the architecture, one layer at a time
-
-### v1: one server, polling
+Redis pub/sub solves this. Every write publishes to a channel named `list:{list_id}`. Every WS pod that has at least one subscriber for that list receives the message and forwards it to local sockets.
 
 ```mermaid
 flowchart TB
-    C([Client]):::user --> API["API Service<br/>(REST + polling)"]:::app
-    API --> DB[("Postgres")]:::db
+    API["REST API pod"]:::app -->|"PUBLISH list:L {seq:512, op:...}"| Bus{{"Redis Pub/Sub<br/>list:{list_id}"}}:::queue
+    Bus -->|"pod A has subscribers"| WS_A["WS pod A"]:::app
+    Bus -->|"pod B has subscribers"| WS_B["WS pod B"]:::app
+    WS_A -->|"WS frame"| Alice([Alice's phone]):::user
+    WS_B -->|"WS frame"| Bob([Bob's laptop]):::user
 
     classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
     classDef app   fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-```
-
-Fine for a small team. Ships in a week.
-
-### v2: add WebSocket, still one server
-
-Split the API service into two. The REST API handles writes. The WebSocket service holds open sockets. When Alice writes, the REST API needs a way to tell the WS service immediately. Because there is only one WS process, an in-process channel works (Go channel, Node.js EventEmitter, asyncio.Queue).
-
-```mermaid
-flowchart TB
-    C([Client]):::user --> GW["API Gateway<br/>(auth, rate limit)"]:::edge
-    GW -->|write| API["REST API"]:::app
-    GW -->|subscribe| WS["WebSocket<br/>Service"]:::app
-    API --> DB[("Postgres")]:::db
-    API -.in-process event.-> WS
-
-    classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef edge  fill:#e2e8f0,stroke:#475569,color:#1e293b
-    classDef app   fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-```
-
-**Why two services and not one?** They scale very differently. The REST API is request/response with low memory per connection. The WS service is connection-heavy, with 10 to 50 KB memory per open socket. Splitting them lets each scale on its axis.
-
-### v3: multiple WS pods need a fan-out bus
-
-At ~30k concurrent sockets you need more than one WS pod. Now Alice's write can land on pod A but Bob's connection lives on pod B. Add Redis pub/sub as the fan-out bus. Every write publishes a message to a channel named `list:{list_id}`. Every WS pod that has at least one subscriber for that list receives it and forwards to local sockets.
-
-```mermaid
-flowchart TB
-    C([Client]):::user --> GW["API Gateway"]:::edge
-    GW -->|write| API["REST API<br/>(stateless pods)"]:::app
-    GW -->|subscribe| WS["WebSocket<br/>pods (×4)"]:::app
-    API --> DB[("Postgres")]:::db
-    API -->|PUBLISH list:L| Redis{{"Redis<br/>Pub/Sub"}}:::queue
-    Redis -->|SUBSCRIBE list:L| WS
-
-    classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef edge  fill:#e2e8f0,stroke:#475569,color:#1e293b
-    classDef app   fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db    fill:#fed7aa,stroke:#c2410c,color:#7c2d12
     classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
 ```
 
-### v4: add the permission cache, notifications, and op log compaction
+One important detail: pub/sub is fire-and-forget. Redis does not guarantee delivery. If a WS pod restarts mid-message, that message is gone. This is fine because the client tracks which `seq` it last received. On reconnect, it calls `GET /lists/L/changes?since_seq=N` to fill the gap. Postgres is the source of truth. Redis is just the delivery channel.
+
+The sync intervals that matter:
+
+| Delivery path | Typical latency |
+|---------------|-----------------|
+| Live WebSocket (same region) | 150 to 300 ms |
+| Polling fallback (10 s interval) | up to 10 s |
+| Reconnect catch-up from change_log | 1 to 5 s depending on gap size |
+| Client offline > 30 days (full refetch) | 5 to 30 s |
+
+> **Take this with you.** Postgres is the source of truth. Redis is the delivery channel. If a Redis message is lost, clients detect the gap via seq numbers and call the catch-up endpoint. Nothing is permanently lost.
+
+---
+
+## Decision 2: how do we handle offline writes?
+
+Carol's phone drops signal on the subway. She adds three items while offline. When she surfaces 20 minutes later, her client has three pending ops sitting in a local SQLite queue.
+
+Two problems on reconnect:
+
+1. **Duplicates.** The network might have dropped after the server accepted an op. Carol's client does not know. If she retries, the server must not create a second copy of "oat milk."
+2. **Conflicts.** Bob may have edited or deleted one of the items Carol touched while she was offline.
+
+The `client_op_id` field handles duplicates. Each op gets a UUID when Carol creates it. On reconnect she flushes the queue. The server checks `change_log` for that UUID. If it is already there, the server returns the original result. The unique index on `(list_id, client_op_id)` makes this safe under concurrent retries.
+
+```mermaid
+flowchart TD
+    Offline["Carol offline<br/>3 ops in SQLite queue"]:::app --> Reconnect[Phone reconnects]
+    Reconnect --> Subscribe["Subscribe with since_seq per list"]
+    Subscribe --> CatchUp["Server replays missed ops<br/>(sync interval: depth of offline queue)"]
+    CatchUp --> Flush["Flush pending ops via REST<br/>with client_op_id headers"]
+    Flush --> Check{client_op_id<br/>already in change_log?}
+    Check -->|yes| Return["Return original result<br/>(idempotent)"]:::ok
+    Check -->|no, no conflict| Apply["Apply op, assign seq"]:::ok
+    Check -->|item deleted| Gone["Return 410 Gone<br/>'Buy milk was deleted. Restore?'"]:::bad
+    Check -->|access revoked| Denied["Return 403<br/>'Alice removed you from this list'"]:::bad
+
+    classDef app  fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef ok   fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef bad  fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+```
+
+Typical offline queue depths and their handling:
+
+| Offline duration | Queue depth (typical) | Server response |
+|------------------|-----------------------|-----------------|
+| < 30 min | 1 to 20 ops | Replay + flush, < 1 s |
+| 1 to 8 hours | 20 to 200 ops | Replay in pages, 2 to 5 s |
+| > 30 days | N/A | `too_far_behind: true`; client refetches full state |
+
+> **Take this with you.** `client_op_id` is non-negotiable. Without it, mobile retries create duplicate items. The unique index on `(list_id, client_op_id)` in `change_log` is what makes "already applied" detection safe.
+
+---
+
+## Decision 3: what do share permissions look like?
+
+Alice owns the list. She grants Bob `editor` and Carol `viewer`.
+
+Three roles cover nearly everything:
+
+| Role | Read items | Write items | Share list | Manage members | Delete list |
+|------|------------|-------------|------------|----------------|-------------|
+| viewer | yes | no | no | no | no |
+| editor | yes | yes | per-list setting | no | no |
+| admin | yes | yes | yes | yes | yes |
+
+The interesting question is cascading. Alice revokes Bob. Bob had invited Dave. Does Dave lose access?
+
+Two models:
+
+```mermaid
+flowchart LR
+    subgraph NonCascade["Non-cascading (recommended)"]
+        A1(["Alice"]) -->|revoke| B1(["Bob"])
+        B1 -.not affected.-> D1(["Dave"])
+        A1 -.prompt: 'Bob invited 1 person. Remove them too?'.-> UI1["UI"]
+    end
+    subgraph Cascade["Cascading"]
+        A2(["Alice"]) -->|revoke| B2(["Bob"])
+        B2 -->|auto-revoke| D2(["Dave"])
+        D2 -->|"(Dave is surprised)".-> UI2["UI"]
+    end
+```
+
+Non-cascading is the better default. It is what Notion and Slack do. Revoking Bob does not remove Dave. Alice sees a prompt offering to remove Dave separately. Fewer surprises.
+
+The permission check runs on every request. To avoid a Postgres query on each of the 1,000 writes/sec, cache `(user_id, list_id) -> role` in Redis with a 60-second TTL. On any grant change, invalidate the cache entry. If Bob is revoked, also publish to a `perm:{bob_user_id}` Redis channel so every WS pod drops his subscriptions immediately.
+
+Permission scope comparison:
+
+| Scope | Description | Where enforced |
+|-------|-------------|----------------|
+| list-level | Can user read/write this list? | Permission cache + DB |
+| op-level | Can user perform this specific op type? | API handler |
+| revocation propagation | Drop WS subscription within 2 s | `perm:{user_id}` Redis channel |
+
+> **Take this with you.** Permissions are enforced by the server, not the client. The client greys out buttons as a courtesy. The server checks on every write.
+
+---
+
+## Decision 4: how do we resolve concurrent edits?
+
+Alice and Bob both have item #42 open. At the same moment:
+
+- Alice changes "Buy milk" to "Buy oat milk."
+- Bob changes "Buy milk" to "Buy almond milk."
+
+Both writes hit the server within 50 ms of each other.
+
+```mermaid
+flowchart TD
+    Start([Two concurrent edits on item 42]) --> Race{Which write<br/>reaches server first?}
+    Race -->|Alice wins| A["seq=512: 'Buy oat milk'<br/>saved and broadcast"]:::ok
+    A --> B["Bob's write arrives 50ms later<br/>seq=513: 'Buy almond milk'<br/>saved and broadcast"]:::ok
+    B --> Final(["All devices converge on:<br/>'Buy almond milk' (seq=513)"]):::ok
+    Race -->|Bob wins| C["seq=512: 'Buy almond milk'"]:::ok
+    C --> D["Alice gets seq=513: 'Buy oat milk' wins"]:::ok
+
+    classDef ok fill:#dcfce7,stroke:#15803d,color:#14532d
+```
+
+This is last-write-wins (LWW) by server-assigned seq. Higher seq wins. No clock skew possible because the server assigns the seq inside a transaction with a row-level lock on `lists.next_seq`.
+
+Alice's screen may briefly show "Buy oat milk" (optimistic update), then snap to "Buy almond milk" when seq=513 arrives. For a todo list, that flash is fine.
+
+<details markdown="1">
+<summary><b>Show: why LWW and not OT or CRDT</b></summary>
+
+**LWW** is correct for item-level edits on a todo list. When two people rename the same item, one edit has to lose. The behavior is "second one wins." Acceptable.
+
+**Operational Transform (OT)** is optimal when two users type in the same text field simultaneously and you want both keystrokes merged. Google Docs uses OT. We are not building Google Docs. OT adds significant complexity for no benefit here.
+
+**CRDT** earns its keep when offline editing is a first-class feature and users spend hours disconnected. CRDTs guarantee convergence without a server round-trip. The cost is real: merge metadata travels with every op, client code is more complex, debugging is harder. Use LWW as the default. Add CRDT for the title field only once offline-conflict complaints are frequent enough to justify the complexity.
+
+**Why not wall-clock timestamps?** Alice's phone might be 30 seconds ahead of Bob's. Server-assigned seq numbers have no skew.
+
+</details>
+
+> **Take this with you.** Use LWW for a todo list. The server-assigned seq number decides the winner. Add CRDT only when offline-first becomes a primary product requirement.
+
+---
+
+## Decision 5: how do we keep op log storage bounded?
+
+At 1 million users, 30 ops/day, 200 bytes each, the log grows by roughly 6 GB per day. Keeping 2 years of history is 4.4 TB. Most of it is cold.
+
+Two-tier retention:
+
+```mermaid
+flowchart LR
+    Hot[("Postgres<br/>change_log<br/>30-day window")]:::db -->|"nightly archive job"| Cold[("S3 Parquet<br/>op log archive")]:::db
+    Hot -->|since_seq in window| Client([Client catch-up]):::user
+    Cold -->|since_seq too old| Snapshot["Full state snapshot<br/>returned to client"]:::app
+
+    classDef db   fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef app  fill:#dcfce7,stroke:#15803d,color:#14532d
+```
+
+A nightly job copies rows older than 30 days from `change_log` to S3 Parquet and deletes them from Postgres. Clients reconnecting with a `since_seq` older than 30 days receive `too_far_behind: true` and refetch the full current state in one call. That keeps the hot storage at roughly 60 GB per million users.
+
+> **Take this with you.** Keep 30 days of ops in Postgres for cheap catch-up. Archive older ops to S3. Clients older than 30 days do a full refetch. Build the snapshot endpoint early; you will need it.
+
+---
+
+## The full architecture
 
 ```mermaid
 flowchart TB
@@ -326,17 +389,17 @@ flowchart TB
 
     subgraph ReadPath["Dashboard read path"]
         R["Read Service"]:::app
-        Cache[("Redis<br/>(dashboard cache,<br/>perm cache)")]:::cache
+        RedisCache[("Redis<br/>(dashboard cache ~90% hit<br/>perm cache 60s TTL)")]:::cache
     end
 
     DB[("Postgres<br/>lists · items · grants<br/>change_log (30d hot)")]:::db
 
     Bus{{"Redis Pub/Sub<br/>list:{list_id}<br/>perm:{user_id}"}}:::queue
 
-    WS["WebSocket<br/>pods (×N)"]:::app
+    WS["WebSocket<br/>pods (×N, ~50k sockets each)"]:::app
 
     subgraph Consumers["Async consumers"]
-        N["Notification<br/>Service"]:::app
+        N["Notification Service<br/>(60s batch per recipient)"]:::app
         Cold[("S3 Parquet<br/>op log archive")]:::db
     end
 
@@ -345,12 +408,12 @@ flowchart TB
     GW -->|read| R
     GW -->|subscribe| WS
     API --> DB
-    API -->|PUBLISH| Bus
+    API -->|"PUBLISH list:{id}"| Bus
     Bus --> WS
-    R --> Cache
+    R --> RedisCache
     R -.miss.-> DB
     DB -->|CDC / outbox| N
-    DB -->|nightly| Cold
+    DB -->|nightly job| Cold
 
     classDef user  fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
     classDef edge  fill:#e2e8f0,stroke:#475569,color:#1e293b
@@ -360,26 +423,22 @@ flowchart TB
     classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
 ```
 
-Each box in one line:
-
-| Box | What it does |
-|-----|--------------|
-| **API Gateway** | Authenticates the caller, rate-limits bots, routes WS upgrades to the right pod |
-| **REST API** | Handles all writes: create list, add item, check off, share. Appends to `change_log` in the same transaction |
-| **WebSocket pods** | Hold open sockets. Subscribe to Redis channels. Forward messages to local sockets |
-| **Postgres** | Source of truth. Current state plus the last 30 days of `change_log` |
-| **Redis pub/sub** | The fan-out bus. Also carries permission-revocation events |
-| **Read Service + Redis cache** | Serves the "my lists" dashboard. One cache read, no DB query in the common case |
-| **Notification Service** | Consumes `change_log` via CDC, batches per recipient, sends push/email |
-| **S3 cold tier** | Op log older than 30 days. Queried rarely, mostly for compliance |
-
-> **Take this with you.** Postgres is the source of truth. Redis is just the delivery channel. If a Redis message is lost (pub/sub is fire-and-forget), clients detect the gap via seq numbers and call the catch-up endpoint. Nothing is lost.
+| Component | Purpose |
+|-----------|---------|
+| API Gateway | Authenticates callers, rate-limits bots, routes WS upgrades to the right pod |
+| REST API | Handles all writes. Appends to `change_log` inside the same transaction as the item update |
+| WebSocket pods | Hold open sockets. Subscribe to Redis channels. Forward messages to local sockets |
+| Postgres | Source of truth. Current item state plus 30 days of `change_log` |
+| Redis pub/sub | Cross-pod fan-out for live delivery. Also carries permission-revocation events |
+| Read Service + Redis cache | Serves the "my lists" dashboard. ~90% cache hit rate, no DB query in the common case |
+| Notification Service | Consumes `change_log` via CDC, batches per recipient over 60 seconds, sends push/email |
+| S3 cold tier | Op log older than 30 days. Queried rarely, mostly for compliance or undo past the 30-day window |
 
 ---
 
-## Step 7: One write, all the way through
+## Walk: one edit, end to end
 
-Alice edits item #42 on her phone. Bob has the same list open on his laptop. Watch what happens.
+Alice edits item #42. Bob has the same list open on his laptop.
 
 ```mermaid
 sequenceDiagram
@@ -392,136 +451,91 @@ sequenceDiagram
     participant Bob as Bob's laptop
 
     Alice->>API: PATCH /lists/L/items/42 (title="Buy oat milk")
-    Note over Alice,API: Client-Op-Id header included
+    Note over Alice,API: Client-Op-Id: a3f9...
 
     rect rgb(241, 245, 249)
         Note over API,DB: one database transaction
-        API->>DB: idempotency check (client_op_id)
-        API->>DB: permission check (from cache)
+        API->>DB: idempotency check (client_op_id not seen before)
+        API->>DB: permission check (Redis cache hit, ~1ms)
         API->>DB: SELECT next_seq FOR UPDATE -> 512
         API->>DB: UPDATE list_items SET title=..., last_seq=512
-        API->>DB: INSERT change_log (seq=512, op=edit_item)
+        API->>DB: INSERT change_log (seq=512, op=edit_item, actor=Alice)
         API->>DB: COMMIT
     end
 
-    API->>Bus: PUBLISH list:L {seq:512, op:edit_item, ...}
-    API-->>Alice: 200 OK {seq: 512}
-    Bus-->>WS: deliver to subscribers of list:L
-    WS-->>Bob: WS frame {seq:512, op:edit_item, title:"Buy oat milk"}
+    API->>Bus: PUBLISH list:L {seq:512, op:edit_item, title:"Buy oat milk"} (~2ms)
+    API-->>Alice: 200 OK {seq: 512} (~30ms total)
+    Bus-->>WS: deliver to subscribers of list:L (~5ms)
+    WS-->>Bob: WS frame {seq:512, title:"Buy oat milk"} (~10ms from Bus)
     Bob->>Bob: apply op, update screen
+    Note over Bob: ~150ms total (Alice presses Enter → Bob sees update)
 ```
 
-Three things worth pointing at:
+Three things to notice:
 
-1. The seq bump, the item update, and the `change_log` row are written in **one transaction**. If anything fails, it all rolls back. Alice gets a 500. Bob never sees a partial update.
-2. The Redis publish happens **after** the commit. If you publish inside the transaction and it rolls back, subscribers see ops that never persisted.
-3. Bob's client knows it last saw `seq=511`. When `seq=512` arrives in order, apply it. If `seq=514` arrived first (gap), the client calls the catch-up endpoint to fill in `seq=513` before applying.
+1. The seq bump, the item update, and the `change_log` row are written in one transaction. If anything fails, it all rolls back. Alice sees a 500. Bob never sees a partial update.
+2. The Redis publish happens after the commit. Publishing inside the transaction and then rolling back would fan out ops that never persisted.
+3. Bob's client knows it last saw `seq=511`. When `seq=512` arrives in order, apply it. If `seq=514` arrived first (gap), the client calls the catch-up endpoint to fill in 513 before applying.
 
 ---
 
-## Step 8: The conflict problem
+## Walk: reconnect after a gap
 
-Alice and Bob both have the same list open. At the same moment:
+Bob's laptop went to sleep for 2 hours. He opens it and the WebSocket reconnects.
 
-- Alice changes item #42 from "Buy milk" to "Buy oat milk."
-- Bob changes item #42 from "Buy milk" to "Buy almond milk."
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Bob as Bob's laptop
+    participant GW as API Gateway
+    participant WS as WS pod
+    participant API as REST API
+    participant DB as Postgres
+    participant Bus as Redis Pub/Sub
 
-Both writes hit the server within 50ms of each other. Whose title wins?
+    Bob->>GW: WebSocket upgrade
+    GW->>WS: route to pod (hash of user_id)
+
+    rect rgb(241, 245, 249)
+        Note over Bob,DB: catch-up before live delivery
+        Bob->>WS: subscribe {list_ids: [L], since_seq: {L: 412}}
+        WS->>DB: SELECT * FROM change_log WHERE list_id=L AND seq > 412 ORDER BY seq LIMIT 500
+        DB-->>WS: 47 ops (seq 413..459)
+        WS-->>Bob: replay 47 ops
+    end
+
+    WS->>Bus: SUBSCRIBE list:L
+    Note over WS,Bus: now receiving live ops
+    Bob->>Bob: apply 47 ops, screen up to date
+    Note over Bob: total reconnect time ~500ms for 47 ops
+```
+
+If Bob was offline more than 30 days, the server returns `too_far_behind: true, current_seq: 9001`. Bob's client refetches full list state via `GET /lists/L`, then subscribes from `since_seq: 9001`.
+
+---
+
+## The large-list fan-out problem
+
+A "company all-hands action items" list has 5,000 subscribers. Every edit fans out to 5,000 sockets across ~8 WS pods. At 10 edits/minute, that is 50,000 message deliveries per minute, roughly 833/sec.
+
+What breaks first: outbound bandwidth per pod. 500-byte op × 625 subscribers per pod × 10 edits/min = 3 MB/min per pod. At 1 edit/sec it becomes 3 MB/sec, getting tight.
 
 ```mermaid
 flowchart TD
-    Start([Two concurrent edits on item 42]) --> S1{Alice's write<br/>reaches server first?}
-    S1 -- yes --> A1["seq=512: title='Buy oat milk'<br/>saved and published"]:::ok
-    A1 --> B1["Bob's write arrives<br/>50ms later"]
-    B1 --> B2["seq=513: title='Buy almond milk'<br/>saved and published"]:::ok
-    B2 --> End(["Final state on all devices:<br/>'Buy almond milk' (seq=513)"]):::ok
+    Edit([1 edit on a 5k-subscriber list]) --> Publish["PUBLISH to list:{id}<br/>1 Redis message"]:::app
+    Publish --> Pods["8 WS pods each receive 1 copy<br/>(625 subscribers per pod)"]:::app
+    Pods --> BW{"Outbound bandwidth<br/>per pod at 1 edit/sec?"}
+    BW -->|"< 1 MB/s"| OK["Fine. Standard pod sizing."]:::ok
+    BW -->|"10+ edits/sec"| Hot["Hot. Compact payloads.<br/>Coalesce within 100ms window.<br/>Dedicated broadcast pod."]:::bad
 
-    S1 -- no --> B3["Bob's write gets seq=512"]:::ok
-    B3 --> A2["Alice's write gets seq=513<br/>title='Buy oat milk' wins"]:::ok
-
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
     classDef ok  fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
 ```
 
-This is **last-write-wins by server-assigned sequence number (LWW)**. The server decides order. No clock skew possible.
+Mitigations: compact op payloads (delta only, not full item state), coalesce multiple edits within a 100 ms window before broadcasting, and route very large lists to dedicated broadcast pods with higher network allocation. For most todo-list use cases this scenario is rare. Consider capping subscribers per list at 1,000 in the standard product tier.
 
-Alice's screen may briefly show "Buy oat milk" (optimistic update), then snap to "Buy almond milk" when `seq=513` arrives. For a todo list, that flash is acceptable.
-
-<details markdown="1">
-<summary><b>Show: why LWW and not OT or CRDT</b></summary>
-
-**Last-write-wins (LWW)** is the right choice for a todo list. When two people both rename the same item, one edit has to lose. The user experience is "second one wins." That is fine.
-
-**Operational Transform (OT)** shines when two users are typing in the same text field at the same time and you want both keystrokes preserved. That is overkill for "edit item title." Google Docs uses OT because it is a document editor. We are not.
-
-**CRDT** earns its keep when offline editing is a first-class feature and users spend hours disconnected. CRDTs guarantee that two clients that diverged for any length of time will converge to the same final state without a server round-trip. The cost is real: bigger payload per op (merge metadata travels with the data), harder to debug, more complex client code. LWW is the right first choice for a todo list. CRDT makes sense later, for the title field, when the offline complaint is loud enough.
-
-**Why not wall-clock timestamps for LWW?** Alice's phone might be 30 seconds ahead of Bob's. Use server-assigned seq numbers instead. Higher seq wins. No clock skew possible.
-
-</details>
-
-> **Take this with you.** Use LWW for a todo list. Use CRDT for the title field only, once offline editing is a primary complaint. Never use OT unless you are building a document editor.
-
----
-
-## Step 9: Permissions
-
-Alice owns a list. She shares it with Bob as editor and Carol as viewer.
-
-Bob wants to share the list with Dave. Does Bob have that authority?
-
-```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> Active: Alice grants Bob as editor
-    Active --> CanShare: if editor-can-share setting is on
-    CanShare --> NewGrant: Bob grants Dave as viewer
-    Active --> Revoked: Alice revokes Bob
-    Revoked --> [*]
-    NewGrant --> Active: Dave has his own grant
-```
-
-Three roles. Six permissions. Simple enough to reason about.
-
-| Role | Read items | Write items | Share list | Manage members | Delete list |
-|------|------------|-------------|------------|----------------|-------------|
-| **viewer** | yes | no | no | no | no |
-| **editor** | yes | yes | per-list setting | no | no |
-| **admin** | yes | yes | yes | yes | yes |
-
-<details markdown="1">
-<summary><b>Show: the grants table and cascade rules</b></summary>
-
-```sql
-CREATE TABLE share_grants (
-    grant_id   UUID PRIMARY KEY,
-    list_id    UUID NOT NULL,
-    grantee_id UUID NOT NULL,
-    role       TEXT NOT NULL,
-    granted_by UUID NOT NULL,
-    granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    revoked_at TIMESTAMPTZ
-);
-CREATE UNIQUE INDEX idx_grants_active
-    ON share_grants (list_id, grantee_id)
-    WHERE revoked_at IS NULL;
-```
-
-A user has access if there is a row with their `grantee_id` and a NULL `revoked_at`. The partial unique index prevents accidentally giving someone two roles on the same list.
-
-**Does Dave lose access when Alice revokes Bob?**
-
-Two models. Pick one and defend it:
-
-- **Non-cascading (recommended).** Revoking Bob does NOT revoke Dave. Dave has his own grant. Alice can see Bob added Dave and choose to revoke Dave separately. The UI prompts: "Bob added 1 other person. Remove them too?" Make it explicit, not automatic. Notion and Slack both work this way.
-- **Cascading.** Revoking Bob automatically revokes everyone Bob invited, recursively. Harder to reason about. Surprises users.
-
-**Cache the permission check.** Store `(user_id, list_id) -> role` in Redis with a 60-second TTL. A user touches the same few lists repeatedly. Hit rate is very high. Invalidate on any grant change. If Bob is revoked, publish to a `perm:{bob_user_id}` Redis channel. Every WS pod that has Bob's connection drops his subscription to `list:L` immediately.
-
-Without the cache: every write triggers a Postgres permission lookup. At 1k writes/sec that is 1k extra queries/sec. With a 95% cache hit rate it drops to 50/sec.
-
-</details>
-
-> **Take this with you.** Permissions are enforced by the server, not the client. The client greys out buttons as a courtesy. The server checks every time.
+> **Take this with you.** Fan-out bandwidth is the constraint on large lists, not write throughput. Compact payloads and coalescing buy you an order of magnitude before you need dedicated infrastructure.
 
 ---
 

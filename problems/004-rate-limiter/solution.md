@@ -1,15 +1,17 @@
 ## Solution: Rate Limiter
 
-### The short version
+### What this system is
 
-A rate limiter is a counter lookup with a yes-or-no decision. The algorithm is the easy part. What actually matters:
+A rate limiter is a counter lookup with a yes-or-no decision. It sits inside the API gateway as middleware, not as a separate service. It enforces per-client quotas by keeping a shared counter in Redis, checking it atomically on every request, and returning 429 when the client is over their limit.
 
-- **Where does the check run?** In-process middleware on each gateway, not a separate service. A separate service adds one network hop per API call, which blows the latency budget.
-- **How do nodes share state?** Redis Cluster, one atomic Lua script per check, sharded by client key.
+The algorithm is the easy part. What actually matters:
+
+- **Where does the check run?** In-process middleware on each gateway, not a separate service. A separate service adds one network hop per API call and blows the latency budget.
+- **How do 200 nodes share state?** Redis Cluster, one atomic Lua script per check, sharded by client key.
 - **What happens when Redis dies?** Configurable per route. Public reads fail-open. Payment and auth endpoints fail-closed.
-- **How do you avoid Redis becoming the bottleneck?** A tiny per-node LRU cache that fast-fails over-limit clients without touching Redis.
+- **How do you keep the check under 2ms?** A tiny per-node LRU cache that fast-fails over-limit clients without touching Redis.
 
-The best algorithm for almost every case is the **sliding window counter**: O(1) memory, no boundary doubling, fits in 15 lines of Lua. Token bucket is a strong second when you want explicit burst ceilings.
+The best algorithm for almost every case is the **sliding window counter**: O(1) memory, no boundary doubling, 15 lines of Lua. Token bucket is a strong second when you need explicit burst ceilings.
 
 ---
 
@@ -17,19 +19,19 @@ The best algorithm for almost every case is the **sliding window counter**: O(1)
 
 If you only get to ask two clarifying questions, ask these.
 
-**What do you limit on?** Per IP? Per API key? Per user? All three? Per IP fails immediately against corporate NAT and IP rotation. Per API key is the right default. Layered keys (IP + API key + user) catch more abuse vectors.
+**What do you limit on?** Per IP? Per API key? Per user? All three? Per-IP fails immediately against corporate NAT and IP rotation. Per-API-key is the right default. Layered keys (IP + API key + user) catch more abuse vectors.
 
 **What happens when the counter store is down?** This is a business question. Public read APIs usually fail-open (enforce nothing, keep serving). Payment and auth endpoints fail-closed (stop serving rather than allow abuse). If you do not have an answer to this, you have not finished the design.
 
 ---
 
-### 2. The math, in plain numbers
+### 2. The math
 
 | Number | Value | Why it matters |
 |--------|-------|----------------|
 | Peak QPS | 300,000 | Drives Redis sizing |
 | Counter writes/sec | 300K to 1M (multiple counters per client) | One Redis handles ~100K/sec, so sharding is required |
-| Total state | ~30MB | Tiny. Shard for availability, not capacity |
+| Total state | ~30 MB | Tiny. Shard for availability, not capacity |
 | Per-node QPS | 1,500 | Easy in-process. The cost is round trips, not compute |
 | Wire bytes per check | ~120 | Negligible. Round trips are what hurt |
 
@@ -39,7 +41,7 @@ State is small. Requests are many. Every request must touch the limiter. Everyth
 
 ### 3. The API and headers
 
-The limiter is internal middleware. It does not have a public API. It does produce headers on every API response.
+The limiter is internal middleware. It does not have a public API. It produces headers on every API response.
 
 **Allowed:**
 
@@ -70,10 +72,12 @@ Content-Type: application/json
 
 Four choices worth defending:
 
-- **429 not 503.** 503 means "the server is overloaded; try anywhere." 429 means "*you* are over your limit; others are fine."
-- **`Retry-After` is required.** Well-written SDKs respect it. Either way, sending it costs nothing.
-- **Headers on success too.** Good clients self-throttle. They never reach 429.
-- **Include a doc URL.** The single most effective way to cut support tickets.
+| Choice | Reason |
+|--------|--------|
+| 429, not 503 | 503 means "the server is overloaded, try anywhere." 429 means "you are over your limit, others are fine." |
+| `Retry-After` is required | Well-written SDKs respect it. Sending it costs nothing. |
+| Headers on success too | Good clients self-throttle. They never reach 429. |
+| Include a doc URL | The single most effective way to cut support tickets. |
 
 ---
 
@@ -152,15 +156,6 @@ estimated = current + previous * (1 - elapsed / window)
 
 No boundary jump. As time passes, the previous window's contribution decays from 100% to 0% smoothly.
 
-The full Lua script is in `question.md` Step 8. Key properties:
-
-- One Redis round trip per check (two GETs + one conditional INCRBY, all inside one Lua execution).
-- Atomic at the shard level. Two concurrent requests cannot both pass the check at count = limit - 1.
-- Clock from the caller, not Redis. Prevents window mismatches during failover.
-- `cost` parameter supports cost-based limits at zero extra Redis calls.
-
-For explicit burst control (200 requests in the first 10 seconds, then 1/second after), use **token bucket** instead. Two knobs: `bucket_size` (max burst) and `refill_rate` (sustained).
-
 ```mermaid
 stateDiagram-v2
     direction LR
@@ -174,9 +169,18 @@ stateDiagram-v2
     Rejected --> [*]
 ```
 
+The diagram above is the **token bucket** state machine, shown as the second option. Use it when you need an explicit burst ceiling: "200 requests in the first second, then 1/second after." Two knobs: `bucket_size` (max burst) and `refill_rate` (sustained throughput).
+
+Key properties of the Lua implementation (full script in `question.md`):
+
+- One Redis round trip per check (two GETs + one conditional INCRBY, all inside one Lua execution).
+- Atomic at the shard level. Two concurrent requests cannot both pass the check at count = limit - 1.
+- Clock from the caller, not Redis. Prevents window mismatches during failover.
+- `cost` parameter supports cost-based limits at zero extra Redis calls.
+
 ---
 
-### 6. Resolving a check on the gateway
+### 6. How the gateway resolves a check
 
 The limiter is in-process middleware. Per-request flow:
 
@@ -486,13 +490,13 @@ The only race the design accepts is the local LRU's 100ms inconsistency window. 
 
 **8. Pre-warming a known burst.**
 
-Write a row to `rate_limit_overrides` with `valid_until = 2026-05-27 02:01:00`. Active only for that minute. The gateway picks it up within 60 seconds. For recurring batch use cases, a separate `/batch` endpoint with its own higher limits (backed by a separate API key) is cleaner.
+Write a row to `rate_limit_overrides` with `valid_until = 2026-05-28 02:01:00`. Active only for that minute. The gateway picks it up within 60 seconds. For recurring batch use cases, a separate `/batch` endpoint with its own higher limits (backed by a separate API key) is cleaner.
 
 **9. "User got popular."**
 
 The limit enforced correctly if set to protect the API. Whether it was the *right* call depends on whether the goal is protecting the API or protecting the customer from runaway cost.
 
-Smarter signals: compare the current minute's rate against the customer's 7-day P95. A 10x step-change sustained for 2 minutes triggers an automated email: "Your API saw a 10x spike. You've been temporarily throttled. Click here to raise your limit." Self-service relief. If the traffic pattern is bot-like (single user-agent, one geo, repeated path), throttle. If it is human (mixed UAs, geo-distributed, varied paths), that is real viral traffic and it is worth auto-raising the limit for a paid account.
+Smarter signals: compare the current minute's rate against the customer's 7-day P95. A 10x step-change sustained for 2 minutes triggers an automated email: "Your API saw a 10x spike. You have been temporarily throttled. Click here to raise your limit." Self-service relief. If the traffic pattern is bot-like (single user-agent, one geo, repeated path), throttle. If it is human (mixed user-agents, geo-distributed, varied paths), that is real viral traffic and it is worth auto-raising the limit for a paid account.
 
 **10. The limiter is the bottleneck.**
 
@@ -513,7 +517,7 @@ The first three explain ~90% of latency regressions in practice.
 
 **Per-region vs global limits.** Per-region is the default. Cross-region counter sync adds 100ms+ to every check. Global limits exist only for enterprise contracts that require them. Document the trade-off explicitly. A client using two regions can get up to 2x their limit. That is not a bug; it is the price of low latency.
 
-**Why the limiter is a library, not a service.** A separate rate-limiter service adds one network hop per API call. At 2ms budget, one hop already takes 1-2ms. You have no room for another.
+**Why the limiter is a library, not a service.** A separate rate-limiter service adds one network hop per API call. At a 2ms budget, one hop already takes 1-2ms. There is no room for another.
 
 **Why Lua, not application-level transactions.** A read followed by a conditional write in two separate Redis calls is not atomic. Two concurrent requests can both read count = 99, both pass the check, and both increment. Lua runs serially within a Redis shard. No coordination protocol needed.
 

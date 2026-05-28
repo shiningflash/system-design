@@ -1,45 +1,37 @@
-## Solution: Design a Web Crawler (Googlebot)
+## Solution: Web Crawler (Googlebot)
 
-### The short version
+### What this system is
 
-A web crawler is a graph walker. It pulls a URL off a to-do list (the frontier), downloads the page, finds the links inside, cleans them up, checks if they are new, and adds new ones back to the list. Repeat forever.
+A web crawler is a graph walker at industrial scale. It pulls a URL off a priority queue (the frontier), downloads the page, finds every link inside, canonicalizes and deduplicates them against 50 billion previously seen URLs, and pushes the new ones back into the queue. That loop runs 58,000 times per second across 450 machines.
 
-The hard parts are not the queue:
-
-- **Politeness.** Never crash another person's website. One stranger should never get hurt by your crawler.
-- **Dedup.** With 50 billion URLs, you cannot afford to fetch the same page twice. A Bloom filter handles the hot path. A key-value store confirms.
-- **Coordination.** 450 machines must work together without stepping on each other. The trick: split the frontier by hostname so all decisions about one site live on one machine.
-- **Recrawl.** News sites change every hour. Old blogs change once a year. A separate scheduler decides when to revisit each URL.
-
-The throughput numbers are large but tractable. The real complexity is etiquette and coordination, not raw QPS.
+The three properties that make this hard: every website must be treated politely (no more than 1 req/sec by default), duplicates must be discarded before fetching (not after), and the queue must survive machine reboots without losing work. All three constraints drive the same architectural choice: shard the frontier by hostname so every decision about one website lives on one machine.
 
 ---
 
 ### 1. The two questions that matter most
 
-**What are we crawling?** HTML only? Or also JS-rendered SPAs, images, PDFs? Each is a separate pipeline. Assuming "everything" makes the design 10x bigger than intended.
+**What are we crawling?** HTML-only, or also JS-rendered SPAs, images, and PDFs? Each is a separate pipeline. Assuming "everything" makes the design 10x bigger than the interviewer intended.
 
-**How fresh must the index be?** A crawler that promises hourly freshness for news needs a recrawl scheduler that is larger and more complex than the discovery crawler itself.
+**How fresh must the index be?** A crawler targeting hourly freshness for news sites needs a recrawl scheduler that is larger and more complex than the discovery crawler itself.
 
-Everything else (politeness detail, JS rendering, output format) follows from those two answers.
+Everything else (exact politeness rules, JS rendering budget, output format, geo-distribution) follows from those two answers.
 
 ---
 
-### 2. The math, in plain numbers
+### 2. The math
 
-| What | Number |
-|------|--------|
-| Fetches/sec sustained | 58,000 |
-| Fetches/sec peak | ~150,000 |
-| Bandwidth sustained | 5.8 GB/sec |
-| Raw HTML/day | 500 TB compressed |
-| 30-day hot storage | ~10 PB after dedup |
-| Frontier metadata | ~5.5 TB across 64 shards |
-| Bloom filter for 50B URLs | ~60 GB across 8-16 nodes |
+| Metric | Value |
+|--------|-------|
+| Fetches/sec (sustained) | 58,000 |
+| Fetches/sec (peak) | ~150,000 |
+| Bandwidth (sustained) | 5.8 GB/sec |
+| Raw HTML per day | 500 TB compressed |
+| 30-day hot storage | ~10 PB (after ~30% content dedup) |
+| Frontier metadata (64 shards) | ~5.5 TB total, ~85 GB per shard |
+| Bloom filter (50B URLs, 1% FP rate) | ~60 GB across 8-16 nodes |
 | Fetcher nodes | ~450 |
-| Concurrent host slots active | ~58,000 of 500M known hosts |
 
-The headline observation: the bottleneck is not storage or CPU. It is per-host politeness coordination. That single constraint drives the sharding scheme. Hash by host so all decisions about one website happen on one shard.
+The headline observation: the bottleneck is not storage or CPU. It is per-host politeness coordination. 450 machines must collectively enforce "max 1 req/sec" for each of 500 million different websites. That single constraint drives the sharding scheme.
 
 ---
 
@@ -69,7 +61,7 @@ Response:
 }
 ```
 
-Two load-bearing details. No two URLs in the batch share a host, so the fetcher fires 100 requests in parallel without violating any rate limit. The **lease** means: if the fetcher does not call back in 60 seconds, the URLs go back into the queue. Prevents lost work when a node dies.
+No two URLs in the batch share a host, so the fetcher fires 100 requests in parallel without violating any rate limit. The lease means: if the fetcher does not call back in 60 seconds, the URLs return to the queue. This prevents lost work when a node dies.
 
 **Fetcher to Frontier: acknowledge results.**
 
@@ -94,7 +86,7 @@ POST /dedup/check_and_add
 { "candidates": [{ "url": "...", "parent_url": "...", "depth": 4 }, ...] }
 
 Response:
-{ "new_urls": [ ... ] }   # only URLs not seen before
+{ "new_urls": [ ... ] }   // only URLs not seen before
 ```
 
 The service does a Bloom filter check, then a KV lookup for the ones Bloom flagged as "maybe seen." Only truly-new ones reach the frontier.
@@ -174,21 +166,21 @@ CREATE INDEX idx_refresh ON url_meta (next_refresh_at)
     WHERE next_refresh_at IS NOT NULL;
 ```
 
-`flags` is a bitfield, not separate columns. States like `trap_suspected`, `soft_404`, `redirect_chain_too_long` can be added without a schema migration. Each bit is one test.
+`flags` is a bitfield. States like `trap_suspected`, `soft_404`, and `redirect_chain_too_long` can be added without a schema migration.
 
 </details>
 
-The **Content Store** lives in object storage (S3 or GCS), addressed by `content_hash` (SHA-256 of the compressed body). Two URLs returning the same page write the same key. The second write is a no-op. This is free content dedup at write time.
+The Content Store lives in object storage (S3 or GCS), addressed by `SHA256(compressed body)`. Two URLs returning the same page write the same key. The second write is a no-op. Free content dedup at write time.
 
-The **frontier shard** holds in-memory state not in the tables: a priority heap keyed by `(host_id, scheduled_at, priority)`, per-host token buckets, and per-host "next allowed fetch" timestamps. On restart, rebuild from `url_meta`.
+The frontier shard holds in-memory state not in the tables: a priority heap keyed by `(host_id, scheduled_at, priority)`, per-host token buckets, and per-host "next allowed fetch" timestamps. On restart, rebuild from `url_meta`.
 
 ---
 
-### 5. The core algorithm
+### 5. The core algorithms
 
 #### URL canonicalization
 
-Before doing anything with a URL, clean it so different forms of the same page look identical.
+Before dedup-checking any URL, normalize it so different forms of the same page look identical.
 
 <details markdown="1">
 <summary><b>Show: the canonicalize function</b></summary>
@@ -219,7 +211,7 @@ def canonicalize(raw_url, base_url):
                        path, "", query, ""))
 ```
 
-Session tokens like `PHPSESSID` cause infinite URL explosions: the same page has a different URL for every visitor. Stripping `utm_*` is opinionated but correct for dedup. Sorting query params ensures `?a=1&b=2` and `?b=2&a=1` hash to the same value.
+Session tokens like `PHPSESSID` cause infinite URL explosions: the same page has a different URL for every visitor. Sorting query params ensures `?a=1&b=2` and `?b=2&a=1` hash to the same value.
 
 </details>
 
@@ -229,9 +221,9 @@ Session tokens like `PHPSESSID` cause infinite URL explosions: the same page has
 def is_new(url):
     h = sha256(canonicalize(url))
     if not bloom.contains(h):
-        return True                  # definitely new
+        return True          # definitely new: 0% false negative
     if not kv_store.exists(h):
-        return True                  # Bloom false positive
+        return True          # Bloom false positive (~1% of checks)
     return False
 
 def mark_seen(url):
@@ -240,9 +232,7 @@ def mark_seen(url):
     kv_store.put(h, {"first_seen": now()})
 ```
 
-The Bloom filter is partitioned by URL hash prefix across 8-16 nodes. Each node owns a slice of the keyspace. Both reads and writes route to one specific node.
-
-False positive rate: 1%. That means 1% of new URLs trigger an extra KV lookup. Tunable by adding more bits per element.
+The Bloom filter is partitioned by URL hash prefix across 8-16 nodes. Each node owns a slice of the keyspace. Both reads and writes route to one specific node. False positive rate: 1%. Tunable by adding more bits per element.
 
 #### Politeness with token buckets
 
@@ -268,16 +258,16 @@ class HostTokenBucket:
 
 </details>
 
-The bucket lives on the frontier shard that owns the host. `lease_batch` only returns URLs whose bucket has a token. URLs with empty buckets are skipped; the shard moves on to other hosts.
+The bucket lives on the frontier shard that owns the host. `lease_batch` only returns URLs whose host bucket has a token. URLs with empty buckets are skipped; the shard moves to other hosts.
 
 #### Priority scoring
 
-Each URL gets a score when it enters the frontier:
+Each URL gets a priority score when it enters the frontier:
 
 ```python
 def initial_priority(url, parent_url, parent_priority):
     p = 0.5
-    p *= host_quality_score(host_of(url))    # 0.0 (spam) to 1.0 (great)
+    p *= host_quality_score(host_of(url))    # 0.0 (spam) to 1.0 (high quality)
     p *= parent_priority ** 0.5              # diffuse from parent
     p *= 1 / (1 + depth(url))               # depth decay
     if has_known_trap_pattern(url):
@@ -285,7 +275,7 @@ def initial_priority(url, parent_url, parent_priority):
     return min(1.0, max(0.0, p))
 ```
 
-Host quality scores are computed offline in a daily batch job over the link graph. Spam hosts identified today have their queued URLs deprioritized overnight.
+Host quality scores are recomputed offline in a daily batch job over the link graph. Spam hosts identified today have their queued URLs deprioritized overnight.
 
 ---
 
@@ -311,10 +301,10 @@ flowchart TB
 
     subgraph ParseLayer["Parse layer"]
         P[/"Link Extractor<br/>(stateless workers)"/]:::app
-        D[/"Dedup Index<br/>(Bloom + sharded KV)"/]:::cache
+        D[/"Dedup Index<br/>(Bloom ~60 GB, 1% FP rate<br/>+ sharded KV)"/]:::cache
     end
 
-    Store[("Content Store<br/>S3, keyed by content hash")]:::db
+    Store[("Content Store<br/>S3, keyed by SHA256(body)")]:::db
     Meta[("URL Metadata<br/>Postgres / RocksDB")]:::db
 
     S --> F
@@ -336,58 +326,64 @@ flowchart TB
     classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
 ```
 
-Five things to notice:
+Five things worth pointing at:
 
-1. The frontier is the coordination bottleneck. Politeness, priority, and dedup-confirmation all need state. Sharding by host keeps the hot path local.
-2. The fetcher pool is the bandwidth bottleneck. Stateless. Easy to scale. Caches are per-node to avoid choke points.
-3. Content Store is hash-addressed. Two URLs with the same content write one blob. Free dedup at write time.
-4. Link Extractor is separate from Fetcher. Parsing is CPU-bound; fetching is IO-bound. Mixing them wastes both types of capacity. If the parser fleet dies, the raw HTML is safely in Kafka.
-5. The Dedup Index is separate from the Frontier. The Bloom filter is global. Co-locating it with the frontier (sharded by host) would not work because outlinks from one page span many hosts.
+1. The frontier is the coordination bottleneck. Politeness, priority, and dedup-confirmation all need host-local state. Sharding by hostname keeps the hot path local.
+2. The fetcher pool is the bandwidth bottleneck. Stateless. Easy to scale horizontally. Per-node caches avoid chokepoints.
+3. Content Store is hash-addressed. Two URLs with the same HTML write one blob. Free dedup at write time, ~30% storage savings.
+4. Link Extractor is separate from Fetcher. Parsing is CPU-bound; fetching is IO-bound. Mixing them wastes both. If the parser fleet dies, raw HTML is safely buffered in Kafka.
+5. The Dedup Index is separate from the Frontier. The Bloom filter is global (all URL hashes, regardless of host). Co-locating it with the frontier would not work because outlinks from one page span many hosts.
 
 ---
 
 ### 7. One URL's journey, end to end
 
-1. **Discovery.** A fetched page `blog.example.com/post-1` is parsed by the Link Extractor. One `<a href>` link is `/post-2`. Canonicalize to `https://blog.example.com/post-2`.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant F as Frontier (shard 17)
+    participant W as Fetcher-042
+    participant R as Robots Cache
+    participant Site as blog.example.com
+    participant Store as Content Store
+    participant K as Kafka
+    participant P as Link Extractor
+    participant D as Dedup Index
 
-2. **Dedup check.** Send to the Dedup Service. Bloom says "not seen." Return as new.
+    F->>W: lease batch of 100 URLs (one per host)
+    W->>R: is /post-2 allowed on blog.example.com?
+    R-->>W: yes, crawl-delay=1s (~95% hit from local DNS/robots cache)
 
-3. **Frontier insert.** Route to shard `hash("blog.example.com") mod 64 = shard 17`. Compute initial priority from parent + depth + host quality. Insert into shard 17's priority heap.
+    rect rgb(241, 245, 249)
+        Note over W,Store: fetch and store (~150ms typical)
+        W->>Site: GET /post-2 (User-Agent: MyCrawler/2.0)
+        Site-->>W: 200 OK + HTML body
+        W->>Store: write compressed HTML (key = SHA256(body))
+        W->>F: ack: url=post-2, status=200, content_hash=abc...
+    end
 
-4. **Wait.** The URL sits in the queue. The host's token bucket releases 1 token/sec.
+    W->>K: emit fetched-page event (fire and forget)
+    K->>P: fetched-page event
+    P->>P: find 25 outlinks, canonicalize each
+    P->>D: check: are these 25 URLs new?
+    D-->>P: 18 new (Bloom: not seen), 7 seen
+    P->>F: insert 18 new URLs into frontier shard(s)
+```
 
-5. **Lease.** Fetcher-042 calls `lease_batch` on shard 17 with `batch_size=100`. Shard 17 picks 100 URLs from 100 different hosts, each with a free token. `post-2` is one of them. Tokens consumed. URLs returned with a 60-second lease.
-
-6. **DNS.** Fetcher-042 checks its local DNS cache. Cache miss. Query DNS. Cache for the TTL.
-
-7. **Robots.** Check robots.txt cache. Cache hit. `/post-2` is allowed.
-
-8. **Fetch.** Open HTTPS connection (reuse from pool if possible). GET `/post-2` with the crawler's user agent. Receive 200 + body.
-
-9. **Content hash.** Normalize the body (strip per-request noise like CSRF tokens). Compute SHA-256.
-
-10. **Store.** Write compressed body to S3 at key `sha256:abc...`. Update `url_meta`: `last_fetched`, `last_status=200`, `content_hash=abc...`.
-
-11. **Ack.** Fetcher sends ack to shard 17. Shard updates host health (success), schedules `next_refresh_at`, removes URL from the active lease.
-
-12. **Extract.** Link Extractor consumes the fetched-pages Kafka event. Parses `post-2`'s HTML. Finds 25 outlinks. Each goes through canonicalize, dedup check, frontier insert.
-
-The interesting observation: most of the latency is queue wait, often hours for low-priority URLs. The actual work is fast. The system is throughput-bound, not latency-bound.
+The key observation: most of a URL's lifetime is queue wait (minutes to hours for low-priority URLs). The actual work is fast. The system is throughput-bound, not latency-bound.
 
 ---
 
 ### 8. Frontier maintenance
 
-The frontier is not just a queue you push to and pop from. It needs active maintenance.
+The frontier is not just a queue to push and pop. It needs active maintenance.
 
-**Trim dead URLs.** URLs with `last_status` in `[404, 410, 451]` for more than 30 days are removed.
+**Trim dead URLs.** URLs with `last_status` in `{404, 410, 451}` for more than 30 days are removed from the active queue.
 
-**Adaptive refresh.** Each URL has `next_refresh_at`. After every fetch:
+**Adaptive refresh.** After every fetch:
 
-- Content changed: halve the interval (floor depends on host class).
+- Content changed: halve the crawl interval (down to a per-class floor).
 - Content unchanged: multiply the interval by 1.5 (up to a ceiling).
-
-Floors and ceilings by host class:
 
 | Host class | Floor | Ceiling |
 |------------|-------|---------|
@@ -406,9 +402,9 @@ Floors and ceilings by host class:
 ```mermaid
 flowchart LR
     S1["Stage 1<br/>1 machine<br/>100K pages/day<br/>SQLite + local disk<br/>~$30/mo"]:::s1
-    S2["Stage 2<br/>~10 machines<br/>10M pages/day<br/>Postgres + S3<br/>+ Redis robots cache<br/>~$1k/mo"]:::s2
-    S3["Stage 3<br/>~100 machines<br/>500M pages/day<br/>Sharded frontier<br/>+ Kafka + Bloom<br/>~$50-100k/mo"]:::s3
-    S4["Stage 4<br/>~450 machines<br/>5B pages/day<br/>+ JS render fleet<br/>+ trap detector<br/>+ regional fetchers"]:::s4
+    S2["Stage 2<br/>~10 machines<br/>10M pages/day<br/>Postgres + S3<br/>Redis robots cache<br/>~$1K/mo"]:::s2
+    S3["Stage 3<br/>~100 machines<br/>500M pages/day<br/>Sharded frontier<br/>Kafka + Bloom<br/>~$50-100K/mo"]:::s3
+    S4["Stage 4<br/>~450 machines<br/>5B pages/day<br/>JS render fleet<br/>trap detector<br/>regional fetchers"]:::s4
 
     S1 --> S2 --> S3 --> S4
 
@@ -420,46 +416,46 @@ flowchart LR
 
 #### Stage 1: 1 machine, 100K pages/day
 
-One Python script. SQLite for `url_meta`. Local disk for HTML. No Bloom filter (the seen-set fits in RAM). robots.txt fetched on every request. About $30/month.
+One Python script. SQLite for `url_meta`. Local disk for HTML. No Bloom filter (the seen set fits in RAM). Robots.txt fetched on every request. About $30/month.
 
 Fine because 100K pages/day is roughly 1 fetch/sec. Building more is over-engineering.
 
 #### Stage 2: 10 machines, 10M pages/day
 
-What breaks: SQLite locks up under concurrent writes. Local disk runs out. robots.txt re-fetching annoys webmasters.
+What breaks: SQLite locks under concurrent writes. Local disk runs out. Robots.txt re-fetching annoys webmasters.
 
-Fixes, in order: move `url_meta` to Postgres, move HTML to S3 addressed by content hash, cache robots.txt in Redis with 24h TTL, add a real Bloom filter (fits in RAM at this size), add per-host token buckets in Redis. Still one shared frontier. ~$1k/month.
+Fixes: move `url_meta` to Postgres, move HTML to S3 keyed by content hash, cache robots.txt in Redis with 24h TTL, add a Bloom filter (fits in RAM at this size), add per-host token buckets in Redis. Still one shared frontier. ~$1K/month.
 
-#### Stage 3: hundreds of machines, 500M pages/day
+#### Stage 3: 100 machines, 500M pages/day
 
 What breaks: Postgres becomes a bottleneck under concurrent frontier access. Politeness violations happen because fetchers race for host tokens. The seen-URL check cannot keep up.
 
-Fixes: shard the frontier by hostname across 64 nodes backed by RocksDB, each with Raft replication. Decouple parsing from fetching via Kafka (fetching is IO-bound, parsing is CPU-bound; separate fleets for each). Add a sharded Bloom filter across 8 nodes. Add regional fetcher pools for EU and Asia hosts. About $50-100k/month.
+Fixes: shard the frontier by hostname across 64 nodes backed by RocksDB with Raft replication. Decouple parsing from fetching via Kafka. Add a sharded Bloom filter across 8 nodes. Add regional fetcher pools for EU and Asia hosts. About $50-100K/month.
 
 #### Stage 4: Googlebot scale, 5B pages/day
 
-What breaks: one frontier shard with a giant host (Wikipedia, GitHub) becomes hot. JS-heavy pages return empty content. Spam farms fill the frontier with junk. The Bloom filter's false positive rate drifts up as the universe grows beyond 50B URLs.
+What breaks: one frontier shard with a giant host (Wikipedia, GitHub) becomes hot. JS-heavy pages return empty content. Spam farms fill the frontier with junk. Bloom filter false positive rate drifts up as the URL universe grows past 50 billion.
 
 Fixes, in order:
 
 - **Hot host mitigation.** Cap per-host pop rate. Spill low-priority URLs to cold storage. Coordinate with mega-hosts via their sitemaps.
-- **JS render pipeline.** Separate fleet of headless Chromium. Allocate ~5% of capacity. Flag and route only JS-heavy URLs.
-- **Trap detector.** Background job clusters URLs by shape. Hosts where one URL shape dominates get flagged.
+- **JS render pipeline.** Separate fleet of headless Chromium. Allocate ~5% of capacity.
+- **Trap detector.** Background job clusters URLs by shape. Hosts where one URL pattern dominates get flagged.
 - **Bloom rebuild.** Nightly job rebuilds from the KV store, restoring the 1% false positive rate.
 - **Adaptive recrawl scheduler.** Per-URL frequency based on observed content changes.
 
-This is also where multi-region shows up. Each major region runs its own fetcher pool. The frontier remains globally sharded. Only the IO leg is regional.
+Multi-region shows up here. Each major region runs its own fetcher pool. The frontier stays globally sharded. Only the IO leg is regional.
 
 ---
 
 ### 10. JavaScript rendering
 
-The modern web is JS-heavy. `https://airbnb.com/rooms/123` might return an almost-empty `<div id="root">` and load real content via JavaScript. Plain HTTP GET sees nothing useful.
+The modern web is JS-heavy. `https://airbnb.com/rooms/123` might return an almost-empty `<div id="root">` and load content via JavaScript. A plain HTTP GET sees nothing useful.
 
 Two-pass crawl, the way Googlebot actually works:
 
-1. **First pass: static fetch.** Standard HTTP GET. Parse the HTML. If the page looks JS-heavy (very little text, few outlinks, large `<script>` blocks), flag it.
-2. **Second pass: render.** Send the URL to a render queue. A headless Chromium node loads the URL, runs JavaScript, waits a few seconds for the page to settle, takes a DOM snapshot, writes rendered HTML to the Content Store under a new key.
+1. **Static fetch.** Standard HTTP GET. Parse HTML. If the page looks JS-heavy (very little text, few outlinks, large `<script>` blocks), flag it.
+2. **Render pass.** Send the URL to a render queue. A headless Chromium node loads the URL, runs JavaScript, waits a few seconds for the page to settle, takes a DOM snapshot, writes rendered HTML to the Content Store under a new key.
 3. **Re-extract.** Link Extractor runs again on the rendered HTML. Now it finds the real outlinks.
 
 Rendering is 10x to 100x more expensive than a plain fetch. Allocate ~5% of total capacity. Prioritize high-value URLs only.
@@ -489,14 +485,14 @@ Rendering is 10x to 100x more expensive than a plain fetch. Allocate ~5% of tota
 | `fetches_per_sec` (sustained, peak) | Headline throughput |
 | `frontier_size_per_shard` | Detects hot shards |
 | `host_quota_used_per_host` | Politeness compliance |
-| `robots_disallow_rate` | Spike means your user agent is getting blocked |
+| `robots_disallow_rate` | Spike means the user agent is getting blocked |
 | `dedup_false_positive_rate` | Above 1% means rebuild the Bloom filter |
-| `content_dedup_rate` | Should be ~30%. Higher means you are crawling mirrors |
+| `content_dedup_rate` | Should be ~30%. Higher means crawling mirrors |
 | `outlinks_per_page` p50/p99 | Spike means a trap site |
-| `fetch_status_breakdown` 429/503 rate | Spike means you are being too aggressive |
+| `fetch_status_breakdown` 429/503 rate | Spike means being too aggressive |
 | `frontier_lease_expiry_rate` | High means the fetcher pool is struggling |
-| `recrawl_scheduler_lag` | Overdue refreshes piling up means the freshness SLO is at risk |
-| `dns_cache_hit_rate` | Below 95% means you are hammering DNS |
+| `recrawl_scheduler_lag` | Overdue refreshes piling up means freshness SLO is at risk |
+| `dns_cache_hit_rate` | Below 95% means hammering DNS |
 | `js_render_queue_depth` | JS pipeline is the slow lane; it can back up |
 | `webmaster_complaint_count` | Page on this. Politeness is the headline non-functional SLO. |
 
@@ -510,20 +506,18 @@ Ticket on: dedup rate drift, content dedup rate spike (mirror crawl), trap detec
 
 **1. Crawler trap.**
 
-Symptoms: one host produces unbounded outlinks of the same shape (`?date=2026-05-25`, `?date=2026-05-26`, ...).
-
 Detection in layers:
 
-- **Per-host URL count cap.** If a host adds more than 1 million URLs to the frontier in a day, pause new additions from that host pending review.
-- **Pattern heuristic.** For each host, cluster URLs by normalized shape (replace digits and tokens with wildcards). If one shape is more than 80% of the host's URLs, flag as a likely trap.
-- **Depth limit.** Hard cap at depth 20. Calendar traps link to themselves indefinitely, so depth grows without bound. The cap stops them.
+- **Per-host URL count cap.** If a host adds more than 1 million URLs in a day, pause new additions from that host pending review.
+- **Pattern heuristic.** Cluster each host's URLs by normalized shape (replace digits and tokens with wildcards). If one shape is more than 80% of the host's URLs, flag as a likely trap.
+- **Depth limit.** Hard cap at depth 20. Calendar traps link to themselves indefinitely. The cap stops them.
 - **Outlink density.** Pages with more than 500 same-shape outlinks to the same host get flagged.
 
 Recovery: drop the trap URLs from the frontier. Lower the host's quality score so future URLs from it get deprioritized.
 
 **2. Soft 404.**
 
-Detection: a single `content_hash` accounting for more than 30% of fetched pages on a host means those URLs all return the same "page not found" body. A secondary signal: that body contains text like "404", "not found", "page does not exist" and is unusually short.
+A single `content_hash` accounting for more than 30% of fetched pages on a host means those URLs all return the same "page not found" body. A secondary signal: that body contains text like "404" or "not found" and is unusually short.
 
 Once detected, mark `soft_404` in `url_meta`. The indexer ignores those URLs. Recrawl drops to once a month in case the site fixes itself.
 
@@ -539,37 +533,37 @@ Track whether `content_hash` changed since the last fetch. Changed: halve the in
 
 **5. Frontier persistence.**
 
-Writing every push synchronously to disk would exhaust the IOPS budget. Instead: keep the queue in memory for low latency, append every operation to a RocksDB write-ahead log asynchronously, and snapshot the full in-memory state to RocksDB every 5 minutes. On restart: load the most recent snapshot, replay the log past it, resume. A crash may lose the last few seconds of pushes. That is fine because URLs are idempotent: a re-discovered URL is caught by the Bloom filter and discarded.
+Writing every push synchronously to disk exhausts the IOPS budget. Keep the queue in memory for low-latency pops. Append every operation to a RocksDB write-ahead log asynchronously. Snapshot the full in-memory state to RocksDB every 5 minutes. On restart: load the most recent snapshot, replay the log past it, resume. A crash may lose the last few seconds of pushes. That is fine because URL dedup is idempotent: re-discovered URLs are caught by the Bloom filter and discarded.
 
 **6. Bloom filter race.**
 
-Two fetchers in different regions discover the same new URL at the same instant. Both calls route to the same Bloom shard (the URL hash deterministically picks the shard). On the shard, the operation is atomic: if not in Bloom, add to Bloom and KV; otherwise reject. Only one wins. No inter-region race is possible because both calls hit the same shard.
+Two fetchers in different regions discover the same new URL at the same instant. Both calls route to the same Bloom shard (the URL hash deterministically picks the shard). On the shard, the check-and-add is atomic: if not in Bloom, add to Bloom and KV; otherwise reject. Only one wins. No inter-region race is possible because routing is deterministic.
 
 **7. Two URLs, same content.**
 
 After canonicalization, `utm_*` is stripped, so `example.com/article/123?utm=email` and `example.com/article/123` become the same URL. Dedup catches them at the URL layer before any fetch.
 
-If canonicalization misses something and both URLs get fetched, they compute the same `content_hash`. The Content Store write is a no-op on the second. The `url_meta` table has two rows pointing at the same `content_hash`. The indexer picks the canonical URL by signals like inlink count, indexes the rest as aliases.
+If canonicalization misses something and both URLs get fetched, they compute the same `content_hash`. The Content Store write is a no-op on the second. The `url_meta` table has two rows pointing at the same `content_hash`. The indexer picks the canonical URL by signals like inlink count and indexes the rest as aliases.
 
 **8. New important domain at default rate.**
 
-12 days to crawl 1 million pages at 1 req/sec is too slow for a major news site relaunch. Options: negotiate a higher rate with the site's crawler-relations team (set `crawl_delay_seconds=0.1` by mutual agreement), ingest their sitemap (sitemaps publish update timestamps, so you only fetch changed pages), or boost only the top 10,000 pages by a quick PageRank pass and leave the long tail at default.
+12 days to crawl 1 million pages at 1 req/sec is too slow for a major news site relaunch. Options: negotiate a higher rate with the site's crawler-relations team (set `crawl_delay_seconds=0.1` by mutual agreement), ingest their sitemap (sitemaps publish update timestamps, so only changed pages need fetching), or boost only the top 10,000 pages by a quick PageRank pass and leave the long tail at default.
 
 Politeness is a default, not a law. With consent and signal, you can go faster.
 
 **9. Spam farm.**
 
-Mitigation in layers: compute host quality scores offline (spam hosts have low PageRank, low inlink diversity, low content quality) and use that score for per-host quota and per-URL priority. Cap outlink extraction at 200 per page (a page with 5,000 self-linking outlinks is junk). For a host whose quality drops below a threshold and whose URL patterns match spam, blacklist it pending weekly review.
+Compute host quality scores offline (spam hosts have low PageRank, low inlink diversity, low content quality) and use those scores for per-host quota and per-URL priority. Cap outlink extraction at 200 per page. For a host whose quality drops below a threshold and whose URL patterns match spam, blacklist it pending weekly review.
 
 A spam farm should burn through its daily host quota in a few hours and then stop affecting capacity.
 
 **10. Geo-distributed targets.**
 
-Maintain a small fetcher pool in each major region (us-east, eu-west, ap-south). The frontier annotates each URL with a `region_hint` based on the host's geo IP. When dispatched, the URL prefers a fetcher in the closest region. The frontier remains globally sharded. Only the IO leg is regional. Cost: 3x deployment, but only fetcher pools are duplicated, not the frontier or stores. Typical fetch latency for Asian sites drops from 300ms to 50ms.
+Maintain a small fetcher pool in each major region (us-east, eu-west, ap-south). The frontier annotates each URL with a `region_hint` based on the host's geo IP. When dispatched, the URL prefers a fetcher in the closest region. The frontier remains globally sharded. Only the IO leg is regional. Cost: 3x deployment for fetcher pools only, not the frontier or stores. Typical fetch latency for Asian sites drops from 300ms to 50ms.
 
 ---
 
-### 14. Trade-offs worth saying out loud
+### 14. Trade-offs worth stating out loud
 
 **BFS vs PageRank-prioritized.** Pure BFS spends capacity equally on everything. PageRank prioritization focuses on useful pages but can starve the long tail. Most production crawlers run weighted: ~80% priority-driven, ~20% exploration budget for low-priority URLs to avoid blind spots.
 
@@ -579,7 +573,7 @@ Maintain a small fetcher pool in each major region (us-east, eu-west, ap-south).
 
 **Synchronous fetch-parse-dedup vs decoupled pipeline.** Decoupled is harder to operate but lets each stage scale independently and fail independently. At this scale, decoupled wins.
 
-**What you would revisit at 10x scale.** Shard by TLD first, then by host within TLD, so country-specific shards can become regional. Move to streaming PageRank (continuous update rather than daily batch) so quality scores reflect link-graph changes faster. Adopt a learned model for per-host adaptive rate rather than a static token bucket. Introduce a federated frontier (top-level coordinator + regional frontiers) so the system survives entire-region outages.
+**What to revisit at 10x scale.** Shard by TLD first, then by host within TLD, so country-specific shards can become regional. Move to streaming PageRank (continuous update rather than daily batch) so quality scores reflect link-graph changes faster. Introduce a federated frontier (top-level coordinator + regional frontiers) so the system survives entire-region outages.
 
 ---
 
@@ -589,11 +583,11 @@ Maintain a small fetcher pool in each major region (us-east, eu-west, ap-south).
 
 **Hashing by URL instead of by host.** Politeness becomes an N-squared coordination problem. The interviewer will catch this immediately.
 
-**Forgetting robots.txt.** Politeness is the load-bearing constraint. If you skip robots.txt and per-host rate limits, you skipped the most important part.
+**Forgetting robots.txt.** Politeness is the load-bearing constraint. Skipping robots.txt and per-host rate limits means skipping the most important part.
 
 **Treating recrawl as an afterthought.** "Just recrawl daily" does not work for news (too slow) or for dormant pages (too wasteful). Adaptive scheduling is the expected answer.
 
-**Ignoring content dedup.** The web has massive duplication from mirrors, CDN variants, and template pages. Without content-hash dedup, you waste 30% of storage and pollute the index.
+**Ignoring content dedup.** The web has massive duplication from mirrors, CDN variants, and template pages. Without content-hash dedup, you waste ~30% of storage and pollute the index.
 
 **No mention of crawler traps.** Calendars, session tokens, infinite pagination. Every real crawler has trap detection. Without it, the frontier fills with junk within days.
 
@@ -601,8 +595,8 @@ Maintain a small fetcher pool in each major region (us-east, eu-west, ap-south).
 
 **Overengineering dedup.** Some candidates propose perfectly-consistent distributed sets. A Bloom filter with 1% false positive rate is fine. Strong consistency on dedup is over-budget.
 
-**No JS rendering plan.** Without a render pipeline you miss a large fraction of the modern web. Name the pipeline and say it is a separate fleet, even if you do not design it in detail.
+**No JS rendering plan.** Without a render pipeline you miss a large fraction of the modern web. Name the pipeline and say it is a separate fleet.
 
 **Skipping geo-distribution.** Crawl latency to far-side hosts is real. Regional fetcher pools are a cheap win that experienced candidates name.
 
-If you hit 9 of these in a 45-minute slot, you are interviewing well. The three that separate strong from average answers: host-sharded frontier for politeness, adaptive recrawl scheduling, and crawler trap handling. Those three together cover about half the design's real complexity.
+The three that separate strong from average answers: host-sharded frontier for politeness, adaptive recrawl scheduling, and crawler trap handling. Those three together cover about half the design's real complexity.

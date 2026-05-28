@@ -7,251 +7,253 @@ difficulty: Easy
 solution: solution.md
 ---
 
-## The scene
+## What this is
 
-You sit down. The interviewer leans forward.
+Read-heavy systems share a small set of patterns. The same tools that make a URL shortener fast make a product catalog fast, a social feed fast, and an approval dashboard fast. The patterns are not the hard part. Knowing the order, the conditions under which each one helps, and when to stop is.
 
-> *"I'll give you any read-heavy system. A product catalog. A social feed. An approval dashboard. Reads outnumber writes ten to one, or a hundred to one. Walk me through how you think about it."*
->
-> *"Don't start with Redis. Start from what the data looks like, who's reading it, and how stale they can tolerate it being. Then tell me which layer to add first, and when NOT to add each one."*
+This doc names the six patterns, shows what each one looks like, and gives the trade-offs. The patterns in order:
 
-That is the question. It is not about knowing the tools. Every candidate knows what a CDN is. The interviewer is asking whether you know the **order**. Whether you check if traffic is hot-skewed before sizing a cache. Whether you distinguish between a CDN fix and a Redis fix. Whether you know that adding read replicas before fixing a low cache hit rate just spreads bad reads across more servers.
-
-We will walk six patterns. Each one gets its own diagram, a "when to use it," and a "what breaks." Read them in order. The order is the lesson.
+1. **Read-through cache** (Redis, cache-aside) - hot set in memory
+2. **Write-through cache** - cache always matches the DB
+3. **Write-behind cache** - counters and high-frequency writes
+4. **CDN** - edge-cached shared responses
+5. **Read replicas** - split the read load off the primary
+6. **Materialized views** - fast cache-miss path
 
 ---
 
-## Step 1: What every read-heavy system shares
+## The shape of every read-heavy system
 
-Before drawing any boxes, draw the shape of the problem.
+Before choosing a pattern, draw the shape of the traffic.
 
 ```mermaid
 stateDiagram-v2
     direction LR
-    [*] --> HotSet: small set of data, most reads
-    [*] --> ColdSet: large set of data, rare reads
+    [*] --> HotSet: small set, most reads
+    [*] --> ColdSet: large set, rare reads
     HotSet --> Cache: serve from memory
     ColdSet --> DB: go to disk
     Cache --> Client: sub-ms to 5ms
     DB --> Client: 10-100ms
 ```
 
-Every read-heavy system has the same shape: a small hot set that gets most of the reads, and a large cold set that gets few. The whole game is keeping the hot set in memory so reads never touch disk.
+Every read-heavy system has a hot set (a small slice of data that gets most of the reads) and a cold set (the rest). The whole game is keeping the hot set in memory so reads never touch disk.
 
-> **Take this with you.** Before choosing any pattern, ask: what is the hot set? How big is it? How fresh does it need to be? Those three answers decide the tier.
+Before drawing boxes, answer these three questions:
 
----
+1. **What is the hot set?** How big is it? Does it fit in a single Redis node?
+2. **Is traffic hot-skewed?** Do the top 1% of items get 90% of reads, or is every item equally popular? Hot-skewed traffic makes caching effective. Uniform traffic makes it nearly useless.
+3. **How fresh does the data need to be?** The answer becomes your TTL and your invalidation strategy. Without it, every caching decision is a guess.
 
-## Step 2: Ask the right questions
-
-In a real interview, write down your questions before drawing. Five precise ones beat twenty vague ones.
-
-<details markdown="1">
-<summary><b>Show: 5 questions that change the design</b></summary>
-
-1. **How fresh does the data need to be?** When a price changes, how stale can the shown price be? One second? Sixty? Five minutes? *This single answer decides your TTL and your invalidation strategy. Without it every other choice is a guess.*
-
-2. **Is traffic hot-skewed or uniform?** Do the top 1% of items get 90% of reads? Or is every item equally popular? *Hot-skewed makes caching extremely effective. Uniform makes it nearly useless.*
-
-3. **Shared responses or personalized?** Does every user see the same page, or do you show user-specific prices and recommendations? *Shared pages cache at the CDN. Personalized ones cannot.*
-
-4. **Where are the users?** Same country as your servers? Or spread across continents? *Same region: skip the CDN for now. Global: the CDN is the cheapest speed win money can buy.*
-
-5. **What does a read look like?** A single-key lookup? A filter query? A full-text search? *Lookup by ID caches well. Text search needs its own index.*
-
-The junior trap: saying "add Redis" before you have answered these. You do not know yet whether Redis is the right tool. For shared-response traffic, the CDN is cheaper and faster. For search, neither helps at all.
-
-</details>
+> **Take this with you.** Check traffic shape before designing the cache tier. A uniform traffic workload gets almost no benefit from Redis. A hot-skewed one with a 50 MB hot set is almost entirely served from memory.
 
 ---
 
-## Step 3: The caching pyramid
+## Pattern 1: Read-through cache
 
-A request, on its way from the browser to the database, can hit up to six cache layers. Each is roughly 10x faster than the one below. Each has different rules.
+The app checks the cache first. On a miss, it queries the DB, populates the cache, and returns.
+
+```mermaid
+flowchart LR
+    App["App Server"]:::app -->|"GET product:42"| Redis[("Redis\nTTL 60s")]:::cache
+    Redis -->|"~80% hit"| App
+    Redis -.miss.-> DB[("Primary DB")]:::db
+    DB -.populate.-> Redis
+
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+```
+
+**When to use.** Traffic is hot-skewed, the hot set fits in memory, and data can tolerate a few seconds of staleness. A product catalog with 1 million items where the top 10,000 get 80% of reads is the ideal case: 50 MB of hot data in Redis, cache hit rate around 80%, DB load at one-fifth of what it would be otherwise.
+
+**What breaks.**
+- Low hit rate on uniform traffic. If every item is equally popular, the hot set is the entire catalog. It does not fit in memory. Adding Redis barely helps.
+- Cache stampede. A popular key expires. A thousand concurrent requests all miss and hit the DB at once. DB CPU spikes. Fix with TTL jitter (±10% random), single-flight per key (only the first miss queries the DB, the rest wait), or stale-while-revalidate.
+- Stale data. A price change takes up to 60 seconds to be visible if the TTL is 60 seconds. Acceptable for browsing, not for checkout.
+
+> **Take this with you.** Confirm the traffic shape before adding Redis. If the hit rate will be low, the DB still gets hammered. Redis is not a universal speed-up.
+
+---
+
+## Pattern 2: Write-through cache
+
+Every write updates both the DB and the cache at the same time.
+
+```mermaid
+flowchart LR
+    App["App Server"]:::app -->|"1. write"| DB[("Primary DB")]:::db
+    App -->|"2. update cache"| Redis[("Redis")]:::cache
+
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+```
+
+**When to use.** Writes are infrequent and reads must always see the latest value. Configuration services, feature flags, and user settings are good fits: the data is small, writes are rare, and stale reads cause visible bugs.
+
+**What breaks.**
+- Writes slow down. Two operations instead of one. On every write path.
+- Race condition under concurrent writers. Writer A writes 5 to DB, writer B writes 7 to DB, writer B writes 7 to cache, writer A writes 5 to cache. Cache says 5, DB says 7. Inconsistent. Fix: on write, delete the cache key instead of setting the new value. Let the next read re-populate from DB. The race disappears.
+
+---
+
+## Pattern 3: Write-behind cache
+
+Write to the cache first. Flush to the DB asynchronously from a queue.
+
+```mermaid
+flowchart LR
+    App["App Server"]:::app -->|"1. INCR views:42"| Redis[("Redis")]:::cache
+    App -->|"2. async"| Q{{"Flush queue"}}:::queue
+    Q -->|"batch flush every 10s"| DB[("Primary DB")]:::db
+
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+```
+
+**When to use.** Very high-frequency writes where exact accuracy is not required and some data loss is acceptable. Page view counters, like counts, and click tracking are the canonical use case. A million increments per minute that flush to the DB in batches every 10 seconds.
+
+**What breaks.**
+- If the queue crashes before flushing, the buffered writes are lost. The cache was the source of truth and it is gone.
+- Never use for financial data, inventory, or anything requiring durability. The write is not durable until it reaches the DB.
+- A Redis failure between write and flush is a data loss event, not a slowdown.
+
+---
+
+## Pattern 4: CDN
+
+Static and cacheable responses are stored at edge servers near each user. A user in Tokyo gets the response from a CDN point-of-presence in Tokyo, not from a datacenter in Virginia.
+
+```mermaid
+flowchart LR
+    U([User in Tokyo]):::user -->|"GET /products/42"| CDN["CDN POP\n(Tokyo)"]:::edge
+    CDN -->|"~95% hit\n~8ms"| U
+    CDN -.miss.-> Origin["Origin\n(us-east)"]:::app
+    Origin -.populate.-> CDN
+
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+```
+
+**When to use.** Responses are shared across all users (no personalization), users are geographically distributed, and you want the largest latency win for the lowest cost. A product catalog page with the same content for every visitor is the ideal case. The CDN absorbs 70-95% of reads without touching origin at all.
+
+**What breaks.**
+- Personalized responses cannot sit in the CDN. A CDN will serve user A's session data to user B if you cache a request that includes auth incorrectly. Always inspect `Vary` headers.
+- CDN purges take 5-30 seconds. Too slow for a flash sale price change. Fix: versioned URLs (`/products/42?v=5`). When the price changes, bump the version. The old URL expires naturally. The new URL fetches fresh.
+- The CDN gives zero benefit if the API returns `Cache-Control: no-store` or nothing. Explicit headers are required.
+
+> **Take this with you.** For shared responses, add the CDN before Redis. The CDN is cheaper, physically closer to the user, and absorbs more traffic. Redis handles the misses the CDN cannot catch.
+
+---
+
+## Pattern 5: Read replicas
+
+A replica is a copy of the DB that accepts only reads. The primary streams writes to it via the WAL.
+
+```mermaid
+flowchart TB
+    subgraph Write["Write path"]
+        App["App Server"]:::app -->|"all writes"| P[("Primary DB")]:::db
+    end
+    subgraph Read["Read path"]
+        App -->|"reads"| Rep1[("Replica 1")]:::db
+        App -->|"reads"| Rep2[("Replica 2")]:::db
+    end
+    P -->|"stream WAL\n(~100ms lag)"| Rep1
+    P -->|"stream WAL\n(~100ms lag)"| Rep2
+
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+```
+
+**When to use.** The primary's read load is competing with write latency. A nightly catalog import spams the primary with writes; adding read replicas routes user reads away from it. Also useful as a per-region read path and as a failover target.
+
+**What breaks.**
+- Replication is async. Typical lag is ~100ms, but it spikes to seconds under write load. Reads from a replica can be stale.
+- Read-your-writes. A user submits a form (write to primary) and refreshes (read from replica). The write has not replicated yet. They see their old data. Fix: 5-second cookie pin to primary after any write. Once the cookie expires, replica routing resumes.
+- Replicas do not fix slow queries. A query taking 200ms on the primary takes 200ms on the replica. Fix the query first.
+
+> **Take this with you.** Replicas help when the primary is busy. They do not help when the cache hit rate is low. Fix the cache first. Only then add replicas.
+
+---
+
+## Pattern 6: Materialized views and denormalization
+
+Pre-compute expensive joins or aggregates into a flat table. A cache miss hits the flat table, not the expensive query.
+
+```mermaid
+flowchart TB
+    subgraph WriteSide["Write side: normalized"]
+        W["Writer"]:::user --> P[("products\ncategories\nreviews")]:::db
+        P -->|"CDC event"| Upd["View updater"]:::app
+        Upd --> PV[("product_view\nflat table")]:::db
+    end
+    subgraph ReadSide["Read side: cache-miss path"]
+        App["App Server"]:::app -.miss.-> PV
+    end
+
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+```
+
+**When to use.** The cache-miss path is provably slow. A product page that joins `products`, `categories`, and `reviews` on every miss takes 200ms. The denormalized `product_view` table makes it a single-row lookup at 5ms. Reads must heavily outweigh writes, because every write to any source table now triggers an update to the flat table.
+
+**What breaks.**
+- Every write to any source table must update the denormalized table. CDC pipeline adds operational complexity.
+- If the CDC stream falls behind, the flat table is stale.
+- If the cache miss path already takes 30ms, denormalization is not worth the complexity. Measure before adding it.
+
+> **Take this with you.** Denormalization makes reads fast and writes expensive. At 100x reads to writes it is a good trade. At 5x reads to writes, reconsider.
+
+---
+
+## Deciding which pattern to apply first
+
+The answer depends on what is actually breaking. The patterns are not a checklist to apply all at once.
 
 ```mermaid
 flowchart TD
-    R([User]):::user --> B["Browser HTTP cache<br/>(0ms, on device)"]:::cache
-    B -->|miss| C["CDN edge POP<br/>(5-30ms, nearest city)"]:::edge
-    C -->|miss| L["App in-process LRU<br/>(&lt;1ms, pod RAM)"]:::app
-    L -->|miss| Redis[("Redis cluster<br/>(1-5ms, datacenter)")]:::cache
-    Redis -->|miss| Rep[("Read replica<br/>(10-30ms, DB RAM)")]:::db
-    Rep -->|miss| P[("Primary DB<br/>(10-50ms, disk)")]:::db
+    Start["Read latency is too high"]
+    Start --> Q1{"Hot-skewed\ntraffic?"}
+    Q1 -->|yes| AddRedis["Add read-through\ncache (Redis)"]:::app
+    Q1 -->|no| Q2{"Responses\nshared?"}
+    Q2 -->|yes| AddCDN["Add CDN"]:::edge
+    Q2 -->|no| Q3{"Primary\nbusy with reads?"}
+    Q3 -->|yes| AddReplicas["Add read replicas"]:::db
+    Q3 -->|no| Q4{"Cache-miss\npath slow?"}
+    Q4 -->|yes| AddView["Denormalize:\nmaterialized view"]:::db
+    Q4 -->|no| AddIndex["Add index or\nrewrite the query"]:::app
 
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
     classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
     classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
 ```
 
-The rule is simple: try the fastest layer first, fall through on miss, populate each layer on the way back.
-
-| Layer | Lives in | Round-trip | What it stores |
-|-------|----------|------------|----------------|
-| **Browser cache** | User's device | 0ms | HTTP responses with `Cache-Control` headers |
-| **CDN edge** | City near the user | 5-30ms | Shared GET responses, images, assets |
-| **In-process LRU** | App pod RAM | Under 1ms | Top-N hottest keys, no network hop |
-| **Redis** | Datacenter, shared | 1-5ms | Warm key-value across all pods |
-| **Read replica** | DB server RAM | 10-30ms | All indexed data |
-| **Primary DB** | DB server disk | 10-50ms | Source of truth |
-
-Which layers do you skip?
-
-- **Browser cache**: always on for static assets. Rarely set for API responses. Easy win.
-- **CDN**: skip if every response is personalized. Otherwise, use it.
-- **In-process LRU**: great with 5-50 pods. Problematic with 500 pods (invalidation gets messy).
-- **Redis**: almost always on at scale. Skip only at toy scale.
-- **Read replica**: add when the primary's read load is hurting write latency. Not before.
-- **Primary**: never skipped. It is the source of truth.
-
-> **Take this with you.** The pyramid is ordered by cost, not by what is easiest to add. Start from the top. Each layer you skip costs more than the one above it.
+The junior trap is reaching for Redis before answering the first question. For shared-response traffic, the CDN is cheaper and absorbs more. For uniform traffic, Redis barely helps. For a slow query, a better index might solve the problem for free.
 
 ---
 
-## Step 4: Build it one layer at a time
+## Cache invalidation patterns
 
-We will add one pattern per step, building on a single scenario.
-
-**The scenario.** A product catalog service. 1 million products at 5KB each. 100,000 users per day, each making 50 reads. Reads beat writes 100 to 1. Target: under 50ms globally.
-
-### v1: no cache
-
-```mermaid
-flowchart LR
-    U([User]):::user --> App["App Server"]:::app
-    App --> DB[("Primary DB")]:::db
-
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-```
-
-Works up to about 100 users. P95 is 30ms. A single Postgres handles it.
-
-### v2: add Redis for the hot set
-
-Traffic grows. The same 10,000 products get 80% of reads. Postgres is at 70% CPU. Add Redis.
-
-```mermaid
-flowchart LR
-    U([User]):::user --> App["App Server"]:::app
-    App -->|hit| Redis[("Redis<br/>TTL 60s")]:::cache
-    App -.miss.-> DB[("Primary DB")]:::db
-    DB -.populate.-> Redis
-
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-```
-
-Hot set is 10k x 5KB = 50MB. Fits on one Redis node with room to spare. Cache hit rate: ~80%. DB load: 1/5th of before.
-
-**When to use Redis:** traffic is hot-skewed, hot set fits in memory, data can tolerate seconds of staleness.
-
-**What breaks:** low hit rate on uniform traffic. Stale data on price changes. Cache stampede when a popular TTL expires.
-
-### v3: add CDN for shared responses
-
-Users start complaining from Asia: 250ms load time. Your servers are in Virginia. Add a CDN.
-
-```mermaid
-flowchart LR
-    U([User]):::user --> CDN["CDN edge POP<br/>(city near user)"]:::edge
-    CDN -->|hit| U
-    CDN -.miss.-> LB["Load Balancer"]:::edge
-    LB --> App["App Server"]:::app
-    App --> Redis[("Redis")]:::cache
-    Redis -.miss.-> DB[("Primary DB")]:::db
-
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-```
-
-The CDN catches ~70-80% of cacheable reads. P95 from Asia drops from 250ms to 20ms.
-
-**When to use a CDN:** responses are shared (not personalized), users are geographically distributed, the response does not change more often than the TTL.
-
-**What breaks:** personalized responses cannot be CDN-cached. The CDN does not help API responses without explicit `Cache-Control` headers. Stale purges take 5-30 seconds.
-
-### v4: add read replicas
-
-The nightly catalog import spams the primary with writes. Read latency spikes because writes compete for IOPS. Add read replicas.
-
-```mermaid
-flowchart TB
-    subgraph WritePath["Write path"]
-        App["App Server"]:::app --> P[("Primary DB")]:::db
-    end
-    subgraph ReadPath["Read path"]
-        App -->|"cache hit"| Redis[("Redis")]:::cache
-        App -.miss.-> Rep1[("Replica 1")]:::db
-        App -.miss.-> Rep2[("Replica 2")]:::db
-    end
-    P -->|"stream WAL"| Rep1
-    P -->|"stream WAL"| Rep2
-
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-```
-
-Writes still go to the primary. Reads route to replicas. Primary is now free to handle writes cleanly.
-
-**When to use replicas:** primary's read load is hurting write latency. You need a failover target. You need a replica per region.
-
-**What breaks:** replication is async. A write on the primary takes ~100ms to appear on a replica. If a user writes and reads immediately, they may see stale data (read-your-writes problem). Fix with a 5-second pin to the primary after any write.
-
-> **Take this with you.** Replicas help when the primary is busy. They do not help when the cache hit rate is low. Fix the cache first. Only then consider replicas.
-
-### v5: add denormalization for slow cache misses
-
-Cache misses still take 200ms because the product page does a 3-table JOIN on every miss. Precompute the join into a flat table.
-
-```mermaid
-flowchart TB
-    subgraph WritePath["Write path"]
-        W["Writer"]:::user --> P[("Primary DB<br/>products, categories,<br/>reviews")]:::db
-        P -->|"CDC stream"| Updater["View-table<br/>updater"]:::app
-        Updater --> PV[("product_view<br/>(flat table)")]:::db
-    end
-    subgraph ReadPath["Read path"]
-        App["App Server"]:::app -->|"hit"| Redis[("Redis")]:::cache
-        App -.miss.-> PV
-    end
-
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-```
-
-Cache-miss latency drops from 200ms to 5ms. The denormalized `product_view` table is a single-row lookup.
-
-**When to denormalize:** the cache-miss path is slow because the query is expensive (multi-table join, aggregate). Reads beat writes heavily, so write amplification is acceptable.
-
-**What breaks:** every write to `products`, `categories`, or `reviews` must update `product_view`. The CDC pipeline adds operational complexity. If the CDC stream falls behind, the view is stale.
-
----
-
-## Step 5: Cache invalidation, the hardest problem
+Adding a cache layer raises an immediate question: when a write happens, how do you get the stale value out of every cache layer that holds it?
 
 Four patterns. Each handles a different freshness need.
 
 ```mermaid
 flowchart TD
-    Start["Which invalidation pattern?"] --> Q1{"Need exact\nfreshness always?"}
+    Start["Which invalidation\npattern?"] --> Q1{"Need exact\nfreshness?"}
     Q1 -->|yes| WT["Write-through\n(update cache on every write)"]:::app
     Q1 -->|no| Q2{"Seconds of\nstaleness OK?"}
     Q2 -->|yes| TTL["TTL\n(expire after N seconds)"]:::cache
-    Q2 -->|no| Q3{"Many writers\nor many layers?"}
+    Q2 -->|no| Q3{"Multiple caches\nor layers?"}
     Q3 -->|yes| ED["Event-driven\n(pub/sub eviction)"]:::queue
-    Q3 -->|no| Q4{"Write-heavy\ncounters?"}
-    Q4 -->|yes| WB["Write-behind\n(buffer in cache, flush later)"]:::cache
+    Q3 -->|no| Q4{"High-freq\ncounters?"}
+    Q4 -->|yes| WB["Write-behind\n(buffer, flush later)"]:::cache
     Q4 -->|no| TTL
 
     classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
@@ -260,117 +262,67 @@ flowchart TD
 ```
 
 <details markdown="1">
-<summary><b>Show: the four patterns, when each fits</b></summary>
+<summary><b>Show: the four invalidation patterns in detail</b></summary>
 
-### TTL (Time To Live)
+**TTL.** Each entry expires after N seconds. Whatever staleness you can accept becomes your TTL budget.
 
-```
-SET product:42 "{json}" EX 60     # Redis: expires in 60 seconds
-```
+The jitter rule: if 1,000 entries all have a 60s TTL set at the same moment, they all expire at the same second. 1,000 misses hit the DB at once. Fix: `TTL = 60 ± random(0, 10s)`. Spreads expiry across time.
 
-The simplest pattern. Each entry expires after N seconds. Whatever staleness you can accept becomes your TTL budget.
+Use TTL everywhere as a safety net, even when using other patterns. If an event is missed, the stale entry will eventually expire.
 
-**When to use:** data that tolerates staleness (catalog descriptions, read counts, rankings). TTL also serves as a safety net for every other pattern.
+**Write-through.** Every write updates both DB and cache. Simpler but slower writes and the concurrent-writer race described in Pattern 2. Safe to use with invalidate-on-write instead: delete the key, let the next read populate fresh.
 
-**The jitter rule.** If 1,000 entries all have a 60s TTL set at the same moment, they all expire at the same second. 1,000 misses hit the DB at once. Fix: TTL = 60 ± (random 0-10s). Spreads the expiry across time.
+**Write-behind.** Write to cache, flush async. For counters only. Not for anything requiring durability.
 
-**What breaks:** a price change takes up to 60 seconds to be visible. Unacceptable for checkout. Fine for browsing.
-
----
-
-### Write-through
+**Event-driven invalidation.** DB write fires a CDC event. All caches subscribe and evict the affected key.
 
 ```python
-def update_product(p):
-    db.update(p)        # write to DB
-    cache.set(p)        # then update cache
-```
-
-Every write updates both the DB and the cache. Cache always matches the DB.
-
-**When to use:** writes are infrequent and read consistency matters (config services, user settings).
-
-**The race condition.** Two writers race: A writes 5 to DB, B writes 7 to DB, B writes 7 to cache, A writes 5 to cache. Cache says 5, DB says 7. Inconsistent. Fix: invalidate instead of writing the new value. Let the next read re-populate.
-
-**What breaks:** writes get slower (two operations). Under concurrent writes, the race above produces inconsistency.
-
----
-
-### Write-behind (write-back)
-
-```python
-def increment_view_count(product_id):
-    cache.incr(f"views:{product_id}")   # fast in-memory counter
-    queue.publish("flush_views")        # async DB write
-```
-
-Update the cache first. Write to DB asynchronously from a queue.
-
-**When to use:** high-frequency counters where exact accuracy does not matter and some loss is acceptable (view counts, like counts, click tracking).
-
-**What breaks:** if the queue crashes before flushing, you lose the buffered writes. Never use for financial data or anything requiring durability.
-
----
-
-### Event-driven invalidation
-
-```python
-def update_product(p):
-    db.update(p)
-    kafka.publish("product.changed", {"id": p.id})
-
-# every app pod subscribes:
+# every pod subscribes to this:
 def on_product_changed(event):
     in_process_lru.evict(event.id)
     redis.delete(f"product:{event.id}")
     cdn.purge(f"/products/{event.id}")
 ```
 
-DB write fires an event. All caches subscribe and evict the affected key.
+Use when multiple cache layers all need coordinated invalidation. A price change must propagate to in-process caches on 50 pods, Redis, and the CDN within seconds.
 
-**When to use:** multiple cache layers all need coordinated invalidation. Price changes must propagate to in-process caches on 50 pods, Redis, and the CDN within seconds.
-
-**What breaks:** operationally heavier (needs Kafka or Redis pub/sub). If the event is missed (consumer down, Kafka lag), the cache stays stale indefinitely. Fix: always have a TTL floor. Event-driven as the fast path, TTL as the safety net.
-
----
-
-**The right answer is usually a mix.** TTL everywhere as the safety net. Event-driven for time-sensitive invalidation. Write-through only for endpoints where reads must be exact. Write-behind only for counters.
+**What breaks:** if the event is missed (consumer down, Kafka lag), the cache stays stale indefinitely. Fix: always have a TTL floor. Event-driven as the fast path, TTL as the safety net. They are not mutually exclusive.
 
 </details>
 
-> **Take this with you.** TTL handles most cases. Add event-driven invalidation when the TTL window is too slow for your freshness budget. They are not mutually exclusive.
+> **Take this with you.** TTL handles most cases. Add event-driven invalidation when the TTL window is too slow for your freshness budget.
 
 ---
 
-## Step 6: The full architecture
+## The full picture: all patterns together
 
-All five patterns together. The invalidation path runs off the primary via CDC.
+A product catalog at 100,000 users per day with all patterns applied.
 
 ```mermaid
 flowchart TB
     subgraph Edge["Client edge"]
         U([User]):::user
-        CDN["CDN edge POP<br/>(Cache-Control: public, max-age=60)"]:::edge
+        CDN["CDN edge POP\n(Cache-Control: public, max-age=60)"]:::edge
     end
 
     subgraph AppLayer["Application layer"]
         LB["Load Balancer"]:::edge
-        App["App Servers<br/>(with in-process LRU)"]:::app
+        App["App Servers\n(in-process LRU, top 1k keys)"]:::app
     end
 
     subgraph CacheLayer["Cache layer"]
-        Redis[("Redis cluster<br/>(warm key-value)")]:::cache
+        Redis[("Redis cluster\n~50MB hot set")]:::cache
     end
 
     subgraph DBLayer["Database layer"]
-        Rep[("Read Replicas")]:::db
+        Rep[("Read Replicas\n~100ms lag)")]:::db
         P[("Primary DB")]:::db
-        PV[("product_view<br/>(denormalized)")]:::db
+        PV[("product_view\nflat table")]:::db
     end
 
     subgraph InvalidationPath["Invalidation path"]
-        K{{"Kafka<br/>product.changed"}}:::queue
-        Upd["View-table updater"]:::app
+        K{{"Kafka\nproduct.changed"}}:::queue
+        Upd["View updater"]:::app
         Inv["Cache invalidator"]:::app
         Purge["CDN purge worker"]:::app
     end
@@ -378,18 +330,17 @@ flowchart TB
     U --> CDN
     CDN -.miss.-> LB
     LB --> App
-    App -->|hit| Redis
+    App -->|"hit"| Redis
     App -.miss.-> Rep
-    Rep -.miss.-> P
-    App -->|write| P
-    P -->|CDC| K
+    Rep -.query.-> PV
+    App -->|"write"| P
+    P -->|"CDC"| K
     K --> Upd
     K --> Inv
     K --> Purge
     Upd --> PV
     Inv -.evict.-> Redis
     Purge -.purge.-> CDN
-    Rep -.read from.-> PV
 
     classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
     classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
@@ -399,25 +350,20 @@ flowchart TB
     classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
 ```
 
-Each box in one line:
-
-| Box | What it does |
-|-----|-------------|
-| **CDN** | Catches ~70-80% of cacheable reads. Closest layer to the user. |
-| **Load Balancer** | Routes to a healthy app pod. Stateless. |
-| **App + in-process LRU** | Holds the hottest ~1,000 keys in pod RAM. Zero network. |
-| **Redis** | Shared warm cache across all pods. Holds the next ~50k keys. |
-| **Read Replicas** | Serve cache misses. ~1s replication lag P99. |
-| **Primary DB** | Source of truth. Accepts all writes. |
-| **product_view** | Flat denormalized table. Cache-miss path is 5ms, not 200ms. |
-| **Kafka** | Carries write events to the invalidation consumers. |
-| **View-table updater** | Recomputes `product_view` rows on write. |
-| **Cache invalidator** | Evicts Redis keys. Publishes to Redis pub/sub for pod LRUs. |
-| **CDN purge worker** | Calls CDN purge API for hot URLs. |
+| Component | Pattern | What it does |
+|-----------|---------|--------------|
+| **CDN** | CDN | Catches ~70-80% of cacheable reads. Closest layer to the user. |
+| **In-process LRU** | Read-through | Hottest ~1,000 keys in pod RAM. Zero network hop. |
+| **Redis** | Read-through | Warm key-value for the next ~50,000 keys. |
+| **Read Replicas** | Read replicas | Serve cache misses. Primary freed for writes. |
+| **product_view** | Materialized view | Cache-miss path is 5ms, not 200ms. |
+| **Kafka** | Event invalidation | Carries write events to the invalidation consumers. |
+| **Cache invalidator** | Event invalidation | Evicts Redis keys and pod LRUs. |
+| **CDN purge worker** | Event invalidation | Calls CDN purge API for hot URLs. |
 
 ---
 
-## Step 7: One read, all the way through
+## One read, all the way through
 
 A user reads product 42. The request misses every layer and warms them on the way back.
 
@@ -431,20 +377,20 @@ sequenceDiagram
     participant Rep as Replica DB
 
     B->>CDN: GET /products/42
-    Note over CDN: cache miss
-    CDN->>App: forward request
+    Note over CDN: miss
+    CDN->>App: forward
     Note over App: LRU miss
     App->>R: GET product:42
     Note over R: Redis miss
     R-->>App: nil
     App->>Rep: SELECT * FROM product_view WHERE id=42
     Rep-->>App: row (5ms)
-    App-->>R: SET product:42 ... EX 60+jitter
+    App-->>R: SET product:42 EX 60+jitter
     App-->>CDN: 200 OK (Cache-Control: public, max-age=60)
     CDN-->>B: 200 OK
 ```
 
-Now an admin changes the price. The invalidation runs:
+An admin changes the price. Invalidation runs:
 
 ```mermaid
 sequenceDiagram
@@ -463,20 +409,16 @@ sequenceDiagram
     Note over Caches: next request re-warms all layers
 ```
 
-The write commits. The response goes back. The cache eviction happens asynchronously. The next request re-populates every layer.
-
 ---
 
-## Step 8: The scaling journey
-
-Four stages. At each stage, name what broke first, then name the smallest fix.
+## The scaling journey
 
 ```mermaid
 flowchart LR
-    S1["Stage 1<br/>10-100 users<br/>1 Postgres, 1 pod<br/>~$50/mo"]:::s1
-    S2["Stage 2<br/>~10k users<br/>+ Redis<br/>~$150/mo"]:::s2
-    S3["Stage 3<br/>~100k users<br/>+ CDN + replicas<br/>+ event invalidation<br/>~$2k/mo"]:::s3
-    S4["Stage 4<br/>1M+ users<br/>+ per-region stack<br/>+ denormalization<br/>~$30k/mo"]:::s4
+    S1["Stage 1\n10-100 users\n1 Postgres, 1 pod\n~$50/mo"]:::s1
+    S2["Stage 2\n~10k users\n+ Redis\n~$150/mo"]:::s2
+    S3["Stage 3\n~100k users\n+ CDN + replicas\n+ event invalidation\n~$2k/mo"]:::s3
+    S4["Stage 4\n1M+ users\n+ per-region stack\n+ denormalization\n~$30k/mo"]:::s4
 
     S1 --> S2 --> S3 --> S4
 
@@ -486,13 +428,13 @@ flowchart LR
     classDef s4 fill:#fce7f3,stroke:#be185d,color:#831843
 ```
 
-**Stage 1 (10-100 users).** Single Postgres. No cache. P95 = 30ms. One app server. Nothing to optimize. The interviewer should stop you if you add Redis here.
+**Stage 1 (10-100 users).** Single Postgres, one app server, P95 = 30ms. Nothing to optimize. Adding Redis here is over-engineering.
 
-**Stage 2 (~10k users).** P95 climbs to 80ms because the JOIN takes 60ms on a cold read and every request goes to Postgres. Add Redis in front of `GET /products/{id}`. TTL 60s. Cache-aside. Hit rate ~80% on hot-skewed traffic. DB load falls to 1/5th. No CDN yet (users are local). No read replicas yet (DB has headroom).
+**Stage 2 (~10k users).** What breaks: the 3-table JOIN takes 60ms on a cold read, Postgres is at 70% CPU. Fix: Redis in front of `GET /products/{id}`, TTL 60s, cache-aside. Hot set is 50 MB. Hit rate ~80%. DB load drops to one-fifth. Do not add CDN (users are local), replicas (DB has headroom), or denormalization yet.
 
-**Stage 3 (~100k users).** Users in Asia see 250ms. Flash-sale price changes take 60 seconds to propagate. Primary CPU climbs during nightly import. Add CDN (global P95 to 30ms), two read replicas (primary freed for writes), event-driven invalidation (price change visible in under 2 seconds), in-process LRU on pods (sub-ms for hottest 1,000 keys).
+**Stage 3 (~100k users).** What breaks: users in Asia see 250ms, flash-sale price changes take 60 seconds to propagate, primary CPU climbs during nightly import. Fix: CDN (global P95 to 30ms), two read replicas (primary freed), event-driven invalidation (price change visible in under 2 seconds), in-process LRU on pods (sub-ms for hottest 1,000 keys).
 
-**Stage 4 (1M+ users).** The 3-table JOIN on cache miss takes 200ms. At 5% miss rate on 3,000 req/s that is 150 slow DB queries per second. One product goes viral and saturates its Redis shard. Add denormalized `product_view` table (miss path: 5ms), per-region Redis (no cross-region invalidation latency), Redis read replicas per shard (hot-key saturation), probabilistic pre-warming before predicted-hot launches.
+**Stage 4 (1M+ users).** What breaks: cache-miss path takes 200ms (3-table JOIN). At 5% miss rate on 3,000 req/s, that is 150 slow DB queries per second. One product goes viral and saturates its Redis shard. Fix: denormalized `product_view` (miss path to 5ms), per-region Redis, Redis read replicas per shard, pre-warm CDN before predicted launches.
 
 > **Take this with you.** At each stage, add the smallest fix for the biggest pain point. Do not add stage-4 infrastructure at stage-2 scale. The costs are not just dollar costs.
 
@@ -512,7 +454,7 @@ Try answering each in 2 to 3 sentences before reading the solution.
 
 5. **Hot key.** One product gets 10,000 req/s. The Redis shard that owns that key is at 100% CPU. The other shards are idle. What do you do?
 
-6. **CDN thundering herd on launch.** A new product launches. 100,000 users hit the URL at the same second. The CDN is cold. They all fall through to the origin. How do you handle this?
+6. **CDN thundering herd on launch.** A new product launches. 100,000 users hit the URL at the same second. The CDN is cold. They all fall through to origin. How do you handle this?
 
 7. **Cache key design.** You cache `product:42`. Then you add a feature where staff users see internal pricing. Do you cache `product:42:role:staff` separately? What is the trade-off?
 

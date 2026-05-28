@@ -7,34 +7,25 @@ difficulty: Easy
 solution: solution.md
 ---
 
-## The scene
+## What we are building
 
-You sit down. The interviewer leans forward.
+A customer emails support@acme.com: "My order is wrong, I got the wrong size." The email arrives, the system creates a ticket, routes it to the Orders queue, and an agent picks it up. The agent replies, the customer writes back, and the conversation continues on the same thread until the issue is resolved. A timer runs the whole time, tracking whether the team responded within the one-hour window they promised.
 
-> *"Our support team gets 500 emails a day. Some come from the web form, some from Slack, some from direct email. An agent reads each one, answers it, and closes it. Sometimes the customer writes back. Sometimes nobody responds and the ticket just sits there."*
->
-> *"We need a system to manage all of this. We promised our enterprise customers: first reply within one hour, full fix within 24. If we miss that window, we want to know before it happens."*
->
-> *"Build me a basic Zendesk."*
+That is Zendesk. It sounds like a to-do list with a status column. The interesting problems are hiding inside:
 
-That sounds like a to-do list with a status column. It is not.
+1. **Conversation threading.** Is this incoming email a new problem, or a reply to a ticket from last week?
+2. **Routing rules.** Which team gets this ticket? Which agent within that team?
+3. **SLA timers.** The timer started Friday at 5 PM. Does it count Saturday and Sunday?
+4. **Agent assignment races.** Two agents click "Next Ticket" at the same instant. Who gets it?
+5. **Multi-channel ingest.** Email, web form, chat, Slack. Different wire formats, same internal model.
 
-The word **ticket** sounds like a row in a table. The real questions are harder:
-
-- An email arrives. Is it a brand-new problem, or a reply to a ticket from last week?
-- 200 agents are online. Who gets this ticket? The one with the right skill? The least busy one?
-- A ticket comes in Friday at 5 PM. Does the SLA clock count Saturday and Sunday?
-- A customer goes silent for six months, then replies. Do you reopen the old ticket or start a new one?
-
-Real products (Zendesk, Freshdesk, ServiceNow, Intercom) all solve the same five sub-problems: **intake, lifecycle, assignment, SLA timers, and reporting**. We will walk through each one.
-
-We start with a 3-agent startup. We end with 2,000 agents across four regions. At every step we name what just broke and add the smallest fix.
+We will start with a 3-agent startup on one database, then scale to 2,000 agents across four regions. At each step, we name what just broke and add the smallest fix.
 
 ---
 
-## Step 1: Picture one ticket
+## The lifecycle of one ticket
 
-Before any boxes, just picture what one ticket **is**. A customer reports a problem. An agent fixes it. That is the whole product.
+Every ticket travels through a small set of states. Picture it before drawing any boxes.
 
 ```mermaid
 stateDiagram-v2
@@ -42,52 +33,30 @@ stateDiagram-v2
     [*] --> New: customer sends message
     New --> Assigned: agent is picked
     Assigned --> InProgress: agent starts work
-    InProgress --> WaitingOnCustomer: agent needs info
-    WaitingOnCustomer --> InProgress: customer replies
+    InProgress --> WaitingOnCustomer: needs info (SLA pauses)
+    WaitingOnCustomer --> InProgress: customer replies (SLA resumes)
     InProgress --> Resolved: agent marks fixed
     Resolved --> Closed: confirmed or 72h auto-close
-    Closed --> [*]
     Closed --> Reopened: customer replies within 7 days
     Reopened --> InProgress
+    New --> Spam
+    New --> Duplicate
 ```
 
-That is the whole product in one picture. Everything we add later (SLA, assignment, multi-channel intake, audit) is a complication on top of this core loop.
+A ticket spends most of its life cycling between `InProgress` and `WaitingOnCustomer`. Everything else (SLA, routing, caching, audit) exists to support that loop correctly.
 
-> **Take this with you.** A help desk is a small state machine running on a lot of conversations. The interesting problems are not about throughput. They are about correctness at every transition.
-
----
-
-## Step 2: Ask the right questions
-
-In a real interview, pause for two minutes and write down what you want to ask. Not twenty questions. Five sharp ones.
-
-<details markdown="1">
-<summary><b>Show: 5 questions that change the design</b></summary>
-
-1. **Which channels?** Email only, or also chat, web form, Slack, SMS? *Each channel needs its own adapter. Email is the messiest because of reply threading. Chat is the easiest because the session already groups messages.*
-
-2. **How many tickets per day, and how many agents?** 50 tickets with 3 agents is a weekend project. 50,000 tickets with 2,000 agents is a real distributed system.
-
-3. **What does the SLA look like?** "Respond in 1 hour, resolve in 24 hours" is common. The big question: is the clock 24/7, or does it pause outside business hours? *Business-hour SLAs are the single most error-prone part of the entire system.*
-
-4. **How does the system pick an agent?** Round robin? By skill? Pull queue? Least busy? *The wrong choice burns out a few agents while others sit idle.*
-
-5. **How long do we keep closed tickets?** Standard compliance is 5-7 years. HIPAA needs longer. GDPR may require deletion.
-
-A strong candidate also asks the meta question: *"Is sending notifications part of this service, or a separate one?"* The right answer is separate. The ticket system emits events. A notification service consumes them.
-
-</details>
+> **Take this with you.** A help desk is a state machine running on many conversations at once. The interesting problems are not about throughput. They are about correctness at every transition.
 
 ---
 
-## Step 3: How big is this thing?
+## How big this gets
 
 Same product, two very different companies.
 
-| Company | Agents | Tickets/day | Writes/sec | Open at once |
-|---------|--------|-------------|------------|--------------|
-| Startup | 3 | 50 | tiny | ~100 |
-| Enterprise | 2,000 | 50,000 | ~5 avg, ~15 peak | ~150,000 |
+| Company | Agents | Tickets/day | Writes/sec (peak) | Open at once |
+|---------|--------|-------------|-------------------|--------------|
+| Startup | 3 | 50 | negligible | ~100 |
+| Enterprise | 2,000 | 50,000 | ~15 | ~150,000 |
 
 <details markdown="1">
 <summary><b>Show: how the numbers come out</b></summary>
@@ -97,63 +66,47 @@ Assume each ticket takes an average of 3 days to resolve, and 8 messages total (
 **Startup (50 tickets/day)**
 - 50 / 86,400 = ~0.0006 tickets/sec. Nearly nothing.
 - 8 messages each = 400 messages/day.
-- 50 tickets/day × 3-day average = ~100 open at any moment.
+- 50 tickets/day x 3-day average = ~100 open at any moment.
 - 5 years of data: about 1 GB total. Fits anywhere.
 
 **Enterprise (50,000 tickets/day)**
 - 50,000 / 86,400 = ~0.6 tickets/sec average, ~3 at peak.
 - 8 messages each = 400,000 messages/day, ~5/sec average, ~15 at peak.
-- 50,000/day × 3-day average = ~150,000 open at any moment.
+- 50,000/day x 3-day average = ~150,000 open at any moment.
 - 2,000 agents refreshing dashboards every 30 seconds = ~65 reads/sec.
 - 5 years: ~5 TB of text, ~50 TB of attachments in S3.
 
-**What the math tells you.** This is not a high-throughput system. Even at enterprise scale, you write about 15 things per second. A single Postgres handles that comfortably. The hard numbers are about read latency (65 agent dashboard reads/sec) and correctness (do not lose tickets, do not double-assign).
+**What the math tells you.** This is not a high-throughput system. Even at enterprise scale, you write about 15 things per second. A single Postgres handles that. The design pressure is on read latency (65 agent dashboard reads/sec) and correctness (no lost tickets, no double-assigns).
 
-Reads beat writes about **10 to 1**. The read path matters more than the write path.
+Reads beat writes about 10 to 1. The read path matters more than the write path.
 
 </details>
 
 ---
 
-## Step 4: The smallest thing that works
+## The smallest version that works
 
-Forget enterprise. We are a 3-agent startup. One channel: email. Tickets go to whoever is next in the rotation. No SLA timer yet.
-
-Three boxes. Nothing else.
+Forget enterprise. Three agents, one channel: email. Tickets go to whoever is next in the rotation. No SLA timer yet.
 
 ```mermaid
 flowchart LR
-    C([Alice]):::user --> API[/"Ticket Service<br/>(create ticket)"/]:::app
-    API --> DB[("Postgres<br/>1 table")]:::db
+    C([Alice]):::user --> API["Ticket Service"]:::app
+    API --> DB[("Postgres<br/>2 tables")]:::db
     DB -.email.-> B([Bob]):::user
-    B --> API2[/"Ticket Service<br/>(reply + close)"/]:::app
-    API2 --> DB
+    B --> API
 
     classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
     classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
     classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
 ```
 
-The happy path from email to close:
+Three endpoints carry the whole product.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Alice
-    participant Adapter as Email Adapter
-    participant App as Ticket Service
-    participant DB as Postgres
-    participant Bob
-
-    Alice->>Adapter: sends email
-    Adapter->>App: normalized intake event
-    App->>DB: INSERT ticket (state=new)
-    App->>DB: INSERT message
-    App-->>Bob: email "new ticket assigned to you"
-    Bob->>App: POST reply
-    App->>DB: INSERT message, UPDATE state=resolved
-    App-->>Alice: email "your issue is fixed"
-```
+| Endpoint | What it does |
+|----------|--------------|
+| `POST /tickets` | Create a new ticket from an intake event |
+| `POST /tickets/{id}/messages` | Add a reply (public) or internal note |
+| `POST /tickets/{id}/status` | Transition state (assign, resolve, close, reopen) |
 
 <details markdown="1">
 <summary><b>Show: the two core tables</b></summary>
@@ -161,300 +114,171 @@ sequenceDiagram
 ```sql
 CREATE TABLE tickets (
     ticket_id       UUID PRIMARY KEY,
+    public_ref      TEXT NOT NULL UNIQUE,   -- "TKT-1234" shown to customer
     subject         TEXT NOT NULL,
     customer_email  TEXT NOT NULL,
     assignee_id     TEXT,
+    team_id         TEXT,
     status          TEXT NOT NULL DEFAULT 'new',
+    priority        TEXT NOT NULL DEFAULT 'medium',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    first_response_at TIMESTAMPTZ,
     resolved_at     TIMESTAMPTZ
 );
 
 CREATE TABLE ticket_messages (
-    message_id  UUID PRIMARY KEY,
-    ticket_id   UUID NOT NULL REFERENCES tickets(ticket_id),
-    author_id   TEXT,
-    body        TEXT NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    message_id          UUID PRIMARY KEY,
+    ticket_id           UUID NOT NULL REFERENCES tickets(ticket_id),
+    author_type         TEXT NOT NULL,   -- 'customer' | 'agent' | 'system'
+    author_id           TEXT,
+    visibility          TEXT NOT NULL DEFAULT 'public',
+    body                TEXT NOT NULL,
+    inbound_message_id  TEXT,           -- email Message-ID header
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE UNIQUE INDEX ON ticket_messages (inbound_message_id)
+    WHERE inbound_message_id IS NOT NULL;
 ```
 
-Two tables. This is the right place to start. Everything we add from here is a response to a real problem that showed up in production.
+The unique index on `inbound_message_id` is load-bearing: when the email adapter crashes and reprocesses the same message, the duplicate insert fails silently. No duplicate messages on the ticket.
 
 </details>
 
-> **Take this with you.** Always start from the smallest thing that works. The interview is really about what you add next, and why.
+> **Take this with you.** Start with the smallest thing that works. The interview is really about what you add next, and why.
 
 ---
 
-## Step 5: The first crack
+## Decision 1: how do we thread email replies?
 
-The startup grows. Two things happen in the same week.
+The first crack shows up fast. A customer replies to a closed ticket from two weeks ago. The adapter has no idea this is a reply. It creates a new ticket. The customer is furious because the new agent has no context.
 
-First, a customer replies to a closed ticket from two weeks ago. The adapter has no idea this is a reply. It creates a new ticket. The new ticket gets assigned to a different agent, who has no context. The customer is furious.
-
-Second, the CEO asks: *"We promised enterprise customers a 1-hour first reply. How do we track that?"*
-
-Two separate problems. Both reveal that the skeleton we built is missing something real.
-
-For the reply problem, you need **email threading**: the ability to look at an inbound email and decide whether it is a new ticket or a reply to an existing one.
-
-For the SLA problem, you need a **timer per ticket** that knows when the clock started and when it must stop.
-
-Neither of these is complicated in isolation. Together they introduce a pattern that runs through the entire system: **the system must track state over time, not just state at a single moment**.
-
-```mermaid
-flowchart LR
-    subgraph T1["New email"]
-        N1[parse headers] --> N2{In-Reply-To match?}
-        N2 -- yes --> N3[append to existing ticket]
-        N2 -- no --> N4[check subject for TKT-NNNN]
-        N4 -- found --> N3
-        N4 -- not found --> N5[create new ticket]
-    end
-```
-
-<details markdown="1">
-<summary><b>Show: how email threading works, layer by layer</b></summary>
-
-Every email has a `Message-ID` header (a globally unique string). When you reply in Gmail, the reply includes `In-Reply-To: <original-message-id>`. That is the primary threading signal.
-
-**Layer 1: `In-Reply-To` and `References` headers (RFC 5322)**
-
-When the help desk sends an agent reply, it saves the outgoing `Message-ID`. When a customer replies, the adapter checks whether the incoming `In-Reply-To` matches any saved `Message-ID`. If it does, the email goes onto the existing ticket. This catches about 85% of replies.
-
-**Layer 2: Subject tag**
-
-Some corporate mail proxies strip email headers. So every outbound message also injects a tag into the subject:
-
-```
-Subject: Re: [TKT-4521] Cannot log in
-```
-
-If the header lookup fails, the adapter checks the subject for `[TKT-NNNN]`. This catches another ~10%.
-
-**Layer 3: Heuristics (off by default)**
-
-Same sender + similar subject + within last 7 days. Risky because two unrelated emails with similar subjects get merged. Most help desks leave this off and let agents merge manually.
-
-The remaining ~5% open new tickets. Agents merge duplicates via a "merge into" button.
-
-</details>
-
-> **Take this with you.** Email threading by header is the single hardest part of a help desk. Build it in three layers: header match first, subject tag second, heuristics never by default.
-
----
-
-## Step 6: Build the architecture, one layer at a time
-
-We have a ticket service, a threading problem, and an SLA promise to keep. Now build the system around these. One layer at a time.
-
-### v1: ticket service + one database
-
-```mermaid
-flowchart TB
-    C([Customer]):::user --> E["Ticket Service<br/>(runs state machine)"]:::app
-    E --> DB[("Postgres")]:::db
-
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-```
-
-Fine for ten users.
-
-### v2: add the intake adapters and assignment
-
-Different channels need different parsing logic. Pull that out into a thin **Intake Adapter** per channel. Each adapter normalizes to a common event. Add an **Assignment Service** that picks the right team and agent.
-
-```mermaid
-flowchart TB
-    C([Customer]):::user --> IA["Intake Adapters<br/>(email · form · chat)"]:::app
-    IA --> E["Ticket Service"]:::app
-    E --> DB[("Postgres")]:::db
-    E --> AS["Assignment Service<br/>(skill + load)"]:::app
-
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-```
-
-### v3: add the SLA worker and agent dashboards
-
-Two things break as the team grows. Agents ask how many tickets are close to breaching SLA. The tickets table is now too big to scan on every dashboard load. Add a dedicated **SLA Worker** that sweeps every 30 seconds. Add a **Read Service** backed by Redis for agent dashboards.
-
-```mermaid
-flowchart TB
-    C([Customer]):::user --> GW["API Gateway<br/>(auth, rate limit,<br/>idempotency)"]:::edge
-    GW -->|intake| IA["Intake Adapters"]:::app
-    GW -->|read dashboard| R["Read Service<br/>(Redis cache,<br/>< 50ms)"]:::app
-    IA --> E["Ticket Service"]:::app
-    E --> DB[("Postgres")]:::db
-    R --> Cache[("Redis")]:::cache
-    R -.miss.-> DB
-    SW["SLA Worker<br/>(sweeps every 30s,<br/>pauses off-hours)"]:::app --> DB
-
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
-```
-
-### v4: notifications, search, and audit archival
-
-These should not slow down the write path. If Slack is down, tickets must still flow. Add **Kafka**. Notifications, Elasticsearch indexing, cache invalidation, and audit archival all become consumers.
-
-```mermaid
-flowchart TB
-    subgraph Edge["Client edge"]
-        C([Web / Mobile / Slack]):::user
-        GW["API Gateway"]:::edge
-    end
-
-    subgraph WritePath["Write path (synchronous)"]
-        IA["Intake Adapters<br/>(email · form · chat · slack · sms)"]:::app
-        E["Ticket Service<br/>(stateless pods)"]:::app
-        AS["Assignment Service"]:::app
-        SW["SLA Worker"]:::app
-    end
-
-    DB[("Postgres<br/>tickets · messages ·<br/>assignments · sla · audit 90d")]:::db
-
-    R["Read Service"]:::app
-    Cache[("Redis")]:::cache
-
-    K{{"Kafka<br/>ticket.* events"}}:::queue
-
-    subgraph Consumers["Async consumers"]
-        N["Notification Service"]:::app
-        IX["Search Indexer<br/>(Elasticsearch)"]:::app
-        A[("Audit cold tier<br/>S3 + Athena · 7yr")]:::db
-    end
-
-    C --> GW
-    GW -->|intake| IA
-    GW -->|read| R
-    IA --> E
-    E --> AS
-    E --> DB
-    SW --> DB
-    R --> Cache
-    R -.miss.-> DB
-    DB -->|CDC / outbox| K
-    K --> N
-    K --> IX
-    K --> A
-
-    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
-    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
-    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
-    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
-    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
-    classDef ext fill:#e9d5ff,stroke:#7e22ce,color:#581c87
-```
-
-Each box, in one line:
-
-| Box | What it does |
-|-----|--------------|
-| **API Gateway** | Authenticates callers, rate-limits bots, dedupes mobile retries. |
-| **Intake Adapters** | Parse channel-native format, thread replies into existing tickets, emit a common event. |
-| **Ticket Service** | The brain. Enforces valid state transitions. Writes to Postgres transactionally. Stateless. |
-| **Assignment Service** | "Which team? Which agent? Who is on shift right now?" |
-| **SLA Worker** | Scans the SLA table every 30 seconds. Fires warnings and breach events. Pauses outside business hours. |
-| **Postgres** | Source of truth. Live state + 90 days of audit. |
-| **Read Service + Redis** | Optimized for agent dashboards. Keeps the primary DB from being read to death. |
-| **Kafka** | Carries events to the async world. |
-| **Notification, Search Indexer, Audit cold tier** | Consumers. Not on the write path. If the notifier dies, tickets still flow. |
-
-> **Take this with you.** If Slack is down at 3 a.m., new tickets still get created and assigned. Agents just do not get Slack DMs. Anything reactive lives **after** Kafka, not before.
-
----
-
-## Step 7: One ticket, all the way through
-
-Alice sends an email. Watch what happens.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Alice
-    participant EA as Email Adapter
-    participant GW as API Gateway
-    participant E as Ticket Service
-    participant AS as Assignment Svc
-    participant DB as Postgres
-    participant K as Kafka
-    participant N as Notification Svc
-
-    Alice->>EA: sends email (new subject, no In-Reply-To)
-    EA->>EA: parse headers, no existing ticket match
-    EA->>GW: POST /tickets (normalized intake event)
-    GW->>E: forward (auth ok, idempotency checked)
-
-    rect rgb(241, 245, 249)
-        Note over E,DB: one database transaction
-        E->>DB: INSERT ticket (state=new)
-        E->>DB: INSERT ticket_message
-        E->>DB: INSERT sla_targets (first_response_due = now + 1 biz hr)
-        E->>DB: INSERT ticket_audit
-        E->>DB: COMMIT
-    end
-
-    E->>AS: assign ticket
-    AS->>DB: lock team, pick least-busy agent (Bob)
-    AS-->>E: assigned to Bob
-
-    E->>K: emit ticket.created, ticket.assigned
-    E-->>GW: 201 Created
-    GW-->>Alice: ticket id + public URL
-
-    K->>N: ticket.assigned
-    N-->>Bob: Slack DM + email
-    N-->>Alice: "we got your message" auto-reply
-```
-
-Three things worth pointing at:
-
-1. The ticket, the first message, the SLA row, and the audit entry are written in **one transaction**. A crash mid-write rolls back cleanly. Either all four exist, or none.
-2. Kafka is written **after** the commit. Notifications fan out from there. The write path does not wait for Slack or email.
-3. The Ticket Service is stateless. Restart any pod at any time. State lives in Postgres.
-
----
-
-## Step 8: SLA timers and business hours
-
-A common SLA: respond to high-priority tickets within 1 hour, resolve within 24. On breach, escalate.
-
-Two things make this much harder than they look.
-
-**Problem 1: business hours.** A ticket arrives Friday at 5 PM. Does the 1-hour clock run through the weekend? No. It must pause at 5 PM Friday and resume 9 AM Monday. That means deadlines are not `created_at + 1 hour`. They are `created_at + 1 business hour`, which requires walking forward through the team's schedule.
-
-**Problem 2: clock pauses.** When an agent moves a ticket to `waiting_on_customer`, the clock pauses. The agent asked for information. The customer has not replied yet. Blaming the agent for that wait makes the SLA metric meaningless.
+Threading an inbound email into the correct ticket requires checking multiple signals in order of trust.
 
 ```mermaid
 flowchart TD
-    A[SLA worker wakes every 30s] --> B{query: tickets near deadline}
+    A[raw email arrives] --> B{In-Reply-To matches<br/>a saved Message-ID?}
+    B -- yes --> D[append to existing ticket]:::ok
+    B -- no --> E{subject contains TKT-NNNN?}
+    E -- yes --> D
+    E -- no --> F{heuristic match?<br/>same sender + similar subject<br/>within 7 days}
+    F -- yes --> G[flag for agent review]:::ok
+    F -- no --> H[create new ticket]:::ok
+
+    classDef ok fill:#dcfce7,stroke:#15803d,color:#14532d
+```
+
+The three layers and what they catch:
+
+| Layer | Signal | Catch rate | Risk |
+|-------|--------|------------|------|
+| RFC 5322 headers | `In-Reply-To` / `References` | ~85% | Low, headers are reliable |
+| Subject tag | `[TKT-1234]` in subject | ~10% | Low, tag is injected by us |
+| Heuristic | Same sender, similar subject | ~3% | Medium, can merge unrelated tickets |
+
+The heuristic layer is off by default. Turn it on only after the first two cover the easy cases.
+
+When the adapter sends an outbound message, it saves the outgoing `Message-ID`. Inbound replies carry `In-Reply-To: <that-message-id>`. A single index lookup on `ticket_messages.inbound_message_id` finds the match.
+
+> **Take this with you.** Email threading by header is the single hardest part of a help desk. Build it in three layers: header match first, subject tag second, heuristics never on by default.
+
+---
+
+## Decision 2: how do we pick an agent?
+
+A ticket arrives. 200 agents are logged in. Who gets it?
+
+```mermaid
+flowchart LR
+    subgraph A["Option A: round robin"]
+        A1["Walk a pointer<br/>through agent list"]:::app
+        A2["Problem: ignores skill<br/>and current load"]:::bad
+    end
+    subgraph B["Option B: skill-based push"]
+        B1["Tag ticket at intake<br/>match to agent skill"]:::app
+        B2["Problem: silently misroutes<br/>when skill tags are stale"]:::bad
+    end
+    subgraph C["Option C: pull queue"]
+        C1["Ticket sits in queue<br/>agent clicks Next"]:::app
+        C2["Problem: agents cherry-pick<br/>easy tickets"]:::bad
+    end
+    subgraph D["Option D: load-balanced push"]
+        D1["Assign to agent with<br/>fewest open tickets"]:::app
+        D2["Problem: ignores ticket<br/>complexity"]:::bad
+    end
+
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+```
+
+In practice, most systems combine B and D: skill-based to narrow the candidate pool, load-balanced to pick within that pool, pull queue as fallback when push fails.
+
+The race to solve: two agents click "Next Ticket" at the same instant. Both queries return TKT-100. Both think it is theirs.
+
+Fix: `SELECT ... FOR UPDATE SKIP LOCKED` in Postgres. Agent A locks TKT-100. Agent B's query sees the lock, skips it, and gets TKT-101. Both succeed. No application-level coordination needed.
+
+<details markdown="1">
+<summary><b>Show: pull-queue assignment with SKIP LOCKED</b></summary>
+
+```python
+def claim_next_ticket(agent):
+    with db.transaction():
+        ticket = db.query("""
+            SELECT ticket_id FROM tickets
+            WHERE team_id = ? AND assignee_id IS NULL
+              AND status IN ('new', 'assigned')
+            ORDER BY priority DESC, created_at ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        """, agent.team_id)
+        if not ticket:
+            return None
+        db.update("tickets", ticket.id,
+                  assignee_id=agent.id, status='assigned')
+        db.insert("assignments",
+                  ticket_id=ticket.id, agent_id=agent.id, reason='pulled')
+        return ticket
+```
+
+</details>
+
+> **Take this with you.** `FOR UPDATE SKIP LOCKED` is the standard Postgres pattern for work queues. One query, no locks at the application layer, no double-assigns.
+
+---
+
+## Decision 3: how do SLA timers work?
+
+The CEO asks: "We promised enterprise customers a 1-hour first reply. How do we track that?"
+
+Two things make this much harder than they look.
+
+**Problem 1: business hours.** A ticket arrives Friday at 5 PM. The 1-hour SLA must pause at close of business and resume Monday at 9 AM. Deadlines are not `created_at + 1 hour`. They are `created_at + 1 business hour`, which requires walking forward through the team's schedule.
+
+**Problem 2: clock pauses.** When an agent moves a ticket to `WaitingOnCustomer`, the clock must pause. If it keeps running, every ticket that needs customer input eventually breaches through no fault of the agent.
+
+```mermaid
+flowchart TD
+    A[SLA worker wakes every 30s] --> B{query: tickets<br/>near deadline}
     B --> C{clock paused?}
     C -- yes --> D[skip]:::ok
-    C -- no --> E{how close to breach?}
+    C -- no --> E{how close?}
     E -- 30 min away --> F[warn team lead]:::ok
     E -- at deadline --> G[mark breached]:::bad
     G --> H[raise priority]
     G --> I[reassign to senior agent]
-    G --> J[notify manager via Slack]
+    G --> J[page manager]
 
     classDef ok fill:#dcfce7,stroke:#15803d,color:#14532d
     classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
 ```
+
+The SLA table is narrow by design. The worker scans it every 30 seconds with a tight index. Keeping SLA columns out of the wide tickets row makes the sweep fast.
 
 <details markdown="1">
 <summary><b>Show: SLA table, business-hour math, and the sweep worker</b></summary>
 
 ```sql
 CREATE TABLE sla_targets (
-    ticket_id           UUID PRIMARY KEY,
+    ticket_id           UUID PRIMARY KEY REFERENCES tickets(ticket_id),
     priority            TEXT NOT NULL,
     first_response_due  TIMESTAMPTZ,
     resolution_due      TIMESTAMPTZ,
@@ -465,12 +289,11 @@ CREATE TABLE sla_targets (
     resolved_at         TIMESTAMPTZ,
     breach_state        TEXT NOT NULL DEFAULT 'on_track'
 );
-
 CREATE INDEX idx_sla_first ON sla_targets (first_response_due)
     WHERE first_response_at IS NULL AND paused_at IS NULL;
 ```
 
-The deadline is not `created_at + 1 hour`. It is `created_at + 1 hour of business time`. You compute it by walking forward through the schedule:
+Business-hour-aware deadline computation:
 
 ```python
 def add_business_time(start, duration, schedule):
@@ -506,7 +329,7 @@ def sla_sweep():
             emit("sla.warning", row.ticket_id)
 ```
 
-When the clock pauses (agent sends to `waiting_on_customer`):
+Pause when ticket moves to `WaitingOnCustomer`:
 
 ```python
 def pause_sla(ticket_id, reason):
@@ -523,78 +346,250 @@ def resume_sla(ticket_id):
               resolution_due=target.resolution_due + paused_for)
 ```
 
-Escalation rules live in config, not in code:
-
-```yaml
-escalation_policy: high_priority_default
-rules:
-  - on: sla.warning
-    action: notify
-    recipient: team_lead
-
-  - on: sla.breached
-    action: reassign
-    target: senior_agent_pool
-
-  - on: sla.breached + 30min
-    action: notify
-    recipient: support_manager
-    via: [email, slack, pagerduty]
-```
-
 </details>
 
-> **Take this with you.** SLA timers are not `created_at + N hours`. They require business-hour-aware math, a pause/resume mechanism, and a separate worker that sweeps regularly. Get any one wrong and the whole metric becomes untrustworthy.
+> **Take this with you.** SLA timers are not `created_at + N hours`. They require business-hour-aware math, a pause/resume mechanism, and a worker that sweeps regularly. Get any one wrong and the metric becomes untrustworthy.
 
 ---
 
-## Step 9: How to pick an agent
+## Decision 4: how do we keep notifications off the write path?
 
-A ticket arrives. 2,000 agents are logged in. Who gets it?
+When a ticket is assigned, Bob gets a Slack DM and an email. If Slack is down, should the ticket creation fail? No.
 
-Four strategies. Each has a sweet spot and a failure mode.
+The answer is to separate event emission from event delivery. The Ticket Service writes to Postgres and emits events to Kafka. A Notification Service consumes those events asynchronously and fans out to Slack, email, and push.
 
-| Strategy | How it works | When it breaks |
-|----------|-------------|----------------|
-| **Round robin** | Walk a pointer through the agent list. | Ignores who is busy. Ignores skill. |
-| **Skill-based** | Tag tickets at intake. Match to agents with the right skill. | Misroutes silently when skill tags are stale. |
-| **Pull queue** | Tickets sit in a queue. Agents click "give me the next one." | Agents cherry-pick easy tickets. Hard ones sit. |
-| **Load-balanced push** | Assign to the agent with the fewest open tickets. | Ignores ticket complexity. One hard ticket counts the same as one easy one. |
+```mermaid
+flowchart LR
+    E["Ticket Service"]:::app -->|INSERT + COMMIT| DB[("Postgres")]:::db
+    DB -->|CDC / outbox| K{{"Kafka<br/>ticket.created<br/>ticket.assigned<br/>sla.breached"}}:::queue
+    K --> N["Notification Service"]:::app
+    K --> IX["Search Indexer"]:::app
+    K --> Cold[("Audit cold tier<br/>S3 · 7yr")]:::db
+    N --> Slack["Slack DM"]:::ext
+    N --> Email["Email reply"]:::ext
 
-In practice, most systems combine these: skill-based to narrow the candidate pool, load-balanced to pick within that pool, pull queue as fallback when push fails.
-
-The race to handle: two agents click "Next Ticket" at the same instant. Both queries return TKT-100. Both think it is theirs.
-
-Fix: use `SELECT ... FOR UPDATE SKIP LOCKED` in Postgres. Agent A locks TKT-100. Agent B's query sees the lock, skips TKT-100, and gets TKT-101. Both succeed.
-
-<details markdown="1">
-<summary><b>Show: pull-queue assignment with SKIP LOCKED</b></summary>
-
-```python
-def claim_next_ticket(agent):
-    with db.transaction():
-        ticket = db.query("""
-            SELECT ticket_id FROM tickets
-            WHERE team_id = ? AND assignee_id IS NULL
-              AND status IN ('new', 'assigned')
-            ORDER BY priority DESC, created_at ASC
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-        """, agent.team_id)
-        if not ticket:
-            return None
-        db.update("tickets", ticket.id,
-                  assignee_id=agent.id, status='assigned')
-        db.insert("assignments",
-                  ticket_id=ticket.id, agent_id=agent.id, reason='pulled')
-        return ticket
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+    classDef ext fill:#e9d5ff,stroke:#7e22ce,color:#581c87
 ```
 
-`FOR UPDATE SKIP LOCKED` is the key. Two agents run the query at the same instant. Each gets a different ticket, because a locked row is invisible to the second query.
+If Slack goes down at 3 AM, new tickets still get created and assigned. Agents just do not get Slack DMs until the queue drains.
 
-</details>
+> **Take this with you.** Anything reactive lives after Kafka, not before. Tie notifications to the write path and every Slack outage becomes a support outage.
 
-> **Take this with you.** `FOR UPDATE SKIP LOCKED` is the standard Postgres pattern for work queues. One query, no application-level coordination, no duplicate claims.
+---
+
+## The full architecture
+
+Putting the four decisions together:
+
+```mermaid
+flowchart TB
+    subgraph Edge["Client edge"]
+        C([Web / Mobile / Slack]):::user
+        GW["API Gateway<br/>(auth · idempotency · rate limit)"]:::edge
+    end
+
+    subgraph WritePath["Synchronous write path"]
+        IA["Intake Adapters<br/>(email · form · chat · slack · sms)"]:::app
+        E["Ticket Service<br/>(stateless pods)"]:::app
+        AS["Assignment Service<br/>(skill + load + pull queue)"]:::app
+        SW["SLA Worker<br/>(sweeps every 30s)"]:::app
+    end
+
+    DB[("Postgres<br/>tickets · messages ·<br/>assignments · sla · audit (90d hot)")]:::db
+
+    subgraph ReadPath["Dashboard read path"]
+        R["Read Service"]:::app
+        Cache[("Redis<br/>agent dashboards")]:::cache
+    end
+
+    K{{"Kafka<br/>ticket.created<br/>ticket.replied<br/>ticket.assigned<br/>sla.breached"}}:::queue
+
+    subgraph Consumers["Async consumers"]
+        N["Notification Service"]:::app
+        IX["Search Indexer<br/>(Elasticsearch)"]:::app
+        Cold[("Audit cold tier<br/>S3 + Athena · 7yr")]:::db
+    end
+
+    C --> GW
+    GW -->|intake| IA
+    GW -->|read| R
+    IA --> E
+    E --> AS
+    E --> DB
+    SW --> DB
+    R --> Cache
+    R -.miss.-> DB
+    DB -->|CDC / outbox| K
+    K --> N
+    K --> IX
+    K --> Cold
+
+    classDef user fill:#dbeafe,stroke:#1e40af,color:#1e3a8a
+    classDef edge fill:#e2e8f0,stroke:#475569,color:#1e293b
+    classDef app fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef db fill:#fed7aa,stroke:#c2410c,color:#7c2d12
+    classDef cache fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef queue fill:#ddd6fe,stroke:#6d28d9,color:#4c1d95
+```
+
+Each component in one line:
+
+| Component | Purpose |
+|-----------|---------|
+| **API Gateway** | Authenticates callers, rate-limits bots, deduplicates mobile retries. |
+| **Intake Adapters** | Parse channel-native format, thread replies into existing tickets, emit a common event. |
+| **Ticket Service** | The state machine. Enforces valid transitions. Writes to Postgres transactionally. Stateless. |
+| **Assignment Service** | "Which team? Which agent? Who is on shift right now?" |
+| **SLA Worker** | Scans the SLA table every 30 seconds. Fires warnings and breach events. Pauses outside business hours. |
+| **Postgres** | Source of truth. Live state plus 90 days of audit. |
+| **Read Service + Redis** | Optimized for agent dashboards. Keeps the primary DB from being read constantly. |
+| **Kafka** | Carries events to the async world. The boundary between synchronous writes and reactive consumers. |
+| **Notification, Search Indexer, Audit cold tier** | Consumers. Not on the write path. If the notifier dies, tickets still flow. |
+
+---
+
+## Walk: one ticket, all the way through
+
+Alice emails support@acme.com about a wrong order.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Alice
+    participant EA as Email Adapter
+    participant GW as API Gateway
+    participant E as Ticket Service
+    participant AS as Assignment Svc
+    participant DB as Postgres
+    participant K as Kafka
+    participant N as Notification Svc
+
+    Alice->>EA: sends email (new subject, no In-Reply-To)
+    EA->>EA: parse headers, no existing ticket match
+    EA->>GW: POST /tickets (normalized intake event)
+    GW->>E: forward (auth ok, idempotency checked)
+
+    rect rgb(241, 245, 249)
+        Note over E,DB: one database transaction
+        E->>DB: INSERT ticket (state=new)
+        E->>DB: INSERT ticket_message
+        E->>DB: INSERT sla_targets (first_response_due = now + 1 biz hr)
+        E->>DB: INSERT ticket_audit
+        E->>DB: COMMIT
+    end
+
+    E->>AS: assign ticket
+    AS->>DB: SELECT FOR UPDATE SKIP LOCKED, pick least-busy agent (Bob)
+    AS-->>E: assigned to Bob
+
+    E->>K: emit ticket.created, ticket.assigned
+    E-->>GW: 201 Created
+    GW-->>Alice: ticket id + public URL (~300ms total)
+
+    K->>N: ticket.assigned event
+    N-->>Bob: Slack DM + email (fire and forget)
+    N-->>Alice: "we got your message" auto-reply
+```
+
+Three things to notice:
+
+1. The ticket, the message, the SLA row, and the audit entry are written in one transaction. A crash mid-write rolls back cleanly.
+2. Kafka is written after the commit. Slack notifications fan out from there. The write path does not wait for Slack.
+3. Alice gets her confirmation in ~300ms. Bob gets notified a few seconds later via Kafka.
+
+---
+
+## Walk: SLA warning, then breach
+
+48 minutes pass. Bob has not replied. The SLA worker wakes up.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SW as SLA Worker
+    participant DB as Postgres
+    participant K as Kafka
+    participant N as Notification Svc
+    participant TL as Team Lead
+
+    SW->>DB: query sla_targets WHERE first_response_due < NOW() + 30min
+    DB-->>SW: TKT-4521 (first_response_due in 12 min)
+
+    rect rgb(241, 245, 249)
+        Note over SW,DB: update breach_state, emit warning
+        SW->>DB: UPDATE sla_targets SET breach_state = 'at_risk'
+        SW->>K: emit sla.warning { ticket_id, minutes_remaining: 12 }
+    end
+
+    K->>N: sla.warning
+    N-->>TL: "TKT-4521 breaches in 12 minutes"
+
+    Note over SW: 12 minutes pass, no reply recorded
+
+    SW->>DB: query sla_targets (next sweep)
+    DB-->>SW: TKT-4521 (first_response_due < NOW())
+
+    rect rgb(241, 245, 249)
+        Note over SW,DB: mark breached
+        SW->>DB: UPDATE sla_targets SET breach_state = 'breached'
+        SW->>DB: UPDATE tickets SET priority = 'urgent'
+        SW->>K: emit sla.breached { ticket_id }
+    end
+
+    K->>N: sla.breached
+    N-->>TL: page + reassign to senior agent pool
+```
+
+---
+
+## The hard sub-problem: SLA windows with business hours across timezones
+
+A customer in Tokyo submits a high-priority ticket at 11 PM Japan Standard Time. The support team is in San Francisco. It is 6 AM Pacific. Business hours have not started yet.
+
+The SLA clock must not run during off-hours for the team. But it also must not confuse the customer's timezone with the team's timezone.
+
+```mermaid
+flowchart TB
+    subgraph Input["At ticket creation"]
+        T["ticket.created_at = 2026-05-28 11:00 PM JST<br/>(= 06:00 AM PST)"]
+    end
+
+    subgraph Schedule["Team schedule lookup"]
+        S["business_hours: SF team<br/>Mon-Fri 09:00-18:00 PST<br/>US holidays excluded"]
+    end
+
+    subgraph Compute["add_business_time(start, 1 hour, schedule)"]
+        C1["cursor = 06:00 AM PST (not in window)"]
+        C2["jump to 09:00 AM PST (window opens)"]
+        C3["advance 1 business hour"]
+        C4["first_response_due = 10:00 AM PST = 03:00 AM JST next day"]
+    end
+
+    subgraph Pause["When ticket moves to WaitingOnCustomer at 09:30 AM PST"]
+        P1["record paused_at = 09:30 AM PST"]
+        P2["stop SLA clock"]
+    end
+
+    subgraph Resume["Customer replies at 02:00 PM PST"]
+        R1["paused_for = 4.5 hours"]
+        R2["shift both deadlines forward by 4.5 hours"]
+        R3["new first_response_due = 02:30 PM PST"]
+    end
+
+    Input --> Schedule --> Compute --> Pause --> Resume
+```
+
+Two things the naive implementation gets wrong:
+
+| Mistake | Consequence |
+|---------|-------------|
+| Use wall-clock time instead of business hours | SLA breaches happen over the weekend when nobody is on shift |
+| Forget to pause when waiting on customer | Agents game the system by closing and reopening tickets to reset the clock |
+
+> **Take this with you.** SLA correctness depends on three things working together: business-hour-aware deadline math, clock pauses on `WaitingOnCustomer`, and a reliable sweep worker. Break any one and the metric becomes meaningless.
 
 ---
 
@@ -602,13 +597,13 @@ def claim_next_ticket(agent):
 
 Try answering each in 2-3 sentences before opening the solution.
 
-1. **Email threading when the subject is stripped.** A customer replies from their phone, which removes the `[TKT-4521]` subject prefix. The email also has no `In-Reply-To` header. How do you still thread it into the right ticket?
+1. **Email threading when the subject is stripped.** A customer replies from a mobile app that removes the `[TKT-4521]` prefix. The email also has no `In-Reply-To` header. How do you still thread it into the right ticket?
 
-2. **Intake adapter crashes mid-batch.** The email adapter pulled 50 messages from IMAP. It crashed after processing 30. On restart, how do you avoid reprocessing the first 30 and avoid losing the last 20?
+2. **Intake adapter crashes mid-batch.** The email adapter pulled 50 messages from IMAP and crashed after processing 30. On restart, how do you avoid reprocessing the first 30 and losing the last 20?
 
 3. **Two agents claim the same queued ticket.** Both click "Next Ticket" within the same second. The query returns the same ticket to both. How do you make sure only one gets it?
 
-4. **SLA business hours across timezones.** Customer in Tokyo. Team in San Francisco. Whose hours apply? What if the contract says "follow the sun"?
+4. **SLA business hours across timezones.** Customer in Tokyo, team in San Francisco. Whose hours apply? What if the contract says "follow the sun"?
 
 5. **Reopen after long silence.** A customer replies to a ticket closed 6 months ago. What does the system do?
 

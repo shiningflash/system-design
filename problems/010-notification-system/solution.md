@@ -1,54 +1,53 @@
 ## Solution: Notification System
 
-### The short version
+### What this system is
 
-A notification system is a pipeline. One event comes in. The right messages go out. Four stages: ingest the event, decide what to send (fan-out), route per channel, deliver through an external provider.
+A notification system is a policy-enforcement pipeline. One event comes in. The system decides, per recipient and per channel, whether to send at all. If yes, it delivers the message through a third-party provider (APNs, FCM, SendGrid, Twilio) and retries on transient failure without sending duplicates.
 
-The pipeline runs on Kafka. Each stage is its own service so each can scale on its own bottleneck. Push, email, SMS, and in-app each get their own queue and their own worker pool. If SendGrid goes down, push keeps flowing.
+The architecture is a stateless Fan-out Service in front of per-channel Kafka queues in front of channel worker pools. Fan-out is the brains: it checks user preferences, quiet hours, per-user caps, and aggregation windows. Workers are the hands: they call providers, retry with backoff, and record results.
 
-The interesting work is at the edges. **Idempotency keys** (`event_id + recipient + channel`) stop duplicate sends across retries and Kafka rebalances. **Aggregation windows** turn 100 likes into one "Alice and 99 others" notification. **Quiet hours** and **per-user caps** stop the system from waking people up at 3am. **Push token cleanup** feeds back into the device registry so dead tokens get pruned within minutes.
-
-What trips candidates: one worker pool for all channels (one bad provider drags everyone else down), preferences as a synchronous Postgres call on the hot path (cannot scale to 100,000/sec), and retries without dedup keys producing duplicate sends.
+What trips candidates: one worker pool for all channels (one bad provider stalls all channels), synchronous Postgres preference reads on the hot path (cannot scale past ~1,000/sec), and retries without dedup keys (users get the same SMS twice).
 
 ---
 
 ### 1. The two questions that matter most
 
-**User preferences.** Without preferences, fan-out is "for each recipient, send." With preferences, it becomes "for each recipient, decide channels, check quiet hours, check the hourly cap, check if we already sent this." Different system.
+**Fan-out shape: transactional or marketing?** A transactional event (Alice liked your post) goes to one user. A marketing campaign targets ten million. These need separate code paths. The marketing path needs a Campaign Scheduler, a rate limiter, and per-user local-time delivery windows. The transactional path needs low latency and high dedup correctness. Conflating them builds the wrong system.
 
-**Fan-out shape.** Are events always 1-to-1 (transactional), or can one event target millions (marketing campaigns)? A 10 billion/day system with even spread is easier than one with viral spikes. The marketing worst case decides queue sizing and whether you need a separate Campaign Scheduler.
+**What are the delivery freshness requirements per channel?** A push notification about a nearby driver arriving must land within 60 seconds or it is useless. An invoice email can arrive 4 hours late and still be useful. These different deadlines drive completely different retry policies. Without asking this question, you cannot size the retry windows.
 
 ---
 
 ### 2. The math, in plain numbers
 
-| Scale | Notifications/day | Per second (sustained) | Peak | Storage (30 days) |
-|-------|-------------------|------------------------|------|-------------------|
+| Scale | Notifications/day | Sustained QPS | Peak QPS | Storage (30 days) |
+|-------|-------------------|---------------|----------|-------------------|
 | Startup (100k users) | ~1 million | ~12 | ~50 | 3.6 GB |
 | Mid-size (10M users) | ~100 million | ~1,200 | ~5,000 | 360 GB |
 | Billion-user product | ~10 billion | ~116,000 | ~350,000 | 36 TB |
 
-Per-channel split at the billion-user scale:
+Per-channel split at billion-user scale:
 
-| Channel | Share | Sustained QPS |
-|---------|-------|---------------|
-| Push    | 60%   | ~70,000/sec |
-| In-app  | 30%   | ~35,000/sec |
-| Email   | 7%    | ~8,000/sec  |
-| SMS     | 3%    | ~3,500/sec  |
+| Channel | Share | QPS |
+|---------|-------|-----|
+| Push (iOS + Android) | 60% | ~70,000 |
+| In-app | 30% | ~35,000 |
+| Email | 7% | ~8,000 |
+| SMS | 3% | ~3,500 |
 
-Worst burst: a 10-million-recipient marketing campaign sent in 5 minutes adds ~33,000/sec for the duration. A 30% spike on top of the 116,000 baseline.
+One marketing campaign targeting 10 million users in 5 minutes: 10M / 300 sec = ~33,000/sec for that burst, roughly 30% on top of the baseline.
 
-Worker pool sizing: at 500 provider calls per second per worker, the sustained 116,000/sec needs ~230 workers; peak needs ~700. Auto-scale based on Kafka consumer lag.
+Worker pool sizing: at 500 provider calls per second per worker, sustained 116,000/sec needs ~230 workers; peak needs ~700. Scale on Kafka consumer lag.
 
-The real ceiling is not your code. It is the **per-account quotas** at the providers. APNs throttles per HTTP/2 connection per certificate. Twilio throttles per sender number. SendGrid throttles per sub-account. At scale, you hold many provider credentials and load-balance across them.
+The real ceiling is provider quotas, not compute. APNs throttles per HTTP/2 connection per certificate. Twilio throttles per sender number. At scale, hold many provider credentials and round-robin across them.
 
 ---
 
 ### 3. The API
 
-Two endpoints carry the whole product. Submit an event and read/write preferences. Everything else is reading data back.
+Two endpoints carry the core product.
 
+**Event submission (from producer services):**
 ```
 POST /api/v1/events
 Idempotency-Key: <event_id>
@@ -58,12 +57,10 @@ Idempotency-Key: <event_id>
   "event_type": "post.liked",
   "category": "social",
   "actor": { "user_id": 123 },
-  "recipients": [
-    { "user_id": 456, "context": { "post_id": 789 } }
-  ],
+  "recipients": [{ "user_id": 456, "context": { "post_id": 789 } }],
   "aggregation_key": "post:789:likes",
   "template_id": "tpl_like_v3",
-  "template_vars": { "actor_name": "Alice", "post_title": "..." },
+  "template_vars": { "actor_name": "Alice", "post_title": "My trip" },
   "ttl_seconds": 3600
 }
 ```
@@ -72,18 +69,17 @@ Idempotency-Key: <event_id>
 |--------|---------|
 | **202** | Event queued |
 | **200** | Same event_id already accepted (idempotent replay) |
-| **400** | Invalid payload, unknown template |
-| **413** | Recipient list too long (> 10k); use bulk endpoint |
+| **400** | Invalid payload or unknown template |
+| **413** | Recipient list exceeds 10k; use the campaign endpoint |
 | **429** | Producer rate limit hit |
 
-Load-bearing choices:
+Three load-bearing choices in the payload:
 
-- **`Idempotency-Key` is required.** Producer retries on timeout. Without it, mobile apps and microservices replay the same event and users get duplicate notifications.
-- **`category` controls policy.** It decides whether quiet hours apply, whether per-user caps apply, and how aggressively the system retries. `transactional` bypasses caps and quiet hours. `marketing` does not.
-- **`ttl_seconds` is a hard deadline.** A push with a 1-hour TTL that sits in a backed-up queue for 90 minutes gets dropped, not delivered stale. This is what prevents the "flood at recovery" problem.
+- `Idempotency-Key` is required. Mobile apps and microservices retry on timeout. Without it, a retry creates a duplicate notification.
+- `category` controls policy. `transactional` bypasses quiet hours and per-user caps. `marketing` does not.
+- `ttl_seconds` is a hard deadline. A push that sits in a backed-up queue past its TTL is dropped, not delivered stale. This prevents the flood-at-recovery problem after a provider outage.
 
-For marketing campaigns targeting millions, a separate bulk endpoint takes a segment query and paces delivery:
-
+**Campaign endpoint (for marketing blasts):**
 ```
 POST /api/v1/campaigns
 {
@@ -100,37 +96,19 @@ POST /api/v1/campaigns
 }
 ```
 
-The Campaign Scheduler expands the segment into a recipient stream and feeds it into the ingest path at the configured rate. Without this, one careless campaign floods Kafka and backpressures everything else.
-
-Preferences API:
-
+**Preferences:**
 ```
 PUT /api/v1/users/me/notification-preferences
 {
-  "channels": {
-    "push":  { "enabled": true },
-    "sms":   { "enabled": false }
-  },
-  "categories": {
-    "marketing":     { "enabled": false },
-    "transactional": { "enabled": true }
-  },
-  "quiet_hours": {
-    "enabled": true,
-    "start": "22:00",
-    "end": "07:00",
-    "timezone": "America/Los_Angeles"
-  }
+  "channels": { "push": { "enabled": true }, "sms": { "enabled": false } },
+  "categories": { "marketing": { "enabled": false }, "transactional": { "enabled": true } },
+  "quiet_hours": { "enabled": true, "start": "22:00", "end": "07:00", "timezone": "America/Los_Angeles" }
 }
 ```
-
-Writes go to the Preferences Service primary. Reads come from a regional Redis cache invalidated via pub/sub on every write.
 
 ---
 
 ### 4. The data model
-
-Five tables. Each one does one job.
 
 ```mermaid
 erDiagram
@@ -140,32 +118,34 @@ erDiagram
     notifications }o--|| events : "created from"
 
     user_preferences {
-        bigint user_id
+        bigint user_id PK
         jsonb channels
         jsonb categories
         time quiet_hours_start
         time quiet_hours_end
         text timezone
+        int version
     }
     notifications {
-        uuid notification_id
+        uuid notification_id PK
         uuid event_id
         bigint recipient_user_id
         smallint channel
         smallint status
         text provider
         text provider_msg_id
+        timestamptz queued_at
         timestamptz sent_at
     }
     templates {
-        text template_id
-        int version
-        smallint channel
-        text locale
+        text template_id PK
+        int version PK
+        smallint channel PK
+        text locale PK
         text body
     }
     user_devices {
-        uuid device_id
+        uuid device_id PK
         bigint user_id
         smallint platform
         text push_token
@@ -237,7 +217,6 @@ CREATE INDEX idx_user_active ON user_devices (user_id) WHERE status = 1;
 ```
 
 **Dedup store (Redis, not SQL):**
-
 ```
 KEY:   dedup:{event_id}:{recipient_user_id}:{channel}
 VALUE: notification_id
@@ -246,53 +225,53 @@ TTL:   24 hours
 
 </details>
 
-Three small choices doing real work:
+Four choices doing real work:
 
-**`notifications` is sharded by `notification_id` hash.** Writes spread evenly. The `idx_event_recipient_channel` index makes "did we already send this?" lookups fast within the shard. The Redis dedup store is the fast path. This index is the durable backup.
+**`notifications` sharded by `notification_id` hash.** Writes spread evenly. The `idx_event_recipient_channel` index makes "did we already send this?" lookups fast within the shard. Redis SETNX is the fast path; this index is the durable backup for reconciliation.
 
-**`templates` are immutable per version.** To "edit" a template, publish version N+1. Roll back by flipping the current-version pointer back. Old messages already sent are stuck (you cannot un-send a push), but new sends pick up the fix within minutes.
+**`templates` are immutable per version.** To fix a template, publish version N+1 and flip the current-version pointer. Roll back by pointing back to N. Messages already sent are stuck (you cannot recall a push), but new sends pick up the fix within minutes.
 
-**`user_devices` filtered by `status = 1`.** Fan-out turns "send to user 456" into active device tokens. Revoked and invalid tokens never touch the provider.
+**`user_devices` filtered by `status = 1`.** Fan-out expands "send to user_456" into active device tokens only. Revoked and invalid tokens never reach the provider.
+
+**`status` is a `SMALLINT`.** Adding new states (`deferred`, `gdpr_deleted`) later is a new integer value, not a schema migration.
 
 ---
 
 ### 5. The engine: event to delivered push
 
-The path of one event, with timing:
+The timing of one event through the full pipeline:
 
 ```
-T+0ms    Post Service calls POST /events with event_id=evt_X, recipient=user_456.
-T+5ms    Ingest API checks payload. Checks event_id in Redis: not seen.
-         SETs event_id (TTL 24h). Appends to events.created Kafka topic.
-         Returns 202.
+T+0ms      Post Service calls POST /events (event_id=evt_X, recipient=user_456).
+T+5ms      Ingest API checks payload. SETNX event_id=evt_X in Redis (24h TTL).
+           Appends to events.created Kafka topic.
+           Returns 202.
 
-T+10ms   Fan-out consumer reads the message.
-T+11ms   Loads user_456's preferences from Redis (cache hit, ~1ms).
-T+12ms   Loads template metadata from Redis (cache hit).
-T+13ms   Checks in order:
-          - category=social, prefs.social.enabled=true. OK.
-          - quiet_hours: user is in PST, now is 14:00. Not in window.
-          - per-user cap: counter=3, cap=20. OK.
-          - aggregation: agg:post:789:likes does not exist.
-            Start window: SETEX 3600 1. Schedule close message.
-          - dedup: SETNX dedup:evt_X:user_456:push. Won.
-         Decision: emit to push and in-app (per user's prefs).
+T+10ms     Fan-out consumer reads the event.
+T+11ms     Loads user_456's prefs from Redis (~1ms, cache hit).
+T+12ms     Checks in order:
+            - category=social, prefs.social=on. OK.
+            - quiet_hours: user is in PST, time is 14:00. Not in window.
+            - per-user cap: counter=3, cap=20. OK.
+            - aggregation: no open window for post:789:likes.
+              SETEX agg:post:789:likes 3600 1. Schedule close at T+3600s.
+            - dedup: SETNX dedup:evt_X:user_456:push. Won.
+           Decision: emit to push (iOS + Android) and in-app.
+T+14ms     Expand user_456 to active devices: device_A (iOS), device_B (Android).
+T+15ms     Emit 2 push tasks and 1 in-app task to channel topics.
+T+17ms     INSERT 3 rows into notifications (status=queued).
 
-T+15ms   Expand user_456 to active devices: device_A (ios), device_B (android).
-T+16ms   Emit two push tasks. Emit one in-app task.
-T+18ms   INSERT 3 rows into notifications (status=queued).
+T+25ms     Push worker pulls task for device_A.
+T+26ms     Render template body (~1ms).
+T+27ms     POST /3/device/{token_A} via persistent HTTP/2 connection.
+T+150ms    APNs returns 200. Worker updates: status=sent, provider_msg_id=apns_xyz.
 
-T+25ms   Push worker pulls task for device_A.
-T+26ms   Check dedup key: already set by fan-out. Proceed.
-T+27ms   Render template body. ~1ms.
-T+28ms   Call APNs HTTP/2: POST /3/device/{token_A}.
-T+150ms  APNs returns 200. Worker updates: status=sent, provider_msg_id=apns_xyz.
-
-T+3600s  Aggregation window closes. Fan-out reads count: 47 likes.
-         Emits one notification: "Alice and 46 others liked your post."
+T+3600s    Aggregation window closes.
+           Fan-out reads count: 47 likes.
+           Emits one notification: "Alice and 46 others liked your post."
 ```
 
-P50 end-to-end for a single push: ~150ms. The biggest chunk is the APNs round trip.
+P50 end-to-end for a single push: ~150ms. The APNs round trip is the biggest chunk.
 
 ---
 
@@ -302,7 +281,7 @@ P50 end-to-end for a single push: ~150ms. The biggest chunk is the APNs round tr
 flowchart TB
     subgraph Edge["Client edge"]
         P([Producer Services]):::user
-        GW["API Gateway<br/>(auth · rate limit · idempotency)"]:::edge
+        GW["API Gateway<br/>auth · rate limit · idempotency"]:::edge
     end
 
     subgraph Ingest["Ingest path"]
@@ -313,19 +292,16 @@ flowchart TB
     subgraph FanOut["Fan-out"]
         F["Fan-out Service<br/>(stateless pods)"]:::app
         Prefs[("Preferences<br/>Redis + Postgres")]:::cache
-        Tmpl[("Template<br/>Service")]:::db
+        Tmpl[("Template Service")]:::db
         DD[("Dedup Store<br/>Redis 24h TTL")]:::cache
         DR[("Device Registry<br/>Postgres by user_id")]:::db
     end
 
-    subgraph Channels["Per-channel queues"]
+    subgraph Channels["Per-channel queues + workers"]
         KP{{"push"}}:::queue
         KE{{"email"}}:::queue
         KS{{"sms"}}:::queue
         KI{{"in-app"}}:::queue
-    end
-
-    subgraph Workers["Channel workers"]
         PW["Push Workers (~150)"]:::app
         EW["Email Workers (~50)"]:::app
         SW["SMS Workers (~30)"]:::app
@@ -334,7 +310,7 @@ flowchart TB
 
     subgraph Providers["External providers"]
         APNs["APNs (iOS)"]:::ext
-        FCM["FCM (Android/web)"]:::ext
+        FCM["FCM (Android)"]:::ext
         SG["SendGrid / SES"]:::ext
         TW["Twilio / SNS"]:::ext
         WS["WebSocket Gateway"]:::app
@@ -380,11 +356,11 @@ flowchart TB
 
 Five things to notice:
 
-- The Ingest API sits in front of Kafka so producers never wait on fan-out. A producer call returns 202 in under 10ms regardless of downstream load.
-- Kafka is partitioned by `recipient_user_id` on `events.created`. All events for one user land on one partition. The per-user cap counter lives on the consumer that owns the partition. No cross-pod fighting.
-- Fan-out and channel workers are split because they have different bottlenecks. Fan-out is IO-bound on Redis lookups. Channel workers are blocked by the provider's latency. Splitting them lets each scale independently.
-- Per-channel topics contain blast radius. If SendGrid is down, the email topic backs up. Push and SMS keep flowing.
-- The Campaign Scheduler is separate because marketing campaigns need pacing. Firing 10 million notifications in 10 seconds would overwhelm the provider quotas. The scheduler reads a segment query, expands it, and feeds the ingest API at a configured rate.
+- The Ingest API returns 202 before any fan-out work starts. Producers are never blocked on delivery latency.
+- Kafka is partitioned by `recipient_user_id` on `events.created`. All events for one user land on one partition. The per-user cap counter lives on the consumer that owns that partition, so no cross-pod synchronization is needed.
+- Fan-out and channel workers split because they have different bottlenecks. Fan-out is IO-bound on Redis lookups. Channel workers are blocked by provider latency.
+- Per-channel topics contain blast radius. SendGrid outage backs up only the email topic.
+- Campaign Scheduler is separate because marketing needs pacing. Without it, one careless campaign floods Kafka and delays 2FA codes.
 
 ---
 
@@ -405,11 +381,10 @@ sequenceDiagram
 
     P->>GW: POST /events (event_id=evt_8f3a)
     GW->>I: forward (auth ok)
-    I->>DD: SETNX event_id (dedup check)
-    DD-->>I: ok, first time seen
+    I->>DD: SETNX event_id=evt_8f3a (24h TTL)
+    DD-->>I: set ok, first time seen
     I->>K: append to events.created
-    I-->>GW: 202 Accepted
-    GW-->>P: 202 Accepted
+    I-->>P: 202 Accepted (~5ms total)
 
     K->>F: read event (partition by recipient_id)
 
@@ -420,13 +395,23 @@ sequenceDiagram
         DD-->>F: set ok
     end
 
-    F->>KP: emit push task
+    F->>KP: emit push task (~15ms from event)
     KP->>W: read task
-    W->>W: render template
+    W->>W: render template (~1ms)
     W->>A: POST /3/device/{token} (HTTP/2)
-    A-->>W: 200 OK
-    W->>W: UPDATE notifications (status=sent)
+    A-->>W: 200 OK (~120ms round trip)
+    W->>W: UPDATE notifications status=sent
 ```
+
+Target latencies for the common paths:
+
+| Path | P99 |
+|------|-----|
+| Ingest to Kafka | ~5ms |
+| Fan-out checks (all Redis) | ~3ms |
+| Push worker to APNs and back | ~120ms |
+| Full end-to-end (happy path push) | ~150ms |
+| Email delivery (SendGrid queued) | ~5 seconds |
 
 ---
 
@@ -434,10 +419,10 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    S1["Stage 1<br/>10k users<br/>1 app + 1 Postgres<br/>~$50/mo"]:::s1
-    S2["Stage 2<br/>~1M users<br/>+ Kafka<br/>+ Preferences svc<br/>~$500/mo"]:::s2
-    S3["Stage 3<br/>10M-100M users<br/>+ Redis for hot reads<br/>+ per-channel workers<br/>+ Campaign Scheduler<br/>~$3-8k/mo"]:::s3
-    S4["Stage 4<br/>1B users<br/>+ multi-region<br/>+ Flink for aggregation<br/>+ sharded dedup store"]:::s4
+    S1["Stage 1<br/>~10k users<br/>1 app + 1 Postgres<br/>~$50/mo"]:::s1
+    S2["Stage 2<br/>~1M users<br/>+ Kafka + Prefs svc<br/>+ push worker pool<br/>~$500/mo"]:::s2
+    S3["Stage 3<br/>10M-100M users<br/>+ Redis prefs cache<br/>+ per-channel workers<br/>+ Campaign Scheduler<br/>~$3-8k/mo"]:::s3
+    S4["Stage 4<br/>1B users<br/>+ multi-region<br/>+ sharded dedup store<br/>+ Flink aggregation"]:::s4
 
     S1 --> S2 --> S3 --> S4
 
@@ -447,55 +432,46 @@ flowchart LR
     classDef s4 fill:#fce7f3,stroke:#be185d,color:#831843
 ```
 
-#### Stage 1: 10,000 users
+#### Stage 1: ~10,000 users
 
-One Postgres, one app instance. Preferences stored in Postgres. Push only (APNs + FCM). Notifications delivered inline via HTTP call to APNs. No queue, no retry logic beyond a single try-catch.
+One Postgres, one app instance. Preferences in Postgres. Push only (APNs + FCM). Notifications delivered inline via HTTP call. No Kafka, no retry logic, no dedup.
 
 Enough because you see a few hundred notifications per hour. Building more is over-engineering.
 
-#### Stage 2: 1 million users
+#### Stage 2: ~1 million users
 
-Something breaks: the inline APNs call slows down the API because APNs latency is 50-200ms. Producer services start timing out.
+What breaks: the inline APNs call takes 50-200ms per notification. At a few hundred concurrent requests, the Ingest API starts timing out.
 
-Add Kafka to decouple the ingest path from delivery. Add a Preferences Service backed by Postgres (still synchronous, but now a separate service). Add a push worker pool. Add basic retry logic. ~$500/month.
+Add Kafka to decouple ingest from delivery. Add a push worker pool. Add basic retry logic. ~$500/month. Still synchronous Postgres preference reads; at 1M users this is manageable.
 
-Still no Redis, no separate channel workers, no dedup beyond a simple Postgres check. One million users and a few thousand notifications per minute is still manageable with direct Postgres reads.
-
-#### Stage 3: 10 million to 100 million users
+#### Stage 3: 10M to 100M users
 
 Several things break at once:
 
-- Preferences Postgres is hit on every fan-out event. At 10,000/sec, that is 10,000 Postgres reads per second. The database falls over.
-- One marketing campaign targeting 5 million users overwhelms the single channel worker pool. Email delivery queues up behind push.
-- No dedup: a Kafka consumer rebalance causes a worker to re-process 500 messages. Users get duplicate push notifications.
+- Preferences Postgres at 10,000 events/sec: 10,000 synchronous reads per second. Database falls over.
+- One marketing campaign targeting 5M users overwhelms the single worker pool. Email backs up behind push.
+- Kafka consumer rebalance causes workers to re-process 500 messages. Users get duplicate push notifications.
 
-Fixes, in order:
+Fixes in priority order:
 
-- Redis cache for preferences with pub/sub invalidation on write. Cache hit rate goes to 99%.
-- Separate Kafka topics and worker pools per channel. Email and push can now fail independently.
-- Redis dedup store with SETNX. Consumer rebalance duplicates handled.
-- Campaign Scheduler to pace large campaigns.
-- Aggregation windows in fan-out to batch social notifications.
-- Quiet hours and per-user caps enforced at fan-out.
+1. Redis cache for preferences with pub/sub invalidation on write. Cache hit rate hits 99%.
+2. Separate Kafka topics and worker pools per channel. Email and push fail independently.
+3. Redis dedup store with SETNX. Consumer rebalance duplicates handled.
+4. Campaign Scheduler to pace large campaigns.
+5. Aggregation windows, quiet hours, and per-user caps in fan-out.
 
 Cost jumps to $3-8k/month.
 
 #### Stage 4: 1 billion users
 
-New problems:
+New problems at this scale:
 
-- EU operations open. GDPR requires EU user data to stay in EU.
-- The Redis dedup store at 100k writes/sec on one cluster becomes a bottleneck.
-- Aggregation windows are stateful. Fan-out workers need distributed state for aggregation counters.
-- Marketing campaigns targeting 100 million users overwhelm even the Campaign Scheduler.
+- GDPR requires EU user data to stay in EU. The architecture goes multi-region.
+- Redis dedup store at 100k writes/sec on one cluster becomes a bottleneck. Shard by `recipient_user_id`.
+- Aggregation window state is too large for stateless fan-out workers. Move to Flink or Kafka Streams for declarative window aggregation with built-in state management.
+- Marketing campaigns can target 100M+ users. Campaign Scheduler needs segment pre-computation and multi-region fan-out.
 
-Multi-region: each region has its own Kafka, workers, Postgres, and Redis. The user's home region (from HRIS/auth) decides where events are processed. Cross-region delivery (a US user sending a notification to an EU user) routed via authenticated cross-region API.
-
-Dedup store sharded by `recipient_user_id` with strong consistency within shard. The dedup guarantee is per-shard; acceptable because cross-shard duplicates are rare.
-
-Replace bare Kafka consumers in fan-out with Flink or Kafka Streams for window aggregation. Lets you express aggregation declaratively and get state management for free.
-
-The core data model has not changed since Stage 1. You added regions, sharding, and a streaming framework on top.
+Each region has its own Kafka, workers, Postgres, and Redis. Cross-region delivery (a US user notifying an EU user) routed via authenticated cross-region API. The core data model has not changed since Stage 1.
 
 ---
 
@@ -503,22 +479,22 @@ The core data model has not changed since Stage 1. You added regions, sharding, 
 
 | Variant | What changes |
 |---------|--------------|
-| **In-app only (no external providers)** | No retry, no token cleanup, no provider quotas. Fan-out writes directly to an inbox table. WebSocket gateway for online users. |
-| **2FA / security SMS** | Exactly-once guarantee required. Use two-phase commit (Postgres `INSERT ON CONFLICT`) instead of Redis SETNX. Accept the ~5ms extra latency. |
+| **In-app only (no external providers)** | No retry complexity, no token cleanup, no provider quotas. Fan-out writes directly to an inbox table. WebSocket gateway for online users. |
+| **2FA / security SMS** | Exactly-once guarantee required. Use Postgres `INSERT ON CONFLICT` (two-phase commit) instead of Redis SETNX. Accept ~5ms extra latency. |
 | **Weekly digest** | Fan-out defers all social notifications to a "digest" bucket. A cron job at Sunday midnight aggregates per user and emits one email. |
-| **WhatsApp / LINE** | Same channel adapter pattern. Each new channel is ~2 weeks of work to wire in. Nothing else changes. |
+| **WhatsApp / LINE channel** | Same channel adapter pattern. New Kafka topic, new worker pool, new provider credentials. ~2 weeks per channel. Nothing else changes. |
 
 ---
 
 ### 10. Reliability
 
-**Provider outage.** APNs goes down for 30 minutes. Push topic backs up. Push workers retry with backoff. After max retries, messages go to dead-letter. When APNs returns, the backlog drains. Two safeguards stop a flood: per-notification TTL drops stale messages, and workers respect APNs's published throughput limit on recovery.
+**Provider outage.** APNs is down for 30 minutes. Push topic backs up. Workers retry with exponential backoff. After 5 attempts (~60 seconds), messages go to dead-letter. When APNs returns, the backlog drains. Two safeguards stop a flood: per-notification TTL drops anything past its expiration, and workers respect APNs's throughput limits on recovery.
 
-**Consumer rebalance.** Kafka consumer groups rebalance when a pod dies or joins. A partition briefly gets processed by two consumers. The Redis SETNX dedup key serializes them: the loser sees the key set and skips the provider call. For 2FA SMS, the stronger Postgres two-phase commit is used instead.
+**Consumer rebalance.** Kafka consumer groups rebalance when a pod dies or joins. A partition briefly gets processed by two consumers. Redis SETNX serializes them: the loser sees the key set and skips the provider call. For 2FA SMS, use Postgres two-phase commit instead.
 
-**Late-arriving events.** A producer held an event for 10 minutes due to its own outage, then sent it. If `ttl_seconds` was 5 minutes, drop it. If no TTL was set, deliver it. Some events (an invoice notification) should be delivered even slightly late. Producers are expected to set TTL based on the event's meaning.
+**Late-arriving events.** A producer held an event for 10 minutes due to its own outage, then sent it. If `ttl_seconds` was 5 minutes, drop it. If no TTL was set, deliver it. Producers set TTL based on the event's business meaning.
 
-**Preferences write race.** A user rapidly toggles marketing opt-out on and off. The pub/sub invalidation fires multiple times. The preferences cache reads the latest value from Postgres on each invalidation. The last write wins. This is intentional and correct.
+**Preferences write race.** A user rapidly toggles marketing opt-out. The pub/sub invalidation fires multiple times. The preferences cache refetches from Postgres on each invalidation and picks up the latest value. Last write wins. Correct behavior.
 
 ---
 
@@ -527,17 +503,16 @@ The core data model has not changed since Stage 1. You added regions, sharding, 
 | Metric | Why it matters |
 |--------|----------------|
 | `notifications.queued_rate` (by channel, category) | Headline throughput |
-| `notifications.delivery_rate_pct` (delivered / queued) | Drops below 95% = page |
+| `notifications.delivery_rate_pct` (delivered / queued) | Below 95% is a page |
 | `fanout.latency_p99` | Fan-out service health |
-| `channel.latency_p99` (per provider) | Spot APNs/SendGrid slowdowns early |
-| `provider.error_rate` (by code) | Distinguish transient from permanent failures |
-| `dedup.hit_rate` | Should be near 0% in steady state; spike means producers are retrying |
-| `aggregation.windows_open` | Sanity check |
-| `quiet_hours.deferred_rate` | If too high, the system may be holding too much |
-| `preferences.cache_hit_rate` | Should be > 99% |
+| `channel.latency_p99` (per provider) | Spots APNs or SendGrid slowdowns early |
+| `provider.error_rate` (by code) | Distinguishes transient from permanent failures |
+| `dedup.hit_rate` | Near 0% in steady state; a spike means producers are retrying |
+| `quiet_hours.deferred_rate` | Too high may mean the system is holding too much |
+| `preferences.cache_hit_rate` | Should be above 99% |
 | `kafka.consumer_lag_p99` (per topic) | Leading indicator of backup |
 | `deadletter.rate` (by channel, reason) | Triggers manual triage |
-| `token_invalidation.rate` | Sudden spike may be an auth bug |
+| `token_invalidation.rate` | A sudden spike may indicate an auth bug |
 | `unsubscribe.rate` (by category) | Product signal for notification fatigue |
 
 Page on: any channel's `delivery_rate_pct` below 95% for 5 minutes. Fan-out `latency_p99` above 30 seconds for 5 minutes. Dead-letter rate spike more than 10x baseline.
@@ -550,9 +525,9 @@ Ticket on: unsubscribe rate spike (likely a bad campaign). Token invalidation sp
 
 **1. Producer retries `event_id=42` twice within 100ms. Later, after TTL expires.**
 
-Within 100ms: the Ingest API checks Redis for the event_id. The first call SETs the key (24h TTL) and proceeds. The second call sees the key set and returns 200 immediately. Nothing reaches Kafka twice.
+Within 100ms: the Ingest API checks Redis for the event_id. The first call SETs the key (24h TTL) and proceeds. The second call sees the key and returns 200 immediately. Nothing reaches Kafka twice.
 
-After 25 hours: the dedup key has expired. The second call is treated as a new event and a second notification fires. This is intentional. Twenty-four hours is long enough that a legitimate retry has already landed. After that, the same event_id is more likely an operator manually resending or a bug producing the same ID for a different intent. For strict deduplication beyond 24 hours, write the event_id to a Postgres `processed_events` table with a unique constraint at ingest time.
+After 25 hours: the dedup key has expired. The second call is treated as a new event and a second notification fires. This is intentional. Twenty-four hours is long enough that a legitimate retry has already landed. After that, the same event_id is more likely an operator manually resending or a bug. For strict deduplication beyond 24 hours, write the event_id to a Postgres `processed_events` table with a unique constraint at ingest time.
 
 **2. Marketing campaign accidentally targets 100M instead of 10M.**
 
@@ -560,89 +535,63 @@ Detection: the volume alert fires when `notifications.queued_rate` for the marke
 
 Stop at the Campaign Scheduler: `POST /campaigns/{id}/pause`. The scheduler stops emitting events within 1-2 seconds.
 
-Events already on `events.created` Kafka are not stopped by pausing the scheduler. Fix: the fan-out Service checks a "campaign blocklist" Redis set on every event. If the campaign_id is in the blocklist, drop the event without fan-out. The operator adds the campaign_id via an admin endpoint, effective within seconds.
-
-Per-channel topics may already have tasks from the bad campaign. Channel workers also check the blocklist before calling the provider.
-
-Cleanup: the blocklist entry expires after 24 hours. Notifications already sent are in the notifications table for audit. Nothing to roll back on the delivery side.
+Events already on Kafka are not stopped by pausing the scheduler. The fan-out Service checks a campaign blocklist Redis set on every event. If the campaign_id is in the blocklist, drop without fan-out. The operator adds the campaign_id via an admin endpoint, effective within seconds. Channel workers also check the blocklist before calling the provider.
 
 **3. APNs is down for 30 minutes.**
 
-During: push topic backs up. Workers retry with exponential backoff. After max retries (5 attempts, ~60-second window), messages go to dead-letter.
+During: push topic backs up. Workers retry with exponential backoff. After 5 attempts (~60 seconds), messages go to dead-letter.
 
-Recovery: APNs returns. Workers resume. A backlog of ~500k messages drains over the next ~5 minutes.
+Recovery: APNs returns. Workers resume. A backlog of ~500k messages drains over the next few minutes. Flood prevention: per-notification TTL drops anything stale (a "your driver arrived" push with a 5-minute TTL is discarded if it sat in the queue for 30 minutes). Workers also respect APNs's throughput limits on resumption.
 
-Flood prevention: per-message TTL drops anything past its expiration. A "your driver arrived" push with a 5-minute TTL is dropped if it sat in the queue for 30 minutes. Workers also respect APNs's throughput limits on resumption and do not dump the full backlog at once.
+**4. User opts out of marketing while a campaign is mid-fan-out.**
 
-**4. User opts out of marketing while a campaign is in flight.**
+Fan-out checks preferences at the moment it processes the event, not when the event was created. The preferences cache has a short TTL with pub/sub invalidation on write. Opt-out at T=0 invalidates the cache. Fan-out refetches on next event, typically within 1 second.
 
-Fan-out checks preferences at the moment it processes the event, not when the event was created. The preferences cache has a 5-minute TTL with pub/sub invalidation on write. Opt-out at T=0 invalidates the cache. Fan-out refetches on next event, typically within 1 second.
-
-Events already past the fan-out stage and sitting on per-channel topics are not re-checked. Those are sent. Window of inconsistency: about 10 seconds.
-
-For strict legal compliance (must not send marketing after opt-out), also re-check preferences in the channel worker before calling the provider. Adds ~1ms per send. Worth it for marketing.
+Events already past fan-out and sitting on per-channel topics are not re-checked. Those are sent. Window of inconsistency: about 10 seconds. For strict legal compliance, also re-check preferences in the channel worker before calling the provider.
 
 **5. User has 5 devices; notification to themselves.**
 
-Fan-out expands "send to user_456" against the device registry filtered by `status = 1` (active). Results: device_A (ios, active), device_B (android, active), device_C (ios, status=revoked, skip), device_D (web push, active), device_E (ios, status=invalid, skip).
-
-Result: 3 push notifications, one per active device. The signed-out and invalid-token devices are filtered at expansion time, before any provider call.
-
-The user gets 3 pushes. Whether to further deduplicate to the most recently active device is a product decision. Most products send to all active devices.
-
-For in-app: one row in the inbox, regardless of devices. Inbox is per-user, not per-device.
+Fan-out expands "send to user_456" against the device registry filtered by `status = 1` (active). If device_C is revoked and device_E is invalid, they are filtered at expansion time before any provider call. Result: 3 push notifications, one per active device. For in-app: one row in the inbox per user, regardless of device count.
 
 **6. Template bug: renders `{{name}}` literally.**
 
-Detection: support tickets, or an automated lint pass that catches unrendered variables in a sample render.
+Detection: support tickets, or a lint pass that checks rendered output against a sample.
 
-Roll back: templates are versioned and immutable. Flip the "current version" pointer for `tpl_X` from v3 to v2. Fan-out picks up the new pointer when the template metadata cache expires (TTL is short for the pointer, longer for the body).
+Roll back: templates are versioned and immutable. Flip the current-version pointer from v3 to v2. Fan-out picks up the new pointer when the template metadata cache expires (short TTL on the pointer, longer on the body).
 
-Messages already sent cannot be recalled. For severe issues (PII leaked), send a follow-up notification with an apology. Mostly, accept the damage and fix forward.
-
-Prevention: every template change goes through lint (check template_vars match variables referenced), a preview render with sample data, a canary to 0.1% of recipients, then full rollout.
+Messages already sent cannot be recalled. For severe issues, send a follow-up apology notification. Prevention: every template change goes through lint, a preview render with sample data, a canary to 0.1% of recipients, then full rollout.
 
 **7. One database shard hotter than others.**
 
-Diagnosis:
+Diagnosis steps:
 
-1. Check the shard key. `notifications` is sharded by `notification_id` hash. An imbalance on a hash-sharded table usually means either the hash function is bad or queries are not using the shard key and are scatter-gathering.
-2. Check slow-query logs. A query like `SELECT FROM notifications WHERE recipient_user_id = ?` scatter-gathers all shards when `recipient_user_id` is not the shard key. One slow shard delays every such query, and it looks "hot" from outside.
-3. Check partition age within the shard. If partitioned by week, the current week's partition takes all writes. Expected and fine.
-4. Check noisy neighbor. Another tenant on the same physical host can steal I/O.
+1. Check the shard key. `notifications` sharded by `notification_id` hash. An imbalance on hash-sharded data usually means queries are not using the shard key and are scatter-gathering.
+2. Check slow-query logs. `SELECT WHERE recipient_user_id = ?` scatter-gathers all shards when `recipient_user_id` is not the shard key. A secondary index on `recipient_user_id` on each shard handles the common case without re-sharding.
+3. Check partition age. If the table is range-partitioned by week, the current week's partition takes all writes.
+4. Check for a noisy neighbor on the same physical host.
 
-Most often it is a query-pattern issue. A secondary index on `recipient_user_id` on each shard handles the common case without re-sharding.
+Most often it is a query-pattern issue, not a sharding problem.
 
-**8. User got an SMS at 4am.**
+**8. User got an SMS at 4 a.m.**
 
 Trace:
 
-1. `SELECT FROM notifications WHERE recipient_user_id = ? AND channel = 3 AND sent_at BETWEEN '03:30' AND '04:30'`. Returns `notification_id`, `event_id`, `template_id`, `category`.
-2. From `event_id`: find the originating event. Who emitted it? What `category`?
+1. Query `notifications` for `recipient_user_id = ?`, `channel = 3` (SMS), and `sent_at` around 4 a.m. Get `notification_id`, `event_id`, `template_id`, `category`.
+2. From `event_id`, find the originating event. Who emitted it? What `category`?
 3. Check the user's preferences: are quiet hours set? What timezone is stored?
 4. Check fan-out logs for this event: did it run the quiet-hours check? What did it decide?
 
-Likely causes: (a) the category was `transactional`, so quiet hours were skipped by design; (b) the user's timezone is wrong in the preferences table (stored as UTC but they live in PST); (c) a DST edge case in the quiet-hours evaluation. Reproduce by replaying the same event with the same user state against the fan-out logic.
-
-The structured fan-out log is what makes diagnosis possible. Without it, you cannot answer this question.
+Likely causes: the category was `transactional` and quiet hours were skipped by design; the user's timezone is wrong in the preferences table; or a DST edge case in the quiet-hours evaluation. Reproduce by replaying the event with the same user state against the fan-out logic. The structured fan-out log is what makes diagnosis possible.
 
 **9. Add web push as a new channel.**
 
-What changes:
+What changes: a new channel adapter for the Web Push protocol (VAPID keys, FCM for Chrome, Mozilla autopush for Firefox). A new entry in the `channel` enum. A new template variant per template (web push bodies are short). A subscription endpoint where the browser registers an `{endpoint URL, keys}` object stored in `user_devices` with `platform=3`. A web push toggle in the preferences UI.
 
-- New channel adapter for the Web Push protocol (uses VAPID keys, talks to FCM for Chrome, Mozilla autopush for Firefox).
-- New entry in the `channel` enum.
-- New template variant per template (web push bodies are short).
-- Subscription endpoint: browser subscribes and gets a `{endpoint URL, keys}` object stored in `user_devices` with `platform=3`.
-- Preferences UI adds the web push toggle.
-
-What stays the same: Ingest API, Kafka topology, dedup store, preferences service, retry and dead-letter logic, templates service. Fan-out now checks for an active web subscription and, if present, emits to a new `notifications.web_push` topic.
-
-Adding a channel is a 2-3 week project. The architecture pays back this decision every time.
+What stays the same: Ingest API, Kafka topology, dedup store, preferences service, retry and dead-letter logic, template service. Fan-out emits to a new `notifications.web_push` topic. Adding a channel is a 2-3 week project.
 
 **10. Audit trail for compliance.**
 
-Every notification has a row in `notifications` with: `notification_id`, `event_id`, `recipient_user_id`, `channel`, `template_id`, `template_version`, `category`, `status`, `queued_at`, `sent_at`, `provider`, `provider_msg_id`, `error_code`.
+Every notification has a row in `notifications` with `notification_id`, `event_id`, `recipient_user_id`, `channel`, `template_id`, `template_version`, `category`, `status`, `queued_at`, `sent_at`, `provider`, `provider_msg_id`, `error_code`.
 
 For "prove user 12345 received exactly these notifications":
 
@@ -655,48 +604,46 @@ SELECT *
  ORDER BY sent_at;
 ```
 
-The absence of a row proves the negative: every emitted notification is logged at queue time (status=queued), before any provider call. If status never became `sent`, the row is still there.
+The absence of a row proves the negative: every emitted notification is logged at queue time (status=queued) before any provider call. If status never became `sent`, the row is still there with the reason.
 
-Retention: 30 days hot in Postgres, archived to S3 as Parquet for 7 years. Compliance queries hit Postgres for recent data and Athena for archived.
-
-For deeper audit (why a notification was suppressed: quiet hours? cap? opt-out?), structured fan-out logs ship to a log warehouse. Cheaper than putting every suppression decision in Postgres. Sufficient for the rare compliance audit.
+Retention: 30 days hot in Postgres, archived to S3 as Parquet for 7 years. Compliance queries hit Postgres for recent data and Athena for archived. For suppression audit (why a notification was dropped: quiet hours, cap, opt-out?), structured fan-out logs ship to a log warehouse.
 
 ---
 
 ### 13. Trade-offs worth saying out loud
 
-**Build vs. buy channel adapters.** You could use OneSignal or Braze to handle all channels. Faster to launch. But you pay per notification at scale, you cannot tune behavior per channel, and you have less visibility into provider failures. For a product sending billions, build. For millions, buy.
+**Build vs. buy channel adapters.** OneSignal or Braze handle all channels. Faster to launch. But you pay per notification at scale, cannot tune behavior per channel, and have less visibility into provider failures. For a product sending billions, build. For millions, buy and iterate.
 
-**Where to evaluate preferences.** Earlier (in fan-out) is cheaper but slightly stale if the user changes preferences mid-campaign. Later (in channel worker) is more responsive but costs an extra Redis read per send. Fan-out is the right default; re-check in the channel worker only for strict compliance cases.
+**Where to evaluate preferences.** Fan-out is cheaper and runs once per event. Channel worker re-check is more responsive but adds one extra Redis read per send. Fan-out is the right default; add channel-worker re-check only for strict marketing compliance requirements.
 
-**Strict vs. eventual dedup.** Redis SETNX is fast but has a window where two workers can both win. Two-phase commit with Postgres is durable but adds 5-10ms. SETNX for social and marketing. Two-phase for 2FA SMS. Pick per category.
+**Strict vs. eventual dedup.** Redis SETNX is fast but has a small window where two workers can both win the key. Postgres two-phase commit is durable but adds 5-10ms. Use SETNX for social and marketing notifications; use two-phase commit for 2FA SMS where exactly-once matters.
 
-**Aggregation window shape.** Tumbling windows (fixed duration, no overlap) are simple but can produce two notifications if events straddle a boundary. Rolling windows extend on each event and never close until quiet, but they delay delivery. Most products use tumbling with a 1-hour default and accept the edge case.
+**Aggregation window shape.** Tumbling windows (fixed duration, no overlap) are simple but can split a burst of likes across two windows and produce two notifications. Rolling windows extend on each event and delay delivery. Most products use tumbling with a 1-hour default and accept the edge case.
 
-**What you would revisit at 10x scale.** Move fan-out to a streaming framework (Flink or Kafka Streams) for declarative window aggregation and built-in state management. Federate the dedup store regionally. Build a "shadow send" mode where new channels or templates can be tested against real traffic without actually calling the provider.
+**What to revisit at 10x scale.** Move fan-out to Flink or Kafka Streams for declarative window aggregation and built-in state management. Federate the dedup store regionally. Build a shadow-send mode where new channels or templates can be tested against real traffic without calling the provider.
 
 ---
 
 ### 14. Common mistakes
 
-**One worker pool for all channels.** "We have a worker that handles push, email, and SMS." Wrong. One bad channel drags down the others. Separate pools, separate topics.
+**One worker pool for all channels.** A single worker handles push, email, and SMS. One bad channel stalls all three. Separate pools, separate topics.
 
 **No idempotency key on producer calls.** A producer retry sends two notifications. Bad.
 
-**Synchronous Postgres preference lookup in the hot path.** At 100k/sec, 100k Postgres reads per second melts the database. Cache in Redis with pub/sub invalidation.
+**Synchronous Postgres preference lookup on the hot path.** At 100k/sec, that is 100k Postgres reads per second. Cache in Redis with pub/sub invalidation.
 
-**No aggregation.** A user with 100 likes on a post gets 100 notifications. Real product complaint within a day of launch.
+**No aggregation.** A user with 100 likes on a post gets 100 separate notifications. A real product complaint within a day of launch.
 
-**No quiet hours or per-user cap.** Both required for any product with more than a few hundred users.
+**No quiet hours or per-user cap.** Required for any product with more than a few hundred users.
 
-**Treating push token revocation as manual cleanup.** APNs and FCM tell you when a token is dead. Build the feedback loop on day one.
+**Treating push token revocation as manual cleanup.** APNs and FCM tell you when a token is dead. Build the feedback loop on day one, or your account-wide delivery rate degrades silently.
 
-**No dead-letter strategy.** "Failed messages just retry forever." Either you flood the provider or messages pile up indefinitely.
+**No dead-letter strategy.** Failed messages pile up or retry forever. Both outcomes are bad.
 
-**Same retry policy across all channels.** Push with a 24-hour retry window delivers a "your driver arrived" push two hours late. Email with a 60-second retry window drops messages that could have delivered after a 1-hour SendGrid outage.
+**Same retry policy across all channels.** Push with a 24-hour retry window delivers a "your driver arrived" push two hours late. Email with a 60-second window drops messages that could have delivered after a 1-hour SendGrid outage.
 
-**Forgetting marketing is different from transactional.** Marketing needs pacing, a Campaign Scheduler, separate quiet-hours behavior, and compliance handling (CAN-SPAM, GDPR). A single uniform pipeline blurs them.
+**Forgetting marketing is different from transactional.** Marketing needs pacing, a Campaign Scheduler, separate quiet-hours behavior, and compliance handling (CAN-SPAM, GDPR, TCPA). A uniform pipeline blurs them.
 
-**No mention of compliance.** GDPR for EU, TCPA for SMS in the US, CAN-SPAM for email. The architecture must accommodate these, not bolt them on later.
+**No mention of compliance.** GDPR for EU, TCPA for SMS in the US, CAN-SPAM for email. The architecture must accommodate these from the start.
 
-If you hit 8 of these 10 in an interview, you are doing well. The three that separate strong from average answers: separate per-channel queues, dedup keys on the producer path, and preferences as a cached read.
+The three that separate strong from average answers: separate per-channel queues, dedup keys at both the ingest and fan-out layers, and preferences as a cached read. Hit those three and you are doing well.

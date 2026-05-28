@@ -6,14 +6,14 @@ Video streaming is two systems that share a database.
 
 The **upload pipeline** is slow, batch, and compute-heavy. It takes a raw file, converts it to 7-9 quality variants, cuts each into 6-second segments, and writes a playlist. Done once per video.
 
-The **playback path** is fast, read-heavy, and CDN-dominated. It delivers bytes to millions of people at the same time. The only code you own on the playback hot path is the Watch Page API, which signs a CDN URL and returns metadata. Every actual byte of video comes from the CDN.
+The **playback path** is fast, read-heavy, and CDN-dominated. It delivers bytes to millions of people at once. The only code you own on the playback hot path is the Watch Page API, which signs a CDN URL and returns metadata. Every actual byte of video comes from the CDN.
 
-They share two things: a metadata database (titles, owners, status) and object storage (the video files). Everything else is separate.
+Both systems share a metadata database (titles, owners, status) and object storage (the video files). Everything else is separate.
 
-Three design choices dominate everything:
+Three choices dominate everything:
 
 1. **Keep upload bytes off your servers.** TUS chunked uploads go directly to S3 multipart. 15 Gbps of ingest is S3's problem.
-2. **Codec choice is the compute budget.** H.264 encodes fast. AV1 is 15-30x slower. Use AV1 only for the top 1% of videos by watch time.
+2. **Codec choice is the compute budget.** H.264 encodes at 100x real-time. AV1 encodes at 0.07x real-time. Use AV1 only for the top 1-5% of videos by watch time.
 3. **The CDN shield is not optional.** Edge PoP → regional shield → S3 origin. A 95% edge hit rate means S3 sees roughly 1% of all traffic. That is the only way the numbers work.
 
 Numbers to know: 500 hours uploaded per minute, 125 million concurrent viewers at peak, 250 Tbps egress, 70 PB of new storage per year.
@@ -22,11 +22,11 @@ Numbers to know: 500 hours uploaded per minute, 125 million concurrent viewers a
 
 ### 1. The two questions that matter most
 
-**YouTube or Netflix?** The whole design forks here. YouTube is a long-tail UGC platform: billions of videos, 80% of them cold, aggressive tiering required. Netflix is a curated library: ~15,000 titles, nearly every video is hot, tiering matters less. The codec and cost story is completely different.
+**YouTube or Netflix?** The whole design forks here. YouTube is a long-tail UGC platform: billions of videos, 80% of them cold, aggressive tiering required. Netflix is a curated library: roughly 15,000 titles, nearly every video is hot, tiering matters less. The codec and cost story is completely different.
 
-**Live or VOD?** Live needs real-time transcoding, RTMP/WebRTC ingest, and a LL-HLS or LL-DASH delivery stack that produces 1-2 second segments. VOD prepares files once. They share almost nothing operationally. Call your scope early.
+**Live or VOD?** Live needs real-time transcoding, RTMP/WebRTC ingest, and a LL-HLS or LL-DASH delivery stack with 1-2 second segments. VOD prepares files once and serves them forever. They share almost no infrastructure. Call your scope early.
 
-Everything else (codec ladder, DRM, storage tiering, freshness of analytics) follows from those two answers.
+Everything else (codec ladder, DRM, storage tiering, analytics freshness) follows from those two answers.
 
 ---
 
@@ -34,13 +34,13 @@ Everything else (codec ladder, DRM, storage tiering, freshness of analytics) fol
 
 | Number | Value | What it tells you |
 |--------|-------|-------------------|
-| Upload ingest | 5 Gbps sustained, 15 Gbps peak | Chunked upload to S3, not to your servers |
-| New videos/day | ~450,000 (5/sec sustained) | Kafka queue depth for transcoding |
+| Upload ingest | 5 Gbps sustained, 15 Gbps peak | Chunked upload direct to S3, not to your servers |
+| New videos per day | ~450,000 (5/sec sustained) | Kafka queue depth for transcoding jobs |
 | Concurrent viewers | 42M average, 125M peak | CDN sizing |
 | Peak egress | 250 Tbps | The reason a three-tier CDN exists |
 | Source storage | 20 PB/year | Cheap if tiered; kept forever for re-encoding |
-| Transcoded storage | 50 PB/year | About 2.5x the source |
-| Transcoding compute | ~3,500 CPU cores steady (H.264 only) | Add several thousand more for AV1 |
+| Transcoded storage | 50 PB/year | About 2.5x the source (7-9 quality variants) |
+| Transcoding compute | ~3,500 CPU cores (H.264 only) | Add several thousand more for AV1 |
 
 Two costs dominate: CDN egress and transcoding compute. Storage is third. Everything else is rounding error.
 
@@ -87,7 +87,7 @@ POST /api/v1/uploads/<upload_id>/finalize
 
 Returns `{ "video_id": "v_8h3jK2p", "status": "transcoding" }`.
 
-**Get video info (creator polling or viewer loading the watch page):**
+**Get video info:**
 
 ```
 GET /api/v1/videos/v_8h3jK2p
@@ -103,7 +103,7 @@ GET /api/v1/videos/v_8h3jK2p
 }
 ```
 
-**Manifests and segments are served by the CDN, not by your API.** Your API produces the signed URL. The CDN serves every byte.
+Manifests and segments are served by the CDN, not by your API. Your API produces the signed URL. The CDN serves every byte.
 
 **Playback telemetry (batched, fire and forget):**
 
@@ -121,9 +121,11 @@ POST /api/v1/telemetry/playback
 
 Three choices worth defending:
 
-- **Idempotency-Key on create.** A mobile client retries on timeout. Without the key, you get duplicate video rows and double-charged storage budgets.
-- **Signed URLs on manifests.** Short-lived (4-8 hours). Stops third-party sites from embedding your video for free.
-- **Telemetry is off the critical path.** Players batch events and POST every few seconds. A lost batch means approximate analytics, not a broken product.
+| Choice | Reason |
+|--------|--------|
+| `Idempotency-Key` on create | A mobile client retries on timeout. Without the key, retries create duplicate video rows and double-charged storage budgets. |
+| Signed URLs on manifests | Short-lived (4-8 hours). Stops third-party sites from embedding your video for free. |
+| Telemetry off the critical path | Players batch events and POST every few seconds. A lost batch means approximate analytics, not a broken product. |
 
 ---
 
@@ -148,6 +150,7 @@ erDiagram
         varchar video_id
         varchar quality
         text status
+        int bitrate_kbps
         text output_path
         timestamptz completed_at
     }
@@ -173,7 +176,7 @@ CREATE TABLE videos (
     video_id        VARCHAR(16) PRIMARY KEY,
     owner_id        BIGINT NOT NULL,
     title           VARCHAR(200),
-    visibility      SMALLINT NOT NULL DEFAULT 1,  -- 1=public, 2=unlisted, 3=private
+    visibility      SMALLINT NOT NULL DEFAULT 1,  -- 1=public 2=unlisted 3=private
     status          TEXT NOT NULL DEFAULT 'uploading',
     source_path     TEXT,
     duration_ms     BIGINT,
@@ -224,7 +227,7 @@ Three choices worth defending:
 
 **`manifests` is separate from `videos`.** The Manifest Builder writes it when enough qualities complete. This lets you show a partial playlist (360p available, 1080p still encoding) without touching the main `videos` row.
 
-Why Postgres first, Cassandra later: at startup, ACID transactions matter (update variant status and publish Kafka message in one go). At 10 billion videos, point lookups by `video_id` with no joins are all you need, which is exactly what Cassandra is designed for.
+Why Postgres first, Cassandra later: at startup, ACID transactions matter (update variant status and publish Kafka message atomically). At 10 billion videos, point lookups by `video_id` with no joins are all you need. That is exactly what Cassandra is designed for.
 
 ---
 
@@ -276,13 +279,13 @@ while True:
 
 Four details that matter for production:
 
-**Segment alignment across qualities.** Every quality cuts at exactly the same timestamps (0s, 6s, 12s, 18s ...). The player switches qualities between segments. If 360p cuts at different boundaries than 1080p, the switch causes a visual jump. Use `-force_key_frames` to enforce this.
+**Segment alignment across qualities.** Every quality cuts at exactly the same timestamps (0s, 6s, 12s, 18s...). The player switches qualities between segments. If 360p cuts at different boundaries than 1080p, the switch causes a visible frame jump. Use `-force_key_frames` to enforce this.
 
 **Idempotent output.** Re-running the same job overwrites the same S3 keys. This is intentional. Kafka may redeliver a message after a worker crash. Idempotent output makes at-least-once delivery safe.
 
 **Janitor for stuck jobs.** A periodic scan finds `variants` rows with `status=encoding` older than 2x the expected job duration and republishes them to Kafka. Workers are stateless; restarting is always safe.
 
-**Manifest assembly.** A separate Manifest Builder consumes `transcode.completed` events. When all required qualities are ready (or even after the first one, for progressive availability), it writes `master.m3u8` and updates `videos.status=ready`. The master playlist has a 60-second CDN TTL so viewers see new qualities quickly as they finish.
+**Manifest assembly.** A separate Manifest Builder consumes `transcode.completed` events. It writes a partial `master.m3u8` after the first quality completes, then rewrites it as more variants finish. The master playlist has a 60-second CDN TTL so viewers see new qualities appear quickly as they complete.
 
 ---
 
@@ -297,21 +300,21 @@ stateDiagram-v2
     Starting --> Buffering: fetch master.m3u8, pick 360p
     Buffering --> Playing: first segment decoded
     Playing --> Playing: fetch next segment, measure speed
-    Playing --> SwitchUp: buffer full, bandwidth allows higher quality
-    Playing --> SwitchDown: buffer low, need to refill fast
+    Playing --> SwitchUp: buffer > 30s AND bandwidth allows higher quality
+    Playing --> SwitchDown: buffer < 5s, need to refill fast
     SwitchUp --> Playing: next request at higher quality
     SwitchDown --> Playing: next request at lower quality
     Playing --> [*]: video ends
 ```
 
-The player keeps about 30 seconds of video in its buffer. It measures bandwidth on each segment download. If a 1 MB segment downloads in 200 ms, that is 5 MB/s = 40 Mbps. Plenty for 1080p at 5 Mbps. If the buffer drops below 5 seconds, it drops to a lower quality to refill fast.
+The player keeps about 30 seconds of video in its buffer. It measures bandwidth on each segment download. If a 1 MB segment downloads in 200ms, that is 5 MB/s = 40 Mbps. Plenty for 1080p at 5 Mbps. If the buffer drops below 5 seconds, it drops to a lower quality to refill fast.
 
-HLS and DASH are the two protocols. Both do the same thing with different file formats:
+HLS and DASH both implement ABR with different file formats:
 
-- **HLS** (Apple): `.m3u8` playlists, `.ts` or `.m4s` segments. Default on iOS and Safari.
+- **HLS** (Apple): `.m3u8` playlists, `.m4s` segments. Default on iOS and Safari.
 - **DASH** (ISO standard): `.mpd` XML manifests, `.m4s` segments. Default on Android.
 
-Modern platforms write segments in `.m4s` (the CMAF format) and produce both an HLS playlist and a DASH manifest pointing to the same byte files. One set of segment files, two manifests.
+Modern platforms write segments in `.m4s` (the CMAF format) and produce both an HLS playlist and a DASH manifest pointing at the same byte files. One set of segments, two manifests, all devices covered.
 
 ---
 
@@ -320,7 +323,7 @@ Modern platforms write segments in `.m4s` (the CMAF format) and produce both an 
 ```mermaid
 flowchart TB
     subgraph Edge["Client edge"]
-        C([Creator / Viewer]):::user
+        C(["Creator / Viewer"]):::user
         GW["API Gateway<br/>(auth · rate limit · routing)"]:::edge
     end
 
@@ -341,8 +344,8 @@ flowchart TB
     S3out[("S3 segments<br/>hot/warm/cold tiered")]:::db
 
     subgraph CDNStack["CDN (3-tier)"]
-        E1["Edge PoPs<br/>(200+ worldwide)"]:::edge
-        SH["Regional Shields<br/>(10-20 worldwide)"]:::edge
+        EP["Edge PoPs<br/>(200+ worldwide, ~95% hit)"]:::edge
+        SH["Regional Shields<br/>(10-20 worldwide, ~80% hit on misses)"]:::edge
     end
 
     subgraph TelemetryStack["Telemetry pipeline"]
@@ -366,8 +369,8 @@ flowchart TB
     MB --> DB
     WA --> DB
     WA --> RD
-    WA -->|signed URL| E1
-    E1 -.miss.-> SH
+    WA -->|"signed URL"| EP
+    EP -.miss.-> SH
     SH -.miss.-> S3out
     TK --> FL
     FL --> VDB
@@ -382,11 +385,11 @@ flowchart TB
 
 Five things worth noticing:
 
-- The Watch Page API is the only piece of your code on the playback hot path. Target P99 latency: 50 ms.
+- The Watch Page API is the only piece of your code on the playback hot path. Target P99 latency: 50ms.
 - Kafka sits between every pipeline stage. A worker crash at 3 a.m. does not lose jobs.
-- Transcoding workers are stateless. Restart any worker at any time; the job reruns from scratch (idempotent output makes this safe).
+- Transcoding workers are stateless. Restart any worker at any time. The job reruns from scratch (idempotent output makes this safe).
 - Telemetry is fully async. If Flink has a lag spike, watch pages keep loading. View counts just update a bit late.
-- Redis caches the most popular video metadata. For a video with 10M views/day, Postgres would get crushed without it.
+- Redis caches the most popular video metadata. For a video with 10M views/day, Postgres would be overwhelmed without it.
 
 ---
 
@@ -404,32 +407,32 @@ sequenceDiagram
     participant S3out as S3 (origin)
 
     Bob->>GW: GET /videos/v_8h3jK2p
-    GW->>WA: forward (auth ok)
+    GW->>WA: forward (auth ok, ~5ms)
     WA->>RD: GET video:v_8h3jK2p
-    alt cache hit
-        RD-->>WA: metadata
+    alt Redis hit (~90% for popular videos)
+        RD-->>WA: metadata (~1ms)
     else cache miss
-        WA->>DB: SELECT video, manifests
+        WA->>DB: SELECT video, manifests (~10ms)
         DB-->>WA: rows
         WA->>RD: SET video:v_8h3jK2p TTL=5min
     end
-    WA-->>Bob: title, signed master.m3u8 URL
+    WA-->>Bob: title, signed master.m3u8 URL (~50ms total)
 
-    Bob->>CDN: GET master.m3u8 (signed)
-    alt edge cache hit (95%)
-        CDN-->>Bob: 1 KB playlist
-    else miss → shield → origin
+    Bob->>CDN: GET master.m3u8 (signed URL)
+    alt edge cache hit (~95%)
+        CDN-->>Bob: 1 KB playlist (~50ms)
+    else miss → shield → S3
         CDN->>S3out: GET master.m3u8
         S3out-->>CDN: file
         CDN-->>Bob: 1 KB playlist
     end
 
     Bob->>CDN: GET 360p/seg_0.m4s
-    CDN-->>Bob: ~1 MB segment (6 sec)
+    CDN-->>Bob: ~1 MB segment (6 sec, ~200ms)
     Note over Bob: decodes, starts playing, measures 40 Mbps available
 
-    Bob->>CDN: GET 1080p/seg_1.m4s
-    CDN-->>Bob: ~2.5 MB segment
+    Bob->>CDN: GET 720p/seg_1.m4s
+    CDN-->>Bob: ~1.9 MB segment (~250ms)
 
     Note over Bob,CDN: player continues fetching segments, adjusting quality as bandwidth changes
 ```
@@ -438,24 +441,24 @@ Latency budget for first frame:
 
 | Step | Typical time | Notes |
 |------|-------------|-------|
-| API call (`GET /videos/<id>`) | 50 ms | Redis hit for popular videos |
-| `GET master.m3u8` (CDN edge hit) | 50 ms | Edge PoP in the same city |
-| `GET playlist.m3u8` (CDN edge hit) | 50 ms | Same |
-| `GET seg_0.m4s` (CDN edge hit) | 200-500 ms | Depends on segment size and local bandwidth |
-| First frame decode | 50 ms | |
-| **Total** | **~400-700 ms** | Cache hits assumed |
+| API call (Redis hit) | ~50ms | |
+| `GET master.m3u8` (CDN edge hit) | ~50ms | Edge PoP in the same city |
+| `GET playlist.m3u8` (CDN edge hit) | ~50ms | |
+| `GET seg_0.m4s` (CDN edge hit) | ~200ms | Depends on segment size and local bandwidth |
+| First frame decode | ~50ms | |
+| **Total** | **~400ms** | Cache hits assumed |
 
 A 2-second start-time SLO is achievable with cold-cache misses included.
 
 ---
 
-### 9. The scaling journey: 10 users to 1 million
+### 9. The scaling journey: 100 users to 1 million
 
 ```mermaid
 flowchart LR
     S1["Stage 1<br/>100 creators<br/>Postgres + 1 worker<br/>~$100/mo"]:::s1
-    S2["Stage 2<br/>~1k creators<br/>+ Kafka + worker pool<br/>~$500/mo"]:::s2
-    S3["Stage 3<br/>~100k users<br/>+ CDN tiers + Redis<br/>+ storage tiering<br/>~$5k/mo"]:::s3
+    S2["Stage 2<br/>~1K creators<br/>+ Kafka + worker pool<br/>~$500/mo"]:::s2
+    S3["Stage 3<br/>~100K users<br/>+ CDN tiers + Redis<br/>+ storage tiering<br/>~$5K/mo"]:::s3
     S4["Stage 4<br/>~1M+ users<br/>+ Cassandra + multi-region<br/>+ AV1 + ClickHouse"]:::s4
 
     S1 --> S2 --> S3 --> S4
@@ -468,35 +471,35 @@ flowchart LR
 
 #### Stage 1: 100 creators
 
-One Postgres, one transcoding worker, direct-to-S3 playback behind a basic CDN. Uploads are single-file HTTP posts. No queue. If the worker dies, you restart it and resubmit. ~$100/month.
+One Postgres, one transcoding worker, direct-to-S3 playback behind a basic CDN. Uploads are single-file HTTP posts. No queue. If the worker dies, restart it and resubmit. ~$100/month.
 
-Enough because you see maybe 50 uploads per day. Over-engineering at this stage wastes weeks.
+This is enough because you see maybe 50 uploads per day. Over-engineering at this stage wastes weeks.
 
 #### Stage 2: ~1,000 creators
 
 Something breaks: a popular creator uploads a 2 GB file, their Wi-Fi drops, they have to start over. Another problem: upload spikes during peak hours overwhelm the single worker.
 
-Fix both at once: chunked resumable uploads (TUS or S3 multipart) and Kafka + a pool of workers. Workers autoscale on Kafka consumer lag. ~$500/month.
+Fix both at once: chunked resumable uploads (TUS or S3 multipart) and Kafka with a pool of workers. Workers autoscale on Kafka consumer lag. ~$500/month.
 
 #### Stage 3: ~100,000 users
 
-Several things break:
+Several things break at once:
 
-- Popular videos cause hundreds of requests per second to S3. S3 throttles you.
+- Popular videos cause hundreds of requests per second to S3. S3 throttles.
 - Creators complain the watch page is slow.
-- Storage costs are growing faster than revenue.
+- Storage costs grow faster than revenue.
 
-Fixes: three-tier CDN (edge + shield + origin), Redis for hot video metadata, storage tiering (S3 lifecycle rules move old segments to Glacier). Cost jumps to ~$5k/month but CDN and tiering save 5-10x more than they cost.
+Fixes: three-tier CDN (edge + shield + origin), Redis for hot video metadata, storage tiering via S3 lifecycle rules. Cost jumps to ~$5K/month but CDN and tiering save 5-10x more than they cost.
 
 #### Stage 4: ~1M+ users
 
 New problems:
 
 - Postgres starts struggling at ~100M video rows.
-- A single region means EU users have high latency.
-- AV1 starts making economic sense for your most-watched 1%.
+- A single region means EU users see high latency.
+- AV1 starts making economic sense for the most-watched 1%.
 
-Migrate to Cassandra, sharded by `video_id`. Add a second region with cross-region S3 replication for the top 5% of hot content. Start the AV1 pipeline on a dedicated CPU pool. Add ClickHouse for creator analytics. The core pipeline shape has not changed since Stage 2; you are adding capacity and correctness around it.
+Migrate to Cassandra sharded by `video_id`. Add a second region with cross-region S3 replication for the top 5% of hot content. Start the AV1 pipeline on a dedicated CPU pool. Add ClickHouse for creator analytics. The core pipeline shape has not changed since Stage 2. You are adding capacity and correctness around it.
 
 ---
 
@@ -504,30 +507,32 @@ Migrate to Cassandra, sharded by `video_id`. Add a second region with cross-regi
 
 | Tier | Location | Caches | TTL | Hit rate target |
 |------|----------|--------|-----|-----------------|
-| Edge PoPs | One per major city (200+ worldwide) | Hot segments and manifests for this city | 24h-7d for segments, 60s for master | 95%+ |
+| Edge PoPs | One per major city (200+ worldwide) | Hot segments and manifests for that city | 7 days for segments, 60s for master | 95%+ |
 | Regional shields | One per cloud region (10-20 worldwide) | Everything any edge in this region fetched | 7 days | 80%+ on edge misses |
 | Origin | S3 + signing service | Everything | Authoritative | N/A |
 
-Why the shield changes the cost model: without it, 200 edges in a region missing the same segment each issue a separate S3 GET. That is 200 requests for one file. With the shield, the first miss does one S3 GET and serves the other 199 from its cache. S3 request volume scales with the number of distinct videos being watched, not the number of PoPs.
+Why the shield changes the cost model: without it, 200 edge PoPs in a region missing the same segment each fire a separate S3 GET. That is 200 requests for one file. With the shield, the first miss does one S3 GET and serves the other 199 from its cache. S3 request volume scales with the number of distinct videos being watched, not the number of PoPs.
 
-At 250 Tbps total egress with a 95% edge hit rate: S3 origin sees roughly 1% of total traffic. Without the CDN, S3 would need to serve all 250 Tbps. With it, S3 sees ~2.5 Tbps. The rest is served from cache. That is where the 100x cost reduction lives.
+At 250 Tbps total egress with a 95% edge hit rate: S3 origin sees roughly 1% of total traffic. Without the CDN, S3 would need to serve all 250 Tbps. The CDN is not an optimization. It is what makes the numbers work at all.
 
 ---
 
 ### 11. Storage tiering
 
-From question.md Step 10, with cost math:
+From the math in section 2:
 
-- 70 PB new per year. If all stored at S3 Standard: $0.023/GB × 70,000 TB × 12 months = ~$20M/year for one year of content. After 10 years: hundreds of millions.
-- With tiering (5% hot / 15% warm / 80% cold): blended ~$0.005/GB. Same data costs ~$4M/year. About 5x cheaper.
+- 70 PB new per year. If all stored at S3 Standard: $0.023/GB × 70,000 TB × 12 months = roughly $20M/year for one year of content. After 10 years: hundreds of millions.
+- With tiering (5% hot / 15% warm / 80% cold): blended ~$0.005/GB. Same data costs roughly $4M/year. About 5x cheaper.
 
-The tiering job runs nightly, reads `last_viewed_at` from ClickHouse, emits S3 lifecycle transitions in bulk. Source files never get deleted; they move from Standard to Glacier after 30 days. When AV2 ships in 5 years, you pull sources out of Glacier and re-encode.
+The tiering job runs nightly, reads `last_viewed_at` from ClickHouse, and emits S3 lifecycle transitions in bulk. When a cold video goes viral, it is promoted back to Standard within minutes.
+
+Source files are never deleted. They move from Standard to Glacier after 30 days. When a new codec ships, you pull sources from Glacier and re-encode without quality loss.
 
 ---
 
 ### 12. Reliability
 
-**Worker crash mid-transcoding.** Kafka redelivers the message. The worker re-runs and overwrites the same S3 keys. Output is idempotent; no partially-written segments survive.
+**Worker crash mid-transcoding.** Kafka redelivers the message. The worker re-runs and overwrites the same S3 keys. Output is idempotent; no partial segments survive.
 
 **Kafka broker loss.** Replication factor 3. Leader election handles a single broker failure. Producers with idempotency enabled prevent duplicates on retry.
 
@@ -539,7 +544,7 @@ The tiering job runs nightly, reads `last_viewed_at` from ClickHouse, emits S3 l
 
 **Metadata DB partial failure.** At Cassandra scale, replication factor 3 per region survives node failures. A full-region failure means writes from that region stall; reads continue from other regions. At Postgres scale, a read replica handles the read side during primary recovery.
 
-**Janitor for stuck jobs.** A periodic scan finds `variants` rows stuck in `encoding` longer than 2x the expected job duration and republishes them. Expected durations are estimated from the source file size and codec.
+**Janitor for stuck jobs.** A periodic scan finds `variants` rows stuck in `encoding` longer than 2x the expected job duration and republishes them. Expected durations are estimated from source file size and codec.
 
 ---
 
@@ -552,16 +557,16 @@ The tiering job runs nightly, reads `last_viewed_at` from ClickHouse, emits S3 l
 | `kafka.transcode.requested.lag` | Autoscaler input; high means farm is undersized |
 | `transcoder.job_duration` by codec | Regression in ffmpeg or source quality |
 | `transcoder.failure_rate` | Bad sources, OOMs, or codec bugs |
-| `manifest.assembly_lag` | Time from last variant done to master published; slow hurts creators |
+| `manifest.assembly_lag` | Time from last variant done to master published; slow hurts creator experience |
 | `cdn.edge_hit_rate` per PoP | The headline cost driver. Below 90%, investigate. |
 | `cdn.shield_hit_rate` | Below 70% means shield is undersized or TTLs are wrong |
-| `cdn.s3_origin_request_rate` | Should be ~1% of total. Spike means edge+shield failed |
-| `playback.first_frame_p99_ms` | The viewer SLO. Page at >3,000 ms for 5 minutes |
+| `cdn.s3_origin_request_rate` | Should be ~1% of total. Spike means edge and shield both failed |
+| `playback.first_frame_p99_ms` | The viewer SLO. Page at >3,000ms for 5 minutes |
 | `playback.rebuffer_ratio` | Rebuffer seconds / playback seconds. Target <0.5% |
 | `playback.quality_distribution` | Viewers stuck on 240p = CDN issue or ABR bug |
 | `view_counter.lag_seconds` | If a video goes viral and shows 0 views, this is broken |
 
-Page on: `cdn.edge_hit_rate < 85%` for 10 min. `playback.first_frame_p99 > 3,000 ms` for 5 min. `transcoder.failure_rate > 5%`. `s3_origin_request_rate > 10x baseline`.
+Page on: `cdn.edge_hit_rate < 85%` for 10 minutes. `playback.first_frame_p99 > 3,000ms` for 5 minutes. `transcoder.failure_rate > 5%`. `s3_origin_request_rate > 10x baseline`.
 
 ---
 
@@ -573,7 +578,7 @@ Update `videos.status=blocked` in Postgres immediately. The Watch Page API now r
 
 **2. AV1 backfill for the top 10,000 videos.**
 
-Sort videos by `total_watch_seconds` descending (more meaningful than view count alone). Take the top 10K. Estimate savings per video: `(h264_bitrate - av1_bitrate) × monthly_watch_seconds`. Filter to videos where bandwidth savings exceed 10x the one-time encoding cost. Average video is 10 minutes. AV1 at 0.5x real-time = 20 minutes of compute per video. 10K videos × 20 min / 1,000 cores in parallel ≈ 3 hours wall-clock. Publish 10K `transcode.requested` messages with `priority=backfill` (lower priority than live uploads). Manifest Builder adds the AV1 variant to the existing master playlist when done. Players that support AV1 pick it automatically; older players stick with H.264.
+Sort videos by `total_watch_seconds` descending (more meaningful than raw view count). Take the top 10K. Estimate savings per video: `(h264_bitrate - av1_bitrate) × monthly_watch_seconds`. Filter to videos where bandwidth savings exceed 10x the one-time encoding cost. Average video is 10 minutes. AV1 at 0.5x real-time = 20 minutes of compute per video. 10K videos × 20 min / 1,000 parallel cores is about 3 hours wall-clock. Publish 10K `transcode.requested` messages with `priority=backfill` (lower priority than live uploads). Manifest Builder adds the AV1 variant to the existing master playlist when done. Players that support AV1 pick it automatically; older players stick with H.264.
 
 **3. Live streaming.**
 
@@ -591,11 +596,11 @@ Trust-and-safety calls `POST /admin/videos/<id>/block`. This updates `videos.sta
 
 **6. Watch-time analytics.**
 
-Players emit heartbeats every few seconds with `(video_id, session_id, position_seconds)`. Flink aggregates: for each video and each 10-second position bucket, count distinct sessions that reached it. The result is a retention curve: at position 0:00, 100% of sessions; at 3:47, maybe 60%; at the end, maybe 30%. Store in ClickHouse, partitioned by `video_id`, bucketed by position. Query latency is in the hundreds of milliseconds even on large data. Creators see the curve in their Studio. Updating nightly is fine; real-time would not change creator decisions.
+Players emit heartbeats every few seconds with `(video_id, session_id, position_seconds)`. Flink aggregates: for each video and each 10-second position bucket, count distinct sessions that reached it. The result is a retention curve: at position 0:00, 100% of sessions; at 3:47, maybe 60%; at the end, maybe 30%. Store in ClickHouse, partitioned by `video_id`, bucketed by position. Query latency is in the hundreds of milliseconds even on large data. Creators see the curve in their Studio dashboard. Updating nightly is fine; real-time would not change creator decisions.
 
 **7. DRM (Netflix mode).**
 
-Every transcoded segment is encrypted with AES-128 in CTR mode using a per-content encryption key (CEK). The manifest references a license server URL. At playback start: (1) player fetches the manifest, (2) player requests a license, (3) license server verifies the user is subscribed and geo-allowed, then returns the CEK wrapped for this device, valid for this session with a TTL, (4) player decrypts segments on the fly. Add to the architecture: a License Server (stateless API), a Key Management Service (stores CEKs indexed by `video_id`), and integration with Widevine (Android/Chrome), FairPlay (Apple), and PlayReady (Windows). Per-session license issuance adds 50-200 ms to start time. Manifests can be cached. Licenses cannot.
+Every transcoded segment is encrypted with AES-128 in CTR mode using a per-content encryption key (CEK). The manifest references a license server URL. At playback start: (1) player fetches the manifest, (2) player requests a license, (3) license server verifies the user is subscribed and geo-allowed, then returns the CEK wrapped for this device with a TTL, (4) player decrypts segments on the fly. Add to the architecture: a License Server (stateless API), a Key Management Service (stores CEKs indexed by `video_id`), and integration with Widevine (Android/Chrome), FairPlay (Apple), and PlayReady (Windows). Per-session license issuance adds 50-200ms to start time. Manifests can be cached. Licenses cannot.
 
 **8. Multiple audio tracks and subtitles.**
 
@@ -603,37 +608,35 @@ HLS master playlists have `#EXT-X-MEDIA` entries for each audio and subtitle tra
 
 **9. Regional shield outage.**
 
-Every edge PoP behind the downed shield now falls back to S3 for cache misses. S3 request volume spikes 10-50x. Edges have `stale-while-revalidate` set: they serve cached segments to in-progress viewers while attempting a background refresh. Most viewers see no interruption. Long-tail videos (not yet cached at the edge) may be unplayable until the shield recovers. Pre-provision higher S3 request rate limits when you deploy a shield so the spike does not exhaust your S3 concurrency quota.
+Every edge PoP behind the downed shield falls back to S3 for cache misses. S3 request volume spikes 10-50x. Edges have `stale-while-revalidate` set: they serve cached segments to in-progress viewers while attempting a background refresh. Most viewers see no interruption. Long-tail videos (not yet cached at the edge) may be unplayable until the shield recovers. Pre-provision higher S3 request rate limits when you deploy a shield so the spike does not exhaust your S3 concurrency quota.
 
 **10. Real-time view counts for ranking.**
 
-The current pipeline (player → Kafka → Flink 1-minute windows → ClickHouse) has ~5-30 minutes of lag. For 5-second freshness, add a parallel high-frequency aggregator: the same Flink job with 5-second windows writing to Redis with `INCR views:<video_id>`. The dedup is best-effort (not exactly-once across Kafka rebalances). For a ranking signal, approximate is fine. The watch page reads from the slower exactly-once pipeline for displayed view counts; the recommendation team reads from the fast approximate store. Two pipelines, two guarantees.
+The current pipeline (player → Kafka → Flink 1-minute windows → ClickHouse) has 5-30 minutes of lag. For 5-second freshness, add a parallel high-frequency aggregator: the same Flink job with 5-second windows writing to Redis with `INCR views:<video_id>`. The dedup is best-effort (not exactly-once across Kafka rebalances). For a ranking signal, approximate is fine. The watch page reads from the slower exactly-once pipeline for displayed view counts; the recommendation team reads from the fast approximate store. Two pipelines, two guarantees.
 
 ---
 
 ### 15. Trade-offs worth saying out loud
 
-**Build vs buy the CDN.** At Google's scale, they built their own global edge network (Google Edge Network). Below about 10 Tbps sustained egress, buying Cloudflare or Fastly is cheaper because you avoid PoP capex and operations. Above that, owning the CDN starts to make sense. A strong candidate names the break-even, not just "buy" or "build."
+**Build vs buy the CDN.** At Google's scale, they built their own global edge network. Below about 10 Tbps sustained egress, buying Cloudflare or Fastly is cheaper because you avoid PoP capital costs and operations. Above that, owning the CDN starts to make sense. Name the break-even, not just "buy" or "build."
 
 **Codec choice is a budget decision, not a technical one.**
 
-- H.264: encodes fast, decodes everywhere, file size baseline. Always ship.
+- H.264: encodes fast, decodes everywhere, file size baseline. Always ship this.
 - H.265: 30% smaller files, 3x slower to encode, patent licensing fees are real, decoder support is near-universal. Worth the tradeoff for most platforms above early stage.
-- AV1: 30% smaller than H.265, royalty-free, 15-30x slower to encode. Use only for the top 1-5% of videos by watch time where bandwidth savings recoup the encode cost in days.
+- AV1: 30% smaller than H.265, royalty-free, 15-30x slower to encode. Use only for the top 1-5% of videos by watch time, where bandwidth savings recoup the encode cost within days.
 
 **Storage tiering tuning.** Demoting a video that gets re-promoted 30% of the time within 30 days means you demoted too early. Tune the threshold per content category: news videos age quickly (aggressive demote), cooking tutorials less so. Measure demote-then-repromote rates and adjust.
 
-**Single manifest vs progressive manifest.** The Manifest Builder can publish a partial master after the first quality completes (360p only), then rewrite as 720p and 1080p finish. This cuts the time from "upload finished" to "watchable" from 20 minutes to 5 minutes. The cost is that master.m3u8 needs a short CDN TTL (60 seconds) during transcoding, which means more origin requests for that video's first hour. Worth it for creator experience.
+**Single manifest vs progressive manifest.** The Manifest Builder can publish a partial master after the first quality completes (360p only), then rewrite as 720p and 1080p finish. This cuts time from "upload finished" to "watchable" from 20 minutes to 5 minutes. The cost is that `master.m3u8` needs a short CDN TTL (60 seconds) during transcoding, which means more origin requests for a video's first hour. Worth it for creator experience.
 
-**What you would revisit at 10x scale.** Custom hardware encoding ASICs (similar to Google Argos). Per-shot encoding: analyze each scene and encode at the optimal bitrate for its complexity, not a fixed ladder. Saves 20%+ bandwidth. Netflix does this. Move manifest building to CDN-edge computation, generating manifests per viewer device in real time rather than pre-building static files.
+**What to revisit at 10x scale.** Custom hardware encoding ASICs (similar to Google Argos). Per-shot encoding: analyze each scene and encode at the optimal bitrate for its complexity rather than a fixed ladder. Saves 20%+ bandwidth. Netflix does this. Move manifest building to CDN-edge computation, generating manifests per viewer device in real time rather than pre-building static files.
 
 ---
 
 ### 16. Common mistakes
 
-Most weak answers fall into one of these:
-
-**Designing upload and playback as one system.** They are two separate systems sharing a database. A single diagram for both gets confusing in ten minutes. Separate them from the first sentence.
+**Designing upload and playback as one system.** They are two separate systems sharing a database. A single diagram for both gets confusing within ten minutes. Separate them from the first sentence.
 
 **Skipping CDN tiers.** "Use a CDN" is not a design. The regional shield is the critical piece. Without it, S3 cannot absorb the request volume when edge caches miss. Mention all three tiers.
 

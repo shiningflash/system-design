@@ -284,12 +284,12 @@ flowchart LR
     subgraph NonCascade["Non-cascading (recommended)"]
         A1(["Alice"]) -->|revoke| B1(["Bob"])
         B1 -.not affected.-> D1(["Dave"])
-        A1 -.prompt: 'Bob invited 1 person. Remove them too?'.-> UI1["UI"]
+        A1 -."prompt: Bob invited 1 person. Remove them too?".-> UI1["UI"]
     end
     subgraph Cascade["Cascading"]
         A2(["Alice"]) -->|revoke| B2(["Bob"])
         B2 -->|auto-revoke| D2(["Dave"])
-        D2 -->|"(Dave is surprised)".-> UI2["UI"]
+        D2 -.->|"Dave is surprised"| UI2["UI"]
     end
 ```
 

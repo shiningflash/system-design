@@ -312,7 +312,7 @@ flowchart TB
 
     subgraph Stores["Data stores"]
         TStore[("Timeline Store\nRedis sorted sets\n~6 TB across shards")]:::cache
-        CStore[("Celeb Recent Posts\nRedis sorted sets\n50 posts per author)"]:::cache
+        CStore[("Celeb Recent Posts\nRedis sorted sets\n50 posts per author")]:::cache
     end
 
     subgraph ReadPath["Read path"]

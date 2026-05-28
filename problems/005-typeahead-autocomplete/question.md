@@ -278,7 +278,7 @@ flowchart TB
     subgraph BuildPath["Build path (offline, global)"]
         Logs[("Query Logs\nS3 Parquet, 30d hot")]:::db
         Builder["Trie Builder\n(Spark, daily + 5-min delta)"]:::app
-        Store[("Object Storage\nS3 trie snapshots,\nversioned per locale/shard)"]:::db
+        Store[("Object Storage\nS3 trie snapshots,\nversioned per locale/shard")]:::db
     end
 
     A --> CDN

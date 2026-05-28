@@ -347,7 +347,7 @@ flowchart TB
     FD --> DW
     FD --> Push
     DW --> RC
-    DW -.->|publish gw:{id}| GW
+    DW -.->|"publish gw:{id}"| GW
     GW -->|receipt frame| MS
     MS --> RC
 
